@@ -230,6 +230,41 @@ class ChatViewModelTest {
         return Pair(viewModel, "session-123")
     }
 
+    private suspend fun TestScope.createPaginatedViewModel(): ChatViewModel {
+        val (viewModel, _) = createViewModelWithSession()
+        coEvery { mockApi.getSessions(any(), any(), any()) } returns
+            retrofit2.Response.success(
+                com.m57.hermescontrol.data.model.SessionListResponse(
+                    sessions = listOf(com.m57.hermescontrol.data.model.SessionInfo(id = "paged", message_count = 300)),
+                ),
+            )
+        coEvery { mockApi.getSessionMessages("paged", 150, 0, true, "latest") } returns
+            retrofit2.Response.success(
+                com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                    messages =
+                        listOf(
+                            com.m57.hermescontrol.data.model.SessionMessage(
+                                id = 200,
+                                role = "assistant",
+                                content = "recent",
+                            ),
+                        ),
+                    pagination =
+                        com.m57.hermescontrol.data.model.SessionMessagePagination(
+                            limit = 150,
+                            offset = 0,
+                            order = "latest",
+                            returned = 150,
+                            total = 300,
+                        ),
+                ),
+            )
+        viewModel.switchSession("paged")
+        advanceUntilIdle()
+        check(viewModel.uiState.value.hasOlderMessages)
+        return viewModel
+    }
+
     // ── Slash command tests ──────────────────────────────────────────────────
 
     @Test
@@ -2395,6 +2430,99 @@ class ChatViewModelTest {
             assertNotNull(viewModel.uiState.value.errorMessage)
         }
 
+    @Test
+    fun testLoadOlderMessages_missingBindingNeverClaimsLoading() =
+        runTest {
+            val viewModel = createPaginatedViewModel()
+            var olderCalls = 0
+            coEvery { mockApi.getSessionMessages("paged", 150, 150, true, "latest") } answers {
+                olderCalls++
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(messages = emptyList()),
+                )
+            }
+            every { HermesWsClient.connectionBinding("profile-a") } returns null
+
+            viewModel.loadOlderMessages()
+            advanceUntilIdle()
+
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+            assertEquals(0, olderCalls)
+        }
+
+    @Test
+    fun testLoadOlderMessages_persistenceRejectionReleasesLoadingOwner() =
+        runTest {
+            var rejectWrites = false
+            lateinit var rejectingRepo: FakeChatPersistenceRepository
+            rejectingRepo =
+                FakeChatPersistenceRepository(
+                    operationRegistrationHook = { sessionId ->
+                        if (rejectWrites) rejectingRepo.invalidateReplacementWrites(sessionId)
+                    },
+                )
+            fakeRepo = rejectingRepo
+            val viewModel = createPaginatedViewModel()
+            coEvery { mockApi.getSessionMessages("paged", 150, 150, true, "latest") } returns
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 50,
+                                    role = "assistant",
+                                    content = "rejected older",
+                                ),
+                            ),
+                    ),
+                )
+            rejectWrites = true
+
+            viewModel.loadOlderMessages()
+            advanceUntilIdle()
+
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "rejected older" })
+            assertFalse(fakeRepo.loadMessages("paged").any { it.content == "rejected older" })
+        }
+
+    @Test
+    fun testLoadOlderMessages_successAndFailureReleaseLoadingOwner() =
+        runTest {
+            val viewModel = createPaginatedViewModel()
+            coEvery { mockApi.getSessionMessages("paged", 150, 150, true, "latest") } returns
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 50,
+                                    role = "assistant",
+                                    content = "older",
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                limit = 150,
+                                offset = 150,
+                                order = "latest",
+                                returned = 150,
+                                total = 300,
+                            ),
+                    ),
+                )
+            viewModel.loadOlderMessages()
+            advanceUntilIdle()
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+            assertTrue(viewModel.uiState.value.messages.any { it.content == "older" })
+
+            coEvery { mockApi.getSessionMessages("paged", 150, 300, true, "latest") } throws
+                java.io.IOException("network failed")
+            viewModel.loadOlderMessages()
+            advanceUntilIdle()
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+        }
+
     // ── Session switch ───────────────────────────────────────────────────────
 
     @Test
@@ -2558,6 +2686,95 @@ class ChatViewModelTest {
 
             assertEquals("session-b", viewModel.uiState.value.currentSessionId)
             assertTrue(viewModel.uiState.value.messages.isEmpty())
+        }
+
+    @Test
+    fun testSessionResumeResultAfterUndo_isFullyIgnored() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val resumeId = "resume-before-undo"
+            every { HermesWsClient.send(WsMethods.SESSION_RESUME, any(), any()) } answers {
+                arg<((String) -> Unit)?>(2)?.invoke(resumeId)
+                resumeId
+            }
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+
+            viewModel.switchSession(sessionId)
+            advanceUntilIdle()
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            undoResult.complete(mapOf("type" to "prefill", "message" to "kept", "notice" to "rewound"))
+            advanceUntilIdle()
+            val before = viewModel.uiState.value
+            val persistedBefore = fakeRepo.loadMessages(sessionId)
+
+            mockEventsFlow.emit(
+                WsEvent.RpcResult(
+                    resumeId,
+                    mapOf(
+                        "session_id" to "stale-runtime",
+                        "resumed" to "stale-storage",
+                        "messages" to listOf(mapOf("role" to "assistant", "text" to "stale resume")),
+                    ),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(before, viewModel.uiState.value)
+            assertEquals(persistedBefore, fakeRepo.loadMessages(sessionId))
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale resume" })
+        }
+
+    @Test
+    fun testStaleSessionResumeError_isFullyIgnored() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val sessionId = "storage-root"
+            val resumeId = "resume-before-reconnect"
+            every { HermesWsClient.send(WsMethods.SESSION_RESUME, any(), any()) } answers {
+                arg<((String) -> Unit)?>(2)?.invoke(resumeId)
+                resumeId
+            }
+            viewModel.switchSession(sessionId)
+            advanceUntilIdle()
+            mockConnectionStatus.value = ConnectionStatus.RECONNECTING
+            advanceUntilIdle()
+            val before = viewModel.uiState.value
+            val persistedBefore = fakeRepo.loadMessages(sessionId)
+
+            mockEventsFlow.emit(WsEvent.RpcError(resumeId, JsonRpcError(5000, "stale resume error")))
+            advanceUntilIdle()
+
+            assertEquals(before, viewModel.uiState.value)
+            assertEquals(persistedBefore, fakeRepo.loadMessages(sessionId))
+            assertFalse(viewModel.uiState.value.messages.any { it.content.contains("stale resume error") })
+        }
+
+    @Test
+    fun testValidSessionResumeTransitionsRuntimeIdentityOnce() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val resumeId = "valid-resume"
+            every { HermesWsClient.send(WsMethods.SESSION_RESUME, any(), any()) } answers {
+                arg<((String) -> Unit)?>(2)?.invoke(resumeId)
+                resumeId
+            }
+            viewModel.switchSession("storage-root")
+            advanceUntilIdle()
+            val result = mapOf("session_id" to "runtime-tip", "resumed" to "storage-tip")
+
+            mockEventsFlow.emit(WsEvent.RpcResult(resumeId, result))
+            advanceUntilIdle()
+            assertEquals("storage-tip", viewModel.uiState.value.currentSessionId)
+            assertEquals("runtime-tip", ActiveSessionHolder.activeSessionId.value)
+            assertEquals(1, viewModel.uiState.value.messages.count { it.content == "Session resumed" })
+
+            mockEventsFlow.emit(WsEvent.RpcResult(resumeId, result))
+            advanceUntilIdle()
+            assertEquals(1, viewModel.uiState.value.messages.count { it.content == "Session resumed" })
         }
 
     @Test

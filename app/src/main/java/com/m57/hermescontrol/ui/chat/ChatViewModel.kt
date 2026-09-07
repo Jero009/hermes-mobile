@@ -85,10 +85,12 @@ private const val SESSION_CREATE_MAX_ATTEMPTS = 3
  * (hermes-agent `tui_gateway/server.py`, `session.redirect` handler).
  */
 private const val REDIRECT_UNSUPPORTED_CODE = 4010
+private const val MAX_RETIRED_RESUME_REQUESTS = 64
 
 private data class PendingRpcRequest(
     val method: String,
     val resumeSessionId: String? = null,
+    val resumeFence: ResumeFence? = null,
     /** Runtime session that initiated a branch, used to fence late responses. */
     val branchSessionId: String? = null,
     /** Session/text captured for a session.redirect so a 4010 rejection can resend. */
@@ -96,6 +98,15 @@ private data class PendingRpcRequest(
     val redirectText: String? = null,
     /** Attempt generation for a session.create, used to fence retried answers. */
     val createGeneration: Long? = null,
+)
+
+private data class ResumeFence(
+    val storageSessionId: String,
+    val runtimeSessionId: String?,
+    val profileId: String,
+    val connectionBinding: ConnectionBinding,
+    val generation: Long,
+    val transcriptRevision: Long,
 )
 
 data class ChatUiState(
@@ -302,6 +313,8 @@ class ChatViewModel(
 
     /** Maps an in-flight RPC id to the context needed to handle its result. */
     private val pendingRequests = ConcurrentHashMap<String, PendingRpcRequest>()
+    private val resumeRequestLock = Any()
+    private val retiredResumeRequests = LinkedHashSet<String>()
 
     /** Runtime TUI session returned by session.resume; Desktop storage keeps the original ID. */
     private var runtimeSessionId: String? = null
@@ -310,6 +323,8 @@ class ChatViewModel(
     private var isSyncingMessages = false
     private var conversationGeneration = 0L
     private val historyLoadJobs = mutableSetOf<Job>()
+    private var olderLoadCounter = 0L
+    private var activeOlderLoadOwner: Long? = null
     val streamingState: StateFlow<StreamingState> = _streamingState.asStateFlow()
 
     /** Tracks the auto-clear coroutine for reaction animations. */
@@ -408,13 +423,14 @@ class ChatViewModel(
         // B7 (Jun 30 2026, kanban t_connection_loading): clear loading state on connection failure or status change
         viewModelScope.launch {
             wsClient.connectionStatus.collect { status ->
-                _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
-                conversationGeneration++
                 if (status == ConnectionStatus.DISCONNECTED ||
                     status == ConnectionStatus.RECONNECTING ||
                     status == ConnectionStatus.NO_NETWORK ||
                     status == ConnectionStatus.AUTH_EXPIRED
                 ) {
+                    _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
+                    conversationGeneration++
+                    invalidateResumeRequests()
                     clearPrivilegedControls()
                     _uiState.update {
                         it.copy(
@@ -494,12 +510,15 @@ class ChatViewModel(
         preloadModelOptions()
         val currentId = _uiState.value.currentSessionId
         if (currentId != null) {
+            val resumeFence = captureResumeFence(currentId)
             viewModelScope.launch(Dispatchers.IO) {
-                wsClient.send(
-                    WsMethods.SESSION_RESUME,
-                    mapOf("session_id" to currentId, "omit_messages" to true),
-                    onSent = { id -> trackResumeRequest(id, currentId) },
-                )
+                if (resumeFence != null && isResumeFenceCurrent(resumeFence)) {
+                    wsClient.send(
+                        WsMethods.SESSION_RESUME,
+                        mapOf("session_id" to currentId, "omit_messages" to true),
+                        onSent = { id -> trackResumeRequest(id, resumeFence) },
+                    )
+                }
             }
             loadSessionMessages(currentId)
         } else {
@@ -520,7 +539,14 @@ class ChatViewModel(
                 is WsEvent.RpcError -> event.id
                 else -> null
             }
+        if (rpcId != null && consumeRetiredResumeRequest(rpcId)) return
         val pending = rpcId?.let(pendingRequests::get)
+        if (pending?.method == WsMethods.SESSION_RESUME &&
+            pending.resumeFence?.let(::isResumeFenceCurrent) != true
+        ) {
+            pendingRequests.remove(rpcId)
+            return
+        }
         if (
             pending?.method == WsMethods.SESSION_BRANCH &&
             pending.branchSessionId != null &&
@@ -911,6 +937,8 @@ class ChatViewModel(
             }
 
             WsMethods.SESSION_RESUME -> {
+                val resumeFence = request.resumeFence ?: return
+                if (!isResumeFenceCurrent(resumeFence)) return
                 val resultMap = result as? Map<String, Any?>
                 val requestedSessionId = request.resumeSessionId
                 val selectedSessionId = _uiState.value.currentSessionId
@@ -940,6 +968,14 @@ class ChatViewModel(
                 // overwrite any message the user sent between switchSession() and
                 // the server ack, making the chat appear to go blank.
                 _uiState.update {
+                    if (!isResumeFenceCurrent(
+                            resumeFence,
+                            allowRuntimeChange = true,
+                            allowSessionChange = true,
+                        )
+                    ) {
+                        return@update it
+                    }
                     it.copy(
                         isLoading = false,
                         currentSessionId = sessionId,
@@ -963,6 +999,7 @@ class ChatViewModel(
                     )
                 }
                 if (sessionId != null) {
+                    if (!isResumeFenceCurrent(resumeFence, allowRuntimeChange = true, allowSessionChange = true)) return
                     hydrateResumeMessages(
                         sessionId = sessionId,
                         payload = resultMap?.get("messages"),
@@ -971,8 +1008,10 @@ class ChatViewModel(
                                 requestedSessionId != sessionId,
                     )
                 }
+                if (!isResumeFenceCurrent(resumeFence, allowRuntimeChange = true, allowSessionChange = true)) return
                 // Mirror the active runtime session id app-wide (issue #532).
                 ActiveSessionHolder.set(runtimeSessionId ?: sessionId, sessionId)
+                if (!isResumeFenceCurrent(resumeFence, allowRuntimeChange = true, allowSessionChange = true)) return
                 addSystemMessage("Session resumed")
             }
 
@@ -1427,6 +1466,7 @@ class ChatViewModel(
 
     private fun invalidateHistoryLoads(sessionId: String) {
         repo.invalidateReplacementWrites(sessionId)
+        invalidateResumeRequests()
         val jobs = synchronized(historyLoadJobs) { historyLoadJobs.toList().also { historyLoadJobs.clear() } }
         jobs.forEach(Job::cancel)
     }
@@ -1767,6 +1807,7 @@ class ChatViewModel(
         clearPrivilegedControls()
         _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
         conversationGeneration++
+        invalidateResumeRequests()
         val generation = ++sessionCreateCounter
         sessionCreateJob?.cancel()
         sessionCreateJob = null
@@ -2219,6 +2260,7 @@ class ChatViewModel(
         clearPrivilegedControls()
         _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
         conversationGeneration++
+        invalidateResumeRequests()
         // A pending session.create belongs to the conversation the user just
         // left. Retiring the generation makes any late answer inert, and the
         // timer must go with it or it would retry a create into this session.
@@ -2259,14 +2301,17 @@ class ChatViewModel(
         // Mirror the active session id app-wide (issue #532).
         ActiveSessionHolder.set(sessionId)
         _streamingState.update { StreamingState() }
+        val resumeFence = captureResumeFence(sessionId)
         viewModelScope.launch {
             // Resume the selected desktop session, then load its complete transcript.
             launch(Dispatchers.IO) {
-                wsClient.send(
-                    WsMethods.SESSION_RESUME,
-                    mapOf("session_id" to sessionId, "omit_messages" to true),
-                    onSent = { id -> trackResumeRequest(id, sessionId) },
-                )
+                if (resumeFence != null && isResumeFenceCurrent(resumeFence)) {
+                    wsClient.send(
+                        WsMethods.SESSION_RESUME,
+                        mapOf("session_id" to sessionId, "omit_messages" to true),
+                        onSent = { id -> trackResumeRequest(id, resumeFence) },
+                    )
+                }
             }
             loadSessionMessages(sessionId)
             loadSessions()
@@ -2398,74 +2443,56 @@ class ChatViewModel(
         if (!latestPaging && loadedMessageOffset <= 0) return
         val oldOffset = loadedMessageOffset
         val newOffset =
-            if (latestPaging) {
-                oldOffset + MESSAGE_PAGE_SIZE
-            } else {
-                (oldOffset - MESSAGE_PAGE_SIZE).coerceAtLeast(0)
-            }
+            if (latestPaging) oldOffset + MESSAGE_PAGE_SIZE else (oldOffset - MESSAGE_PAGE_SIZE).coerceAtLeast(0)
         val limit = if (latestPaging) MESSAGE_PAGE_SIZE else oldOffset - newOffset
-        _uiState.update { it.copy(isLoadingOlder = true) }
         val fence = captureHistoryLoadFence(sessionId) ?: return
+        val owner = ++olderLoadCounter
+        activeOlderLoadOwner = owner
+        _uiState.update { it.copy(isLoadingOlder = true) }
         launchHistoryLoad {
-            val result =
-                fetchMessagePage(
-                    sessionId,
-                    newOffset,
-                    limit,
-                    order = if (latestPaging) "latest" else null,
-                )
-            when (result) {
-                is NetworkResult.Success -> {
-                    if (!isHistoryLoadFenceCurrent(fence)) return@launchHistoryLoad
-                    val effectiveOffset =
-                        result.data.pagination?.offset ?: newOffset
-                    val older =
-                        mapServerMessages(
-                            sessionId,
-                            result.data.messages.orEmpty(),
-                            effectiveOffset,
-                        )
-                    val persisted =
-                        withContext(Dispatchers.IO) {
-                            repo.persistMessagesIfCurrent(older, sessionId, fence.transcriptRevision)
-                        }
-                    if (!persisted) return@launchHistoryLoad
-                    _uiState.update { current ->
-                        if (!isHistoryLoadFenceCurrent(fence)) {
-                            return@update current
-                        }
-                        loadedMessageOffset = effectiveOffset
-                        val mergedMessages =
-                            (older + current.messages).distinctBy { it.id }
-                        val hasOlder =
-                            if (latestPaging) {
-                                val returned =
-                                    result.data.pagination?.returned
-                                        ?: older.size
-                                returned >= limit && older.isNotEmpty()
-                            } else {
-                                effectiveOffset > 0 && older.isNotEmpty()
-                            }
-                        current.copy(
-                            messages = mergedMessages,
-                            todos =
-                                restoredTodos(
-                                    current.todos,
-                                    mergedMessages,
-                                ),
-                            isLoadingOlder = false,
-                            hasOlderMessages = hasOlder,
-                        )
+            try {
+                val result =
+                    fetchMessagePage(
+                        sessionId,
+                        newOffset,
+                        limit,
+                        order = if (latestPaging) "latest" else null,
+                    )
+                if (result !is NetworkResult.Success || !isHistoryLoadFenceCurrent(fence)) return@launchHistoryLoad
+                val effectiveOffset = result.data.pagination?.offset ?: newOffset
+                val older = mapServerMessages(sessionId, result.data.messages.orEmpty(), effectiveOffset)
+                val persisted =
+                    withContext(Dispatchers.IO) {
+                        repo.persistMessagesIfCurrent(older, sessionId, fence.transcriptRevision)
                     }
+                if (!persisted || !isHistoryLoadFenceCurrent(fence)) return@launchHistoryLoad
+                _uiState.update { current ->
+                    if (!isHistoryLoadFenceCurrent(fence) || activeOlderLoadOwner != owner) return@update current
+                    loadedMessageOffset = effectiveOffset
+                    val mergedMessages = (older + current.messages).distinctBy { it.id }
+                    val hasOlder =
+                        if (latestPaging) {
+                            val returned = result.data.pagination?.returned ?: older.size
+                            returned >= limit && older.isNotEmpty()
+                        } else {
+                            effectiveOffset > 0 && older.isNotEmpty()
+                        }
+                    current.copy(
+                        messages = mergedMessages,
+                        todos = restoredTodos(current.todos, mergedMessages),
+                        hasOlderMessages = hasOlder,
+                    )
                 }
-
-                is NetworkResult.Failure -> {
-                    _uiState.update {
-                        if (isHistoryLoadFenceCurrent(fence)) it.copy(isLoadingOlder = false) else it
-                    }
-                }
+            } finally {
+                releaseOlderLoad(owner)
             }
         }
+    }
+
+    private fun releaseOlderLoad(owner: Long) {
+        if (activeOlderLoadOwner != owner) return
+        activeOlderLoadOwner = null
+        _uiState.update { it.copy(isLoadingOlder = false) }
     }
 
     fun syncCurrentSession() {
@@ -3742,16 +3769,67 @@ class ChatViewModel(
             )
     }
 
+    private fun captureResumeFence(sessionId: String): ResumeFence? {
+        val profileId = selectedProfileId()
+        val binding = wsClient.connectionBinding(profileId) ?: return null
+        return ResumeFence(
+            storageSessionId = sessionId,
+            runtimeSessionId = runtimeSessionId,
+            profileId = profileId,
+            connectionBinding = binding,
+            generation = conversationGeneration,
+            transcriptRevision = repo.replacementGeneration(sessionId),
+        )
+    }
+
+    private fun isResumeFenceCurrent(
+        fence: ResumeFence,
+        allowRuntimeChange: Boolean = false,
+        allowSessionChange: Boolean = false,
+    ): Boolean =
+        fence.generation == conversationGeneration &&
+            fence.profileId == selectedProfileId() &&
+            (allowSessionChange || fence.storageSessionId == _uiState.value.currentSessionId) &&
+            (allowRuntimeChange || fence.runtimeSessionId == runtimeSessionId) &&
+            fence.transcriptRevision == repo.replacementGeneration(fence.storageSessionId) &&
+            wsClient.isConnectionBindingCurrent(fence.connectionBinding)
+
     private fun trackResumeRequest(
         id: String,
-        sessionId: String,
+        fence: ResumeFence,
     ) {
-        pendingRequests[id] =
-            PendingRpcRequest(
-                method = WsMethods.SESSION_RESUME,
-                resumeSessionId = sessionId,
-            )
+        synchronized(resumeRequestLock) {
+            invalidateResumeRequestsLocked()
+            pendingRequests[id] =
+                PendingRpcRequest(
+                    method = WsMethods.SESSION_RESUME,
+                    resumeSessionId = fence.storageSessionId,
+                    resumeFence = fence,
+                )
+        }
     }
+
+    private fun invalidateResumeRequests() {
+        synchronized(resumeRequestLock) {
+            invalidateResumeRequestsLocked()
+        }
+    }
+
+    private fun invalidateResumeRequestsLocked() {
+        pendingRequests.entries.removeIf { (id, request) ->
+            if (request.method != WsMethods.SESSION_RESUME) return@removeIf false
+            retiredResumeRequests += id
+            while (retiredResumeRequests.size > MAX_RETIRED_RESUME_REQUESTS) {
+                retiredResumeRequests.remove(retiredResumeRequests.first())
+            }
+            true
+        }
+    }
+
+    private fun consumeRetiredResumeRequest(id: String): Boolean =
+        synchronized(resumeRequestLock) {
+            retiredResumeRequests.remove(id)
+        }
 
     /**
      * Track a `session.create` alongside the attempt generation that issued it,
