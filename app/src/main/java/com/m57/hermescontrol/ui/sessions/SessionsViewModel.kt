@@ -27,7 +27,20 @@ data class SessionStats(
     val messages: Int = 0,
 )
 
+/** History is split by provenance: interactive conversations vs. scheduled automation runs. */
+enum class HistorySection {
+    CONVERSATIONS,
+    AUTOMATIONS,
+}
+
+internal val HistorySection.source: String?
+    get() = if (this == HistorySection.AUTOMATIONS) AUTOMATION_SOURCE else null
+
+internal val HistorySection.excludeSources: String?
+    get() = if (this == HistorySection.CONVERSATIONS) AUTOMATION_SOURCE else null
+
 data class SessionsUiState(
+    val section: HistorySection = HistorySection.CONVERSATIONS,
     val isLoading: Boolean = false,
     val isLoadingMore: Boolean = false,
     val sessions: List<SessionInfo> = emptyList(),
@@ -59,6 +72,9 @@ data class SessionsUiState(
     val isSearchMode: Boolean get() = searchQuery.isNotBlank()
 }
 
+private fun com.m57.hermescontrol.data.model.SessionListResponse.nextOffset(requestOffset: Int): Int =
+    if (limit > 0) offset + limit else requestOffset + sessions.size
+
 class SessionsViewModel(
     private val pinStore: SessionPinStore = AuthManagerSessionPinStore(),
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
@@ -81,11 +97,49 @@ class SessionsViewModel(
         const val SEARCH_DEBOUNCE_MS = 300L
     }
 
+    /**
+     * Switch between conversation and automation history. Every section owns its own
+     * server-paginated window, so the previous section's rows, offset, selection, and
+     * search results are dropped and its in-flight loads are fenced out by generation.
+     */
+    fun selectSection(section: HistorySection) {
+        if (_uiState.value.section == section) return
+        loadGeneration += 1
+        loadJob?.cancel()
+        loadJob = null
+        loadMoreJob?.cancel()
+        loadMoreJob = null
+        hydratePinsJob?.cancel()
+        searchJob?.cancel()
+        val query = _uiState.value.searchQuery
+        _uiState.update {
+            it.copy(
+                section = section,
+                isLoading = false,
+                isLoadingMore = false,
+                sessions = emptyList(),
+                loadedSessionIds = emptySet(),
+                serverOffset = 0,
+                paginationExhausted = false,
+                total = 0,
+                errorMessage = null,
+                isSelecting = false,
+                selectedIds = emptySet(),
+                isSearching = false,
+                searchResults = emptyList(),
+                searchError = null,
+            )
+        }
+        if (query.isBlank()) loadSessions() else setSearchQuery(query)
+    }
+
     /** Load (or reload) sessions from page 0. Used by pull-to-refresh and initial load. */
     fun loadSessions() {
         loadGeneration += 1
         loadMoreJob?.cancel()
         loadMoreJob = null
+        val section = _uiState.value.section
+        val generation = loadGeneration
         _uiState.update { it.copy(isLoadingMore = false) }
         loadJob =
             safeLaunchLoad(
@@ -97,12 +151,16 @@ class SessionsViewModel(
                             limit = PAGE_SIZE,
                             offset = 0,
                             order = "recent",
+                            source = section.source,
+                            excludeSources = section.excludeSources,
                         )
                     }
                 },
                 onStart = { _uiState.update { it.copy(isLoading = true, errorMessage = null) } },
                 onSuccess = { data ->
+                    if (generation != loadGeneration) return@safeLaunchLoad
                     val incoming = data.sessions.orEmpty()
+                    val nextOffset = data.nextOffset(0)
                     _uiState.update {
                         it.copy(
                             isLoading = false,
@@ -114,8 +172,8 @@ class SessionsViewModel(
                                     pinnedSessionIds = it.pinnedSessionIds,
                                 ),
                             loadedSessionIds = incoming.mapTo(mutableSetOf()) { it.id },
-                            serverOffset = incoming.size,
-                            paginationExhausted = incoming.isEmpty(),
+                            serverOffset = nextOffset,
+                            paginationExhausted = incoming.isEmpty() || nextOffset <= 0,
                             total = data.total,
                             selectedIds = emptySet(),
                         )
@@ -123,6 +181,7 @@ class SessionsViewModel(
                     hydrateMissingPinnedSessions()
                 },
                 onError = { errorMsg ->
+                    if (generation != loadGeneration) return@safeLaunchLoad
                     _uiState.update {
                         it.copy(
                             isLoading = false,
@@ -137,7 +196,7 @@ class SessionsViewModel(
     /** Load the next page and append to the existing session list. */
     fun loadMore() {
         val state = _uiState.value
-        if (state.isLoadingMore || !state.hasMore) return
+        if (state.isLoading || state.isLoadingMore || !state.hasMore || state.isSearchMode) return
         val generation = loadGeneration
 
         _uiState.update { it.copy(isLoadingMore = true) }
@@ -145,15 +204,20 @@ class SessionsViewModel(
             viewModelScope.launch {
                 val result =
                     safeApiCall {
+                        // Paginate strictly on the server window: the offset counts rows the
+                        // server returned, never the locally merged or filtered row count.
                         ApiClient.hermesApi.getSessions(
                             limit = PAGE_SIZE,
                             offset = state.serverOffset,
                             order = "recent",
+                            source = state.section.source,
+                            excludeSources = state.section.excludeSources,
                         )
                     }
                 when (result) {
                     is NetworkResult.Success -> {
                         val data = result.data
+                        val nextOffset = data.nextOffset(state.serverOffset)
                         _uiState.update {
                             if (generation != loadGeneration) return@update it
                             it.copy(
@@ -161,8 +225,8 @@ class SessionsViewModel(
                                 sessions = mergeSessionRows(it.sessions, data.sessions),
                                 loadedSessionIds =
                                     it.loadedSessionIds + data.sessions.map { session -> session.id },
-                                serverOffset = it.serverOffset + data.sessions.size,
-                                paginationExhausted = data.sessions.isEmpty(),
+                                serverOffset = nextOffset,
+                                paginationExhausted = data.sessions.isEmpty() || nextOffset <= state.serverOffset,
                                 total = data.total,
                             )
                         }
@@ -206,6 +270,8 @@ class SessionsViewModel(
     private fun hydrateMissingPinnedSessions() {
         hydratePinsJob?.cancel()
         val state = _uiState.value
+        val generation = loadGeneration
+        val section = state.section
         val missingPinIds =
             state.pinnedSessionIds.filter { pinId ->
                 state.sessions.none { it.matchesPin(pinId) }
@@ -214,12 +280,14 @@ class SessionsViewModel(
 
         hydratePinsJob =
             viewModelScope.launch {
+                // A pin only names a lineage root, so its provenance is unknown until the
+                // session is fetched; drop the ones that belong to the other section.
                 val hydrated =
                     hydratePinnedSessions(
                         api = ApiClient.hermesApi,
                         pinIds = missingPinIds,
-                    )
-                if (hydrated.isNotEmpty()) {
+                    ).filter { it.inSection(section) }
+                if (hydrated.isNotEmpty() && generation == loadGeneration) {
                     _uiState.update {
                         it.copy(sessions = mergeSessionRows(it.sessions, hydrated))
                     }
@@ -237,12 +305,16 @@ class SessionsViewModel(
      * paginated list mode.
      */
     fun setSearchQuery(query: String) {
-        _uiState.update { it.copy(searchQuery = query) }
+        val generation = loadGeneration
+        val section = _uiState.value.section
+        _uiState.update { it.copy(searchQuery = query, searchResults = emptyList()) }
         searchJob?.cancel()
         if (query.isBlank()) {
             _uiState.update {
                 it.copy(searchResults = emptyList(), searchError = null, isSearching = false)
             }
+            // A section switch made while searching clears the paged rows; restore them.
+            if (_uiState.value.sessions.isEmpty() && !_uiState.value.isLoading) loadSessions()
             return
         }
         searchJob =
@@ -251,8 +323,14 @@ class SessionsViewModel(
                 _uiState.update { it.copy(isSearching = true, searchError = null) }
                 val result =
                     safeApiCall {
-                        ApiClient.hermesApi.searchSessions(q = query, profile = null)
+                        ApiClient.hermesApi.searchSessions(
+                            q = query,
+                            profile = null,
+                            source = section.source,
+                            excludeSources = section.excludeSources,
+                        )
                     }
+                if (generation != loadGeneration || _uiState.value.searchQuery != query) return@launch
                 when (result) {
                     is NetworkResult.Success -> {
                         _uiState.update {
