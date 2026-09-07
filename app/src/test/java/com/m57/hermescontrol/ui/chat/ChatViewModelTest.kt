@@ -4346,6 +4346,8 @@ class ChatViewModelTest {
 
             val mismatches =
                 listOf(
+                    WsEvent.SudoExpire("sudo-1", null, "profile-a", 7),
+                    WsEvent.SudoExpire("sudo-1", "   ", "profile-a", 7),
                     WsEvent.SudoExpire("sudo-2", sessionId, "profile-a", 7),
                     WsEvent.SudoExpire("sudo-1", sessionId, "profile-b", 7),
                     WsEvent.SudoExpire("sudo-1", sessionId, "profile-a", 8),
@@ -4380,6 +4382,23 @@ class ChatViewModelTest {
             assertEquals("GITHUB_TOKEN", prompt?.envVar)
             assertEquals(sessionId, prompt?.binding?.runtimeSessionId)
             assertEquals(7, prompt?.binding?.connectionGeneration)
+        }
+
+    @Test
+    fun privilegedRequestsWithoutExactRuntimeSessionAreIgnored() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            listOf<String?>(null, "   ").forEach { missingSession ->
+                mockEventsFlow.emit(approvalRequest(sessionId = missingSession))
+                mockEventsFlow.emit(sudoRequest(sessionId = missingSession))
+                mockEventsFlow.emit(secretRequest(sessionId = missingSession))
+                advanceUntilIdle()
+            }
+
+            assertFalse(viewModel.uiState.value.messages.any { it.approvalInfo != null })
+            assertNull(viewModel.uiState.value.sudoPrompt)
+            assertNull(viewModel.uiState.value.secretPrompt)
         }
 
     @Test
@@ -4498,6 +4517,14 @@ class ChatViewModelTest {
 
             mockEventsFlow.emit(secretRequest())
             advanceUntilIdle()
+
+            mockEventsFlow.emit(WsEvent.SecretExpire("secret-1", null, "profile-a", 7))
+            advanceUntilIdle()
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+
+            mockEventsFlow.emit(WsEvent.SecretExpire("secret-1", "session-other", "profile-a", 7))
+            advanceUntilIdle()
+            assertNotNull(viewModel.uiState.value.secretPrompt)
 
             mockEventsFlow.emit(WsEvent.SecretExpire("secret-1", sessionId, "profile-b", 7))
             advanceUntilIdle()

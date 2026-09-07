@@ -18,6 +18,48 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
 class ChatPersistenceRepositoryTest {
+    private suspend fun ChatPersistenceRepository.persistMessage(
+        message: ChatMessage,
+        sessionId: String,
+    ): Boolean = persistMessage(message, sessionId, replacementGeneration(sessionId))
+
+    private suspend fun ChatPersistenceRepository.persistMessages(
+        messages: List<ChatMessage>,
+        sessionId: String,
+    ): Boolean = persistMessages(messages, sessionId, replacementGeneration(sessionId))
+
+    @Test
+    fun acceptedWritesAreFencedBeforeFifoRegistration() =
+        runBlocking {
+            val dao = RacingDao()
+            val repository = ChatPersistenceRepository(dao)
+            val releasePreUndo = CompletableDeferred<Unit>()
+            val acceptedBeforeUndo = repository.replacementGeneration("session-a")
+            val preUndoWrite =
+                async {
+                    releasePreUndo.await()
+                    repository.persistMessage(message("pre-undo"), "session-a", acceptedBeforeUndo)
+                }
+
+            repository.invalidateReplacementWrites("session-a")
+            val acceptedAfterUndo = repository.replacementGeneration("session-a")
+            assertTrue(
+                repository.replaceMessagesIfCurrent(
+                    listOf(message("replacement")),
+                    "session-a",
+                    acceptedAfterUndo,
+                ),
+            )
+            assertTrue(repository.persistMessage(message("post-undo"), "session-a", acceptedAfterUndo))
+            val unrelatedRevision = repository.replacementGeneration("session-b")
+            assertTrue(repository.persistMessage(message("unrelated"), "session-b", unrelatedRevision))
+
+            releasePreUndo.complete(Unit)
+            assertFalse(preUndoWrite.await())
+            assertEquals(listOf("replacement", "post-undo"), dao.contents("session-a"))
+            assertEquals(listOf("unrelated"), dao.contents("session-b"))
+        }
+
     @Test
     fun earlierRegisteredWriteCompletesBeforeLaterReplacement() =
         runBlocking {

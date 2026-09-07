@@ -611,8 +611,9 @@ class ChatViewModel(
         for (effect in result.effects) {
             when (effect) {
                 is ReducerEffect.PersistMessage -> {
+                    val acceptedRevision = repo.replacementGeneration(effect.sessionId)
                     viewModelScope.launch(Dispatchers.IO) {
-                        repo.persistMessage(effect.message, effect.sessionId)
+                        repo.persistMessage(effect.message, effect.sessionId, acceptedRevision)
                     }
                 }
 
@@ -632,8 +633,9 @@ class ChatViewModel(
                     // attachments (images inline, every other file tappable)
                     // via the gateway /api/files/download endpoint. Works on a
                     // remote phone too.
+                    val acceptedRevision = repo.replacementGeneration(effect.sessionId)
                     viewModelScope.launch(Dispatchers.IO) {
-                        attachHostMedia(effect.sessionId, effect.messageId)
+                        attachHostMedia(effect.sessionId, effect.messageId, acceptedRevision)
                     }
                 }
             }
@@ -1213,8 +1215,9 @@ class ChatViewModel(
         }
 
         // Persist under the original Desktop session ID.
+        val acceptedRevision = repo.replacementGeneration(storageSessionId)
         viewModelScope.launch(Dispatchers.IO) {
-            repo.persistMessage(userMessage, storageSessionId)
+            repo.persistMessage(userMessage, storageSessionId, acceptedRevision)
         }
 
         // Upload attachments then submit prompt
@@ -1382,8 +1385,9 @@ class ChatViewModel(
 
         // Persist — OUTSIDE update{}
         if (sessionId != null) {
+            val acceptedRevision = repo.replacementGeneration(sessionId)
             viewModelScope.launch(Dispatchers.IO) {
-                repo.persistMessage(userMsg, sessionId)
+                repo.persistMessage(userMsg, sessionId, acceptedRevision)
             }
         }
 
@@ -1820,8 +1824,9 @@ class ChatViewModel(
         // Persist — OUTSIDE update{}
         val sessionId = _uiState.value.currentSessionId
         if (sessionId != null) {
+            val acceptedRevision = repo.replacementGeneration(sessionId)
             viewModelScope.launch(Dispatchers.IO) {
-                repo.persistMessage(msg, sessionId)
+                repo.persistMessage(msg, sessionId, acceptedRevision)
             }
         }
     }
@@ -3030,12 +3035,13 @@ class ChatViewModel(
     private suspend fun attachHostMedia(
         sessionId: String,
         messageId: String,
+        acceptedRevision: Long,
     ) {
         val current = _uiState.value.messages.find { it.id == messageId } ?: return
         val content = current.content
         val items = HostMediaExtractor.extract(content)
         if (items.isEmpty()) {
-            repo.persistMessage(current, sessionId)
+            repo.persistMessage(current, sessionId, acceptedRevision)
             return
         }
 
@@ -3058,7 +3064,7 @@ class ChatViewModel(
                 )
             }
         if (newAttachments.isEmpty()) {
-            repo.persistMessage(current, sessionId)
+            repo.persistMessage(current, sessionId, acceptedRevision)
             return
         }
 
@@ -3077,7 +3083,7 @@ class ChatViewModel(
                     },
             )
         }
-        repo.persistMessage(updatedMessage, sessionId)
+        repo.persistMessage(updatedMessage, sessionId, acceptedRevision)
     }
 
     /**
@@ -3348,6 +3354,7 @@ class ChatViewModel(
         val normalized = answers.mapValues { it.value.trim() }.filterValues { it.isNotEmpty() }
         if (normalized.isEmpty() || normalized.keys.any { answerId -> questions.none { it.qid == answerId } }) return
         val requestId = expected.clarifyId ?: return
+        val acceptedRevision = repo.replacementGeneration(sessionId)
         viewModelScope.launch(Dispatchers.IO) {
             val answeredIds = mutableSetOf<String>()
             for (question in questions) {
@@ -3387,7 +3394,7 @@ class ChatViewModel(
                 }
             }
             if (_uiState.value.messages.any { it.id == userMessage.id }) {
-                repo.persistMessage(userMessage, sessionId)
+                repo.persistMessage(userMessage, sessionId, acceptedRevision)
             }
         }
     }
@@ -3780,8 +3787,8 @@ class ChatViewModel(
         if (requestId.isBlank()) return null
         if (generation == null) return null
         if (profileId.isNullOrBlank() || profileId != selectedProfileId()) return null
-        val runtimeId = eventSessionId?.takeIf { it.isNotBlank() } ?: runtimeSessionId
-        if (runtimeId.isNullOrBlank() || !isCurrentSession(runtimeId)) return null
+        val runtimeId = eventSessionId?.takeIf { it.isNotBlank() } ?: return null
+        if (runtimeId != runtimeSessionId) return null
         return PrivilegedRequestBinding(
             requestId = requestId,
             runtimeSessionId = runtimeId,
@@ -3804,7 +3811,8 @@ class ChatViewModel(
         requestId == binding.requestId &&
             profileId == binding.profileId &&
             generation == binding.connectionGeneration &&
-            (sessionId == null || sessionId == binding.runtimeSessionId)
+            !sessionId.isNullOrBlank() &&
+            sessionId == binding.runtimeSessionId
 
     fun reconnect() {
         retireSync()
@@ -3903,8 +3911,9 @@ class ChatViewModel(
 
         // Persist — OUTSIDE update{}
         if (persist && sessionId != null) {
+            val acceptedRevision = repo.replacementGeneration(sessionId)
             viewModelScope.launch(Dispatchers.IO) {
-                repo.persistMessage(msg, sessionId)
+                repo.persistMessage(msg, sessionId, acceptedRevision)
             }
         }
     }

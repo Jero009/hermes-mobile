@@ -74,22 +74,29 @@ open class ChatPersistenceRepository internal constructor(
     suspend fun persistMessage(
         message: ChatMessage,
         sessionId: String,
-    ) {
+        expectedRevision: Long,
+    ): Boolean =
         enqueueSessionOperation(sessionId) {
+            val fence = replacementFence(sessionId)
+            if (synchronized(fence) { fence.generation != expectedRevision }) return@enqueueSessionOperation false
             dao.upsert(message.toEntity(sessionId))
+            true
         }
-    }
 
     /** Persist multiple messages in one transaction. */
     suspend fun persistMessages(
         messages: List<ChatMessage>,
         sessionId: String,
-    ) {
+        expectedRevision: Long,
+    ): Boolean =
         enqueueSessionOperation(sessionId) {
-            val entities = messages.map { it.toEntity(sessionId) }
-            dao.upsertAll(entities)
+            val fence = replacementFence(sessionId)
+            synchronized(fence) {
+                if (fence.generation != expectedRevision) return@synchronized false
+                dao.upsertAll(messages.map { it.toEntity(sessionId) })
+                true
+            }
         }
-    }
 
     suspend fun persistMessagesIfCurrent(
         messages: List<ChatMessage>,
