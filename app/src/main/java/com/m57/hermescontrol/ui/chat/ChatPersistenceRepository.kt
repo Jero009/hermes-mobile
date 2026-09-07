@@ -33,4 +33,11 @@ open class ChatPersistenceRepository(
     /** Load cached messages for a session from Room. */
     suspend fun loadMessages(sessionId: String): List<ChatMessage> =
         dao.getMessagesForSession(sessionId).map { it.toUiModel() }
+
+    suspend fun replaceMessages(
+        messages: List<ChatMessage>,
+        sessionId: String,
+    ) {
+        dao.replaceMessagesForSession(sessionId, messages.map { it.toEntity(sessionId) })
+    }
 }

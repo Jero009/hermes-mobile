@@ -227,6 +227,107 @@ class ChatViewModelTest {
     // ── Slash command tests ──────────────────────────────────────────────────
 
     @Test
+    fun testUndoCommand_replacesCompleteTranscriptCacheAndPrefillsComposer() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            viewModel.addAttachment("content://safe", "safe.txt", "text/plain", 4)
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.request(
+                    WsMethods.COMMAND_DISPATCH,
+                    mapOf("name" to "undo", "arg" to "2", "session_id" to sessionId),
+                    any(),
+                )
+            } returns undoResult
+            val pageOffsets = mutableListOf<Int>()
+            coEvery { mockApi.getSessionMessages(sessionId, any(), any(), true, "latest") } answers {
+                val offset = arg<Int>(2)
+                pageOffsets += offset
+                val content = if (offset == 0) "kept recent" else "kept archived"
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = if (offset == 0) 20 else 10,
+                                    role = "assistant",
+                                    content = content,
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                limit = 150,
+                                offset = offset,
+                                order = "latest",
+                                returned = if (offset == 0) 150 else 1,
+                                total = 151,
+                            ),
+                    ),
+                )
+            }
+
+            viewModel.sendMessage("/undo 2")
+            runCurrent()
+            undoResult.complete(
+                mapOf(
+                    "type" to "prefill",
+                    "message" to "undone prompt",
+                    "notice" to "Undid 2 turns",
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(listOf(0, 150), pageOffsets)
+            assertEquals(
+                listOf("kept archived", "kept recent", "Undid 2 turns"),
+                viewModel.uiState.value.messages.map { it.content },
+            )
+            assertEquals("undone prompt", viewModel.uiState.value.pendingPrefillText)
+            assertEquals(
+                setOf("kept archived", "kept recent", "Undid 2 turns"),
+                fakeRepo.loadMessages(sessionId).map { it.content }.toSet(),
+            )
+            assertEquals(1, viewModel.uiState.value.pendingAttachments.size)
+        }
+
+    @Test
+    fun testUndoCommand_lateResultAfterSessionSwitchIsInert() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val undoResult = CompletableDeferred<Any?>()
+            every { HermesWsClient.request(WsMethods.COMMAND_DISPATCH, any(), any()) } returns undoResult
+
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            viewModel.switchSession("other-session")
+            undoResult.complete(mapOf("type" to "prefill", "message" to "stale", "notice" to "stale"))
+            advanceUntilIdle()
+
+            assertEquals("other-session", viewModel.uiState.value.currentSessionId)
+            assertNull(viewModel.uiState.value.pendingPrefillText)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale" })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "/undo" })
+        }
+
+    @Test
+    fun testUndoCommand_lateResultAfterProfileSwitchIsInert() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val undoResult = CompletableDeferred<Any?>()
+            every { HermesWsClient.request(WsMethods.COMMAND_DISPATCH, any(), any()) } returns undoResult
+
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            every { AuthManager.getSelectedProfileId() } returns "profile-b"
+            undoResult.complete(mapOf("type" to "prefill", "message" to "stale", "notice" to "stale"))
+            advanceUntilIdle()
+
+            assertNull(viewModel.uiState.value.pendingPrefillText)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale" })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "/undo" })
+        }
+
+    @Test
     fun testSlashCommand_help_addsHelpMessage() =
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()

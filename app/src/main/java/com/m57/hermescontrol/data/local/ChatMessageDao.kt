@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 
 @Dao
 interface ChatMessageDao {
@@ -18,4 +19,16 @@ interface ChatMessageDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertAll(messages: List<ChatMessageEntity>)
+
+    @Query("DELETE FROM chat_messages WHERE session_id = :sessionId")
+    suspend fun deleteMessagesForSession(sessionId: String)
+
+    @Transaction
+    suspend fun replaceMessagesForSession(
+        sessionId: String,
+        messages: List<ChatMessageEntity>,
+    ) {
+        deleteMessagesForSession(sessionId)
+        upsertAll(messages)
+    }
 }

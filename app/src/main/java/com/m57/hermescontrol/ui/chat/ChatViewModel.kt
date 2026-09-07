@@ -175,6 +175,8 @@ data class ChatUiState(
     val showContextDetail: Boolean = false,
     /** Agent todo / plan items (issue #736). */
     val todos: List<TodoItem> = emptyList(),
+    /** One-shot composer restoration produced by a successful `/undo`. */
+    val pendingPrefillText: String? = null,
 ) {
     /** Convenience — derived from [connectionStatus]. */
     val isConnected: Boolean get() = connectionStatus == ConnectionStatus.CONNECTED
@@ -303,6 +305,7 @@ class ChatViewModel(
     private var loadedMessageOffset = 0
     private var latestPaging = false
     private var isSyncingMessages = false
+    private var conversationGeneration = 0L
     val streamingState: StateFlow<StreamingState> = _streamingState.asStateFlow()
 
     /** Tracks the auto-clear coroutine for reaction animations. */
@@ -397,6 +400,7 @@ class ChatViewModel(
         // B7 (Jun 30 2026, kanban t_connection_loading): clear loading state on connection failure or status change
         viewModelScope.launch {
             wsClient.connectionStatus.collect { status ->
+                conversationGeneration++
                 if (status == ConnectionStatus.DISCONNECTED ||
                     status == ConnectionStatus.RECONNECTING ||
                     status == ConnectionStatus.NO_NETWORK ||
@@ -1354,10 +1358,117 @@ class ChatViewModel(
                 handleQueueCommand(command)
             }
 
+            is SlashResult.Undo -> {
+                handleUndoCommand(result.count, command)
+            }
+
             is SlashResult.RpcDispatch -> {
                 dispatchViaRpc(command)
             }
         }
+    }
+
+    private data class UndoFence(
+        val storageSessionId: String,
+        val runtimeSessionId: String,
+        val profileId: String,
+        val generation: Long,
+    )
+
+    private fun handleUndoCommand(
+        count: String,
+        command: String,
+    ) {
+        val storageSessionId = _uiState.value.currentSessionId ?: return
+        val agentSessionId = runtimeSessionId ?: return
+        val fence =
+            UndoFence(
+                storageSessionId = storageSessionId,
+                runtimeSessionId = agentSessionId,
+                profileId = selectedProfileId(),
+                generation = conversationGeneration,
+            )
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result =
+                    wsClient
+                        .request(
+                            WsMethods.COMMAND_DISPATCH,
+                            mapOf("name" to "undo", "arg" to count, "session_id" to agentSessionId),
+                        ).await()
+                if (!isUndoFenceCurrent(fence)) return@launch
+                recordAcceptedSlash(command)
+                handleUndoResult(result, fence)
+            } catch (e: Exception) {
+                if (isUndoFenceCurrent(fence)) {
+                    addAssistantMessage(e.message ?: "Failed to undo.")
+                }
+            }
+        }
+    }
+
+    private fun isUndoFenceCurrent(fence: UndoFence): Boolean =
+        fence.generation == conversationGeneration &&
+            fence.profileId == selectedProfileId() &&
+            fence.storageSessionId == _uiState.value.currentSessionId &&
+            fence.runtimeSessionId == runtimeSessionId
+
+    private suspend fun handleUndoResult(
+        result: Any?,
+        fence: UndoFence,
+    ) {
+        val map = result as? Map<*, *> ?: return
+        if (map["type"] != "prefill") {
+            if (isUndoFenceCurrent(fence)) handleDispatchResult(result)
+            return
+        }
+        val prefill = map["message"] as? String ?: ""
+        val notice = (map["notice"] as? String).orEmpty().ifBlank { "Rewound conversation" }
+        val transcript = fetchCompleteSessionHistory(fence) ?: return
+        if (!isUndoFenceCurrent(fence)) return
+        val feedback = ChatMessage(role = MessageRole.SYSTEM, content = notice)
+        val reconciled = transcript + feedback
+        repo.replaceMessages(reconciled, fence.storageSessionId)
+        if (!isUndoFenceCurrent(fence)) return
+        loadedMessageOffset = 0
+        latestPaging = true
+        _uiState.update { state ->
+            if (!isUndoFenceCurrent(fence)) return@update state
+            state.copy(
+                messages = reconciled,
+                todos = restoredTodos(emptyList(), transcript),
+                hasOlderMessages = false,
+                isLoadingOlder = false,
+                pendingPrefillText = prefill.takeIf { it.isNotBlank() },
+            )
+        }
+    }
+
+    private suspend fun fetchCompleteSessionHistory(fence: UndoFence): List<ChatMessage>? {
+        val pages = mutableListOf<List<ChatMessage>>()
+        var offset = 0
+        while (true) {
+            if (!isUndoFenceCurrent(fence)) return null
+            val result = fetchMessagePage(fence.storageSessionId, offset, MESSAGE_PAGE_SIZE, order = "latest")
+            if (result !is NetworkResult.Success) return null
+            val pagination = result.data.pagination
+            val effectiveOffset = pagination?.offset ?: offset
+            pages += mapServerMessages(fence.storageSessionId, result.data.messages.orEmpty(), effectiveOffset)
+            val returned = pagination?.returned ?: result.data.messages.size
+            val total = pagination?.total
+            if (returned <= 0 ||
+                (total != null && effectiveOffset + returned >= total) ||
+                (total == null && returned < MESSAGE_PAGE_SIZE)
+            ) {
+                break
+            }
+            offset = effectiveOffset + returned
+        }
+        return pages.asReversed().flatten().distinctBy { it.id }
+    }
+
+    fun consumePendingPrefill() {
+        _uiState.update { it.copy(pendingPrefillText = null) }
     }
 
     private fun handleQueueCommand(command: String) {
@@ -1579,6 +1690,7 @@ class ChatViewModel(
         setLoading: Boolean = true,
         onDispatched: (() -> Unit)? = null,
     ) {
+        conversationGeneration++
         val generation = ++sessionCreateCounter
         sessionCreateJob?.cancel()
         sessionCreateJob = null
@@ -1599,6 +1711,7 @@ class ChatViewModel(
                 terminalBackend = null,
                 contextUsage = null,
                 showContextDetail = false,
+                pendingPrefillText = null,
             )
         }
         _streamingState.update { StreamingState() }
@@ -2027,6 +2140,7 @@ class ChatViewModel(
     fun switchSession(sessionId: String) {
         if (sessionId == _uiState.value.currentSessionId) return
 
+        conversationGeneration++
         // A pending session.create belongs to the conversation the user just
         // left. Retiring the generation makes any late answer inert, and the
         // timer must go with it or it would retry a create into this session.
@@ -2061,6 +2175,7 @@ class ChatViewModel(
                 // first turn lands.
                 contextUsage = null,
                 showContextDetail = false,
+                pendingPrefillText = null,
             )
         }
         // Mirror the active session id app-wide (issue #532).
