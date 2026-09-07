@@ -9,7 +9,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -305,7 +304,7 @@ fun ChatScreen(
             ActivityResultContracts.RequestPermission(),
         ) { granted ->
             if (granted) {
-                if (SpeechRecognizer.isRecognitionAvailable(context)) {
+                if (SpeechInputHelper.isSpeechInputAvailable(context)) {
                     val intent =
                         Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                             putExtra(
@@ -671,7 +670,7 @@ fun ChatScreen(
                             Manifest.permission.RECORD_AUDIO,
                         ) == PackageManager.PERMISSION_GRANTED
                     ) {
-                        if (SpeechRecognizer.isRecognitionAvailable(context)) {
+                        if (SpeechInputHelper.isSpeechInputAvailable(context)) {
                             val intent =
                                 Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                                     putExtra(
