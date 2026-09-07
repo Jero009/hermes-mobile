@@ -43,11 +43,12 @@ fun SudoPromptDialog(
     onConfirm: (String) -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit,
+    isSubmitting: Boolean = false,
 ) {
     var password by remember { mutableStateOf("") }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isSubmitting) onDismiss() },
         title = { Text(stringResource(R.string.chat_sudo_title)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -61,6 +62,7 @@ fun SudoPromptDialog(
                     singleLine = true,
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(autoCorrectEnabled = false, keyboardType = KeyboardType.Password),
+                    enabled = !isSubmitting,
                 )
             }
         },
@@ -71,7 +73,8 @@ fun SudoPromptDialog(
                         onConfirm(password)
                     }
                 },
-                enabled = password.isNotBlank(),
+                enabled = password.isNotBlank() && !isSubmitting,
+                modifier = Modifier.testTag("sudo_send_button"),
             ) {
                 Text(stringResource(R.string.chat_send))
             }
@@ -80,6 +83,7 @@ fun SudoPromptDialog(
             TextButton(
                 onClick = onCancel,
                 modifier = Modifier.testTag("sudo_cancel_button"),
+                enabled = !isSubmitting,
             ) {
                 Text(stringResource(R.string.chat_privileged_cancel))
             }
@@ -103,6 +107,7 @@ fun SecretPromptDialog(
     onDismiss: () -> Unit,
     envVar: String? = null,
     prompt: String? = null,
+    isSubmitting: Boolean = false,
 ) {
     var secret by remember { mutableStateOf("") }
     val titleText = envVar?.takeIf { it.isNotBlank() } ?: stringResource(R.string.chat_secret_title)
@@ -110,7 +115,7 @@ fun SecretPromptDialog(
     val labelText = envVar?.takeIf { it.isNotBlank() } ?: stringResource(R.string.chat_secret_value)
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { if (!isSubmitting) onDismiss() },
         title = { Text(titleText) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -124,6 +129,7 @@ fun SecretPromptDialog(
                     singleLine = true,
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(autoCorrectEnabled = false, keyboardType = KeyboardType.Password),
+                    enabled = !isSubmitting,
                 )
             }
         },
@@ -134,7 +140,8 @@ fun SecretPromptDialog(
                         onConfirm(secret)
                     }
                 },
-                enabled = secret.isNotBlank(),
+                enabled = secret.isNotBlank() && !isSubmitting,
+                modifier = Modifier.testTag("secret_send_button"),
             ) {
                 Text(stringResource(R.string.chat_send))
             }
@@ -143,6 +150,7 @@ fun SecretPromptDialog(
             TextButton(
                 onClick = onCancel,
                 modifier = Modifier.testTag("secret_cancel_button"),
+                enabled = !isSubmitting,
             ) {
                 Text(stringResource(R.string.chat_privileged_cancel))
             }

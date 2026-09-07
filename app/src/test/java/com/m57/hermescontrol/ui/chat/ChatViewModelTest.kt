@@ -3047,6 +3047,28 @@ class ChatViewModelTest {
         }
 
     @Test
+    fun reusedApprovalId_keepsIndependentCardTimersAndStaleAckCannotCancelTheNewTimer() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            capturePrivileged(ack)
+            mockEventsFlow.emit(approvalRequest(requestId = "reused", timeoutSeconds = 10.0))
+            runCurrent()
+            val old = requireNotNull(viewModel.approvalMessage())
+            viewModel.respondToApproval(old.id, old.approvalInfo!!.privilegedBinding, "approve")
+            runCurrent()
+            mockEventsFlow.emit(approvalRequest(requestId = "reused", timeoutSeconds = 20.0))
+            runCurrent()
+            ack.complete(mapOf("status" to "ok"))
+            runCurrent()
+
+            assertEquals(1, viewModel.uiState.value.messages.count { it.approvalInfo != null })
+            advanceTimeBy(21_000)
+            runCurrent()
+            assertEquals(0, viewModel.uiState.value.messages.count { it.approvalInfo != null })
+        }
+
+    @Test
     fun olderApprovalCardClickTargetsThatExactRequestAndDisablesOnlyThatCard() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
@@ -3183,6 +3205,24 @@ class ChatViewModelTest {
             assertNull(viewModel.uiState.value.sudoPrompt)
         }
 
+    @Test
+    fun sudoSubmission_doubleSendAndCancelDispatchExactlyOnce() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            val calls = capturePrivileged(ack)
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+
+            viewModel.respondToSudo("hunter2")
+            viewModel.respondToSudo("hunter2")
+            viewModel.cancelSudo()
+            runCurrent()
+
+            assertEquals(listOf(WsMethods.SUDO_RESPOND), calls.map { it.method })
+            assertTrue(viewModel.uiState.value.sudoPrompt!!.isSubmitting)
+        }
+
     /** A gateway error string could echo the submitted value; `errorMessage` is durable UI state. */
     @Test
     fun respondToSudo_failureNeverSurfacesTheGatewayString() =
@@ -3204,6 +3244,7 @@ class ChatViewModelTest {
                     .contains("hunter2"),
             )
             assertNotNull(viewModel.uiState.value.sudoPrompt)
+            assertFalse(viewModel.uiState.value.sudoPrompt!!.isSubmitting)
         }
 
     @Test
@@ -3335,6 +3376,27 @@ class ChatViewModelTest {
         }
 
     @Test
+    fun secretSubmission_doubleSendAndCancelDispatchExactlyOnceThenAckClears() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            val calls = capturePrivileged(ack)
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+
+            viewModel.respondToSecret("super-secret-token")
+            viewModel.cancelSecret()
+            viewModel.respondToSecret("other")
+            runCurrent()
+
+            assertEquals(listOf(WsMethods.SECRET_RESPOND), calls.map { it.method })
+            assertTrue(viewModel.uiState.value.secretPrompt!!.isSubmitting)
+            ack.complete(mapOf("status" to "ok"))
+            runCurrent()
+            assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
     fun respondToSecret_failureNeverSurfacesTheGatewayString() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
@@ -3354,6 +3416,7 @@ class ChatViewModelTest {
                     .contains("super-secret-token"),
             )
             assertNotNull(viewModel.uiState.value.secretPrompt)
+            assertFalse(viewModel.uiState.value.secretPrompt!!.isSubmitting)
         }
 
     @Test

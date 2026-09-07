@@ -242,6 +242,7 @@ private const val CLARIFY_DISMISS_RESPONSE = "The user cancelled — no answer p
  */
 data class SudoPromptUi(
     val binding: PrivilegedRequestBinding,
+    val isSubmitting: Boolean = false,
 ) {
     val requestId: String get() = binding.requestId
 }
@@ -256,6 +257,7 @@ data class SecretPromptUi(
     val binding: PrivilegedRequestBinding,
     val envVar: String? = null,
     val prompt: String? = null,
+    val isSubmitting: Boolean = false,
 ) {
     val requestId: String get() = binding.requestId
 }
@@ -313,11 +315,15 @@ class ChatViewModel(
     private var reactionClearJob: Job? = null
 
     /**
-     * Local expiry timers for live approval requests, keyed by the gateway's
-     * opaque request id, so a resolved request cancels its own timer and a
-     * second request never retires the first one's controls.
+     * Local expiry timers for live approval cards. Request ids can be reused,
+     * so timer ownership includes the message and complete transport binding.
      */
-    private val approvalExpiryJobs = ConcurrentHashMap<String, Job>()
+    private data class ApprovalTimerKey(
+        val messageId: String,
+        val binding: PrivilegedRequestBinding,
+    )
+
+    private val approvalExpiryJobs = ConcurrentHashMap<ApprovalTimerKey, Job>()
 
     private val wsClient = HermesWsClient
 
@@ -408,6 +414,7 @@ class ChatViewModel(
                     status == ConnectionStatus.NO_NETWORK ||
                     status == ConnectionStatus.AUTH_EXPIRED
                 ) {
+                    clearPrivilegedControls()
                     _uiState.update {
                         it.copy(
                             isLoading = false,
@@ -1701,6 +1708,7 @@ class ChatViewModel(
         setLoading: Boolean = true,
         onDispatched: (() -> Unit)? = null,
     ) {
+        clearPrivilegedControls()
         conversationGeneration++
         repo.invalidateReplacementWrites()
         val generation = ++sessionCreateCounter
@@ -2152,6 +2160,7 @@ class ChatViewModel(
     fun switchSession(sessionId: String) {
         if (sessionId == _uiState.value.currentSessionId) return
 
+        clearPrivilegedControls()
         conversationGeneration++
         repo.invalidateReplacementWrites()
         // A pending session.create belongs to the conversation the user just
@@ -3153,6 +3162,18 @@ class ChatViewModel(
 
     // ── Approval flow ───────────────────────────────────────────────────
 
+    private fun clearPrivilegedControls() {
+        approvalExpiryJobs.values.forEach(Job::cancel)
+        approvalExpiryJobs.clear()
+        _uiState.update { state ->
+            state.copy(
+                messages = state.messages.map { message -> message.copy(approvalInfo = null) },
+                sudoPrompt = null,
+                secretPrompt = null,
+            )
+        }
+    }
+
     private fun handleApprovalRequest(event: WsEvent.ApprovalRequest) {
         val binding =
             privilegedBinding(
@@ -3195,13 +3216,14 @@ class ChatViewModel(
         binding: PrivilegedRequestBinding,
         timeoutSeconds: Double,
     ) {
-        approvalExpiryJobs.remove(binding.requestId)?.cancel()
-        approvalExpiryJobs[binding.requestId] =
+        val key = ApprovalTimerKey(messageId, binding)
+        val job =
             viewModelScope.launch {
                 delay((timeoutSeconds * 1_000.0).toLong().coerceAtLeast(1L))
-                approvalExpiryJobs.remove(binding.requestId)
+                approvalExpiryJobs.remove(key, coroutineContext[Job])
                 clearApprovalControls(messageId, binding)
             }
+        approvalExpiryJobs.put(key, job)?.cancel()
     }
 
     /** Approve exactly once. Session-wide and permanent allows are not offered. */
@@ -3241,7 +3263,7 @@ class ChatViewModel(
             runCatching {
                 wsClient.privilegedRequest(method = method, binding = binding, params = params).await()
             }.onSuccess {
-                approvalExpiryJobs.remove(binding.requestId)?.cancel()
+                approvalExpiryJobs.remove(ApprovalTimerKey(messageId, binding))?.cancel()
                 clearApprovalControls(messageId, binding)
             }.onFailure { error ->
                 restoreApprovalControls(messageId, binding, error.message)
@@ -3395,14 +3417,33 @@ class ChatViewModel(
         method: String,
         params: Map<String, String>,
     ) {
+        val claimed = claimSudoSubmission(prompt) ?: return
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                wsClient.privilegedRequest(method = method, binding = prompt.binding, params = params).await()
+                wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
             }.onSuccess {
-                _uiState.update { if (it.sudoPrompt == prompt) it.copy(sudoPrompt = null) else it }
+                _uiState.update { if (it.sudoPrompt == claimed) it.copy(sudoPrompt = null) else it }
             }.onFailure {
-                _uiState.update { it.copy(errorMessage = privilegedFailureMessage()) }
+                _uiState.update {
+                    if (it.sudoPrompt == claimed) {
+                        it.copy(
+                            sudoPrompt = claimed.copy(isSubmitting = false),
+                            errorMessage = privilegedFailureMessage(),
+                        )
+                    } else {
+                        it
+                    }
+                }
             }
+        }
+    }
+
+    private fun claimSudoSubmission(expected: SudoPromptUi): SudoPromptUi? {
+        val claimed = expected.copy(isSubmitting = true)
+        while (true) {
+            val state = _uiState.value
+            if (state.sudoPrompt != expected || expected.isSubmitting) return null
+            if (_uiState.compareAndSet(state, state.copy(sudoPrompt = claimed))) return claimed
         }
     }
 
@@ -3411,14 +3452,33 @@ class ChatViewModel(
         method: String,
         params: Map<String, String>,
     ) {
+        val claimed = claimSecretSubmission(prompt) ?: return
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                wsClient.privilegedRequest(method = method, binding = prompt.binding, params = params).await()
+                wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
             }.onSuccess {
-                _uiState.update { if (it.secretPrompt == prompt) it.copy(secretPrompt = null) else it }
+                _uiState.update { if (it.secretPrompt == claimed) it.copy(secretPrompt = null) else it }
             }.onFailure {
-                _uiState.update { it.copy(errorMessage = privilegedFailureMessage()) }
+                _uiState.update {
+                    if (it.secretPrompt == claimed) {
+                        it.copy(
+                            secretPrompt = claimed.copy(isSubmitting = false),
+                            errorMessage = privilegedFailureMessage(),
+                        )
+                    } else {
+                        it
+                    }
+                }
             }
+        }
+    }
+
+    private fun claimSecretSubmission(expected: SecretPromptUi): SecretPromptUi? {
+        val claimed = expected.copy(isSubmitting = true)
+        while (true) {
+            val state = _uiState.value
+            if (state.secretPrompt != expected || expected.isSubmitting) return null
+            if (_uiState.compareAndSet(state, state.copy(secretPrompt = claimed))) return claimed
         }
     }
 
