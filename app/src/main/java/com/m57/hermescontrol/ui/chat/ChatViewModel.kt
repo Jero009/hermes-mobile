@@ -2359,15 +2359,20 @@ class ChatViewModel(
     }
 
     private fun loadSessionMessages(sessionId: String) {
-        val fence = captureHistoryLoadFence(sessionId) ?: return
-        val owner = ++historyRefreshCounter
         retireOlderLoad()
+        val owner = ++historyRefreshCounter
         activeHistoryRefreshOwner = owner
         historyRefreshJob?.cancel()
         _uiState.update { it.copy(isLoading = true, errorMessage = null) }
         historyRefreshJob =
             launchHistoryLoad {
                 try {
+                    withContext(Dispatchers.IO) {
+                        repo.awaitSessionOperations(sessionId)
+                    }
+                    if (activeHistoryRefreshOwner != owner) return@launchHistoryLoad
+                    val fence = captureHistoryLoadFence(sessionId) ?: return@launchHistoryLoad
+                    if (!isHistoryRefreshCurrent(fence, owner)) return@launchHistoryLoad
                     val latestResult =
                         fetchMessagePage(
                             sessionId,

@@ -66,6 +66,10 @@ open class ChatPersistenceRepository internal constructor(
         replacementFence(sessionId).let { fence -> synchronized(fence) { fence.generation++ } }
     }
 
+    suspend fun awaitSessionOperations(sessionId: String) {
+        enqueueSessionOperation(sessionId) {}
+    }
+
     /** Persist a single message for the given session. */
     suspend fun persistMessage(
         message: ChatMessage,

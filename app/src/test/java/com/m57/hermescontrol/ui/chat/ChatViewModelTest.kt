@@ -10,6 +10,7 @@ import android.util.Log
 import androidx.core.content.FileProvider
 import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.local.AuthManager
+import com.m57.hermescontrol.data.local.ChatMessageEntity
 import com.m57.hermescontrol.data.local.HermesDatabase
 import com.m57.hermescontrol.data.model.Attachment
 import com.m57.hermescontrol.data.model.AttachmentSource
@@ -24,6 +25,7 @@ import com.m57.hermescontrol.data.ws.JsonRpcError
 import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
+import com.m57.hermescontrol.ui.chat.fakes.FakeChatMessageDao
 import com.m57.hermescontrol.ui.chat.fakes.FakeChatPersistenceRepository
 import com.m57.hermescontrol.ui.chat.fakes.FakeSlashUsageStore
 import io.mockk.coEvery
@@ -59,6 +61,9 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /** Fixed, value-free text the VM shows when a secret-bearing verb is not acknowledged. */
 private const val PRIVILEGED_FAILURE_TEXT = "Hermes did not acknowledge that. The request is still waiting."
@@ -330,6 +335,52 @@ class ChatViewModelTest {
                 fakeRepo.loadMessages(sessionId).map { it.content }.toSet(),
             )
             assertEquals(1, viewModel.uiState.value.pendingAttachments.size)
+        }
+
+    @Test
+    fun fullRefreshDoesNotRetireAcceptedUndoReconciliation() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+            var historyCalls = 0
+            coEvery { mockApi.getSessionMessages(sessionId, any(), any(), true, "latest") } answers {
+                val content = if (++historyCalls == 1) "refresh superseded" else "undo authoritative"
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = historyCalls,
+                                    role = "assistant",
+                                    content = content,
+                                ),
+                            ),
+                    ),
+                )
+            }
+
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            viewModel.refreshCurrentSession()
+            runCurrent()
+
+            assertEquals(1, historyCalls)
+            undoResult.complete(mapOf("type" to "prefill", "message" to "restored", "notice" to "Undone"))
+            advanceUntilIdle()
+
+            assertEquals(2, historyCalls)
+            assertEquals(
+                listOf("undo authoritative", "Undone"),
+                viewModel.uiState.value.messages.map { it.content },
+            )
+            assertEquals(
+                setOf("undo authoritative", "Undone"),
+                fakeRepo.loadMessages(sessionId).map { it.content }.toSet(),
+            )
+            assertEquals("restored", viewModel.uiState.value.pendingPrefillText)
         }
 
     @Test
@@ -2645,6 +2696,77 @@ class ChatViewModelTest {
             assertFalse(viewModel.uiState.value.messages.any { it.content == "stale persisted older" })
             assertFalse(fakeRepo.loadMessages("paged").any { it.content == "stale persisted older" })
             assertEquals(listOf("recent"), viewModel.uiState.value.messages.map { it.content })
+        }
+
+    @Test
+    fun fullRefreshWaitsForOlderDaoBoundaryBeforeCapturingRevision() =
+        runTest {
+            val olderDaoEntered = CountDownLatch(1)
+            val releaseOlderDao = CountDownLatch(1)
+            val refreshDaoPersisted = CountDownLatch(1)
+            val dao =
+                object : FakeChatMessageDao() {
+                    override fun upsertAll(messageList: List<ChatMessageEntity>) {
+                        if (messageList.any { it.content == "stale inside dao" }) {
+                            olderDaoEntered.countDown()
+                            check(releaseOlderDao.await(5, TimeUnit.SECONDS))
+                        }
+                        super.upsertAll(messageList)
+                        if (messageList.any { it.content == "atomic refresh" }) refreshDaoPersisted.countDown()
+                    }
+                }
+            fakeRepo = FakeChatPersistenceRepository(dao)
+            val viewModel = createPaginatedViewModel()
+            var refreshFetches = 0
+            coEvery { mockApi.getSessionMessages("paged", 150, 0, true, "latest") } answers {
+                refreshFetches++
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 200,
+                                    role = "assistant",
+                                    content = "atomic refresh",
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(150, 0, "latest", 150, 300),
+                    ),
+                )
+            }
+            val staleRevision = fakeRepo.replacementGeneration("paged")
+            val executor = Executors.newSingleThreadExecutor()
+            try {
+                val olderWrite =
+                    executor.submit<Boolean> {
+                        kotlinx.coroutines.runBlocking {
+                            fakeRepo.persistMessagesIfCurrent(
+                                listOf(ChatMessage(role = MessageRole.ASSISTANT, content = "stale inside dao")),
+                                "paged",
+                                staleRevision,
+                            )
+                        }
+                    }
+                assertTrue(olderDaoEntered.await(5, TimeUnit.SECONDS))
+                viewModel.refreshCurrentSession()
+                runCurrent()
+
+                assertEquals(0, refreshFetches)
+                assertTrue(viewModel.uiState.value.isLoading)
+                releaseOlderDao.countDown()
+                assertTrue(olderWrite.get(5, TimeUnit.SECONDS))
+                runCurrent()
+                assertTrue(refreshDaoPersisted.await(5, TimeUnit.SECONDS))
+                runCurrent()
+
+                assertEquals(1, refreshFetches)
+                assertEquals(listOf("atomic refresh"), viewModel.uiState.value.messages.map { it.content })
+                assertTrue(fakeRepo.loadMessages("paged").any { it.content == "atomic refresh" })
+            } finally {
+                releaseOlderDao.countDown()
+                executor.shutdownNow()
+            }
         }
 
     // ── Session switch ───────────────────────────────────────────────────────
