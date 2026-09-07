@@ -26,6 +26,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.m57.hermescontrol.R
+import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import com.m57.hermescontrol.theme.LocalHermesStatusColors
 
 /**
@@ -40,12 +41,13 @@ import com.m57.hermescontrol.theme.LocalHermesStatusColors
  */
 @Composable
 fun SudoPromptDialog(
+    binding: PrivilegedRequestBinding,
     onConfirm: (String) -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit,
     isSubmitting: Boolean = false,
 ) {
-    var password by remember { mutableStateOf("") }
+    var password by remember(binding) { mutableStateOf("") }
 
     AlertDialog(
         onDismissRequest = { if (!isSubmitting) onDismiss() },
@@ -102,6 +104,7 @@ fun SudoPromptDialog(
  */
 @Composable
 fun SecretPromptDialog(
+    binding: PrivilegedRequestBinding,
     onConfirm: (String) -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit,
@@ -109,7 +112,7 @@ fun SecretPromptDialog(
     prompt: String? = null,
     isSubmitting: Boolean = false,
 ) {
-    var secret by remember { mutableStateOf("") }
+    var secret by remember(binding) { mutableStateOf("") }
     val titleText = envVar?.takeIf { it.isNotBlank() } ?: stringResource(R.string.chat_secret_title)
     val bodyText = prompt?.takeIf { it.isNotBlank() } ?: stringResource(R.string.chat_secret_body)
     val labelText = envVar?.takeIf { it.isNotBlank() } ?: stringResource(R.string.chat_secret_value)

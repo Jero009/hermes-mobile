@@ -14,6 +14,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -162,23 +163,29 @@ fun ChatLifecycleEffects(
 
     // Sudo / secret prompt dialogs (issue #524)
     sudoPrompt?.let { prompt ->
-        SudoPromptDialog(
-            onConfirm = viewModel::respondToSudo,
-            onCancel = viewModel::cancelSudo,
-            onDismiss = viewModel::dismissSudo,
-            isSubmitting = prompt.isSubmitting,
-        )
+        key(prompt.binding) {
+            SudoPromptDialog(
+                binding = prompt.binding,
+                onConfirm = viewModel::respondToSudo,
+                onCancel = viewModel::cancelSudo,
+                onDismiss = viewModel::dismissSudo,
+                isSubmitting = prompt.isSubmitting,
+            )
+        }
     }
 
     secretPrompt?.let { prompt ->
-        SecretPromptDialog(
-            onConfirm = viewModel::respondToSecret,
-            onCancel = viewModel::cancelSecret,
-            onDismiss = viewModel::dismissSecret,
-            envVar = prompt.envVar,
-            prompt = prompt.prompt,
-            isSubmitting = prompt.isSubmitting,
-        )
+        key(prompt.binding) {
+            SecretPromptDialog(
+                binding = prompt.binding,
+                onConfirm = viewModel::respondToSecret,
+                onCancel = viewModel::cancelSecret,
+                onDismiss = viewModel::dismissSecret,
+                envVar = prompt.envVar,
+                prompt = prompt.prompt,
+                isSubmitting = prompt.isSubmitting,
+            )
+        }
     }
 
     // Scroll to current search match (serialized through the controller so it
