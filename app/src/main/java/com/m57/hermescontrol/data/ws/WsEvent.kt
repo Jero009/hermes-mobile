@@ -124,10 +124,27 @@ sealed class WsEvent {
 
     // ── Interactive ──────────────────────────────────────────────────────
 
+    data class ClarifyQuestion(
+        val qid: String,
+        val question: String,
+        val choices: List<String> = emptyList(),
+        val multiSelect: Boolean = false,
+    )
+
     data class ClarifyRequest(
         val text: String?,
         val options: List<String>?,
         val clarifyId: String? = null,
+        val sessionId: String? = null,
+        val questionId: String? = null,
+        val multiSelect: Boolean = false,
+        val questions: List<ClarifyQuestion> = emptyList(),
+        val sourceProfileId: String? = null,
+        val connectionGeneration: Int? = null,
+    ) : WsEvent()
+
+    data class ClarifyExpire(
+        val clarifyId: String,
         val sessionId: String? = null,
     ) : WsEvent()
 

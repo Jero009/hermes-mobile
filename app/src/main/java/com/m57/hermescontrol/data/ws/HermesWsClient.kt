@@ -681,6 +681,42 @@ object HermesWsClient {
         return id
     }
 
+    /**
+     * Sends a clarification answer only on the exact socket that delivered the
+     * prompt. Control replies are never queued across reconnect/profile changes.
+     */
+    fun respondToClarify(
+        sessionId: String,
+        clarifyRequestId: String,
+        questionId: String?,
+        answer: String,
+        sourceProfileId: String,
+        sourceConnectionGeneration: Int,
+    ): Boolean =
+        synchronized(connectionLock) {
+            if (!connected.get() ||
+                sourceConnectionGeneration != connectionGeneration.get() ||
+                sourceProfileId != AuthManager.getSelectedProfileId()
+            ) {
+                return@synchronized false
+            }
+            val params =
+                buildMap<String, Any> {
+                    put("session_id", sessionId)
+                    put("request_id", clarifyRequestId)
+                    put("answer", answer)
+                    questionId?.let { put("question_id", it) }
+                }
+            val id = requestId.incrementAndGet().toString()
+            val request =
+                JsonRpcRequest(
+                    id = id,
+                    method = WsMethods.CLARIFY_RESPOND,
+                    params = params.mapValues { it.value.toJsonElement() },
+                )
+            webSocket?.send(OkHttpProvider.json.encodeToString(request)) == true
+        }
+
     /** Start an idle-close recovery without reopening a credential boundary. */
     private fun startConnectionLocked() {
         if (intentionalClose.get() || !acceptQueuedMessages.get() || connected.get()) return
@@ -1061,7 +1097,15 @@ object HermesWsClient {
                 val emitted =
                     parsedEvents.tryEmit(
                         SourcedWsEvent(
-                            event = event,
+                            event =
+                                if (event is WsEvent.ClarifyRequest) {
+                                    event.copy(
+                                        sourceProfileId = profileId,
+                                        connectionGeneration = generation,
+                                    )
+                                } else {
+                                    event
+                                },
                             profileId = profileId,
                             connectionGeneration = generation,
                             storedSessionId =

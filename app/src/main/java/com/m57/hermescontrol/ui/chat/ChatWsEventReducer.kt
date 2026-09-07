@@ -37,6 +37,7 @@ object ChatWsEventReducer {
                 is WsEvent.ToolComplete -> event.sessionId
                 is WsEvent.ToolOutputRisk -> event.sessionId
                 is WsEvent.ClarifyRequest -> event.sessionId
+                is WsEvent.ClarifyExpire -> event.sessionId
                 is WsEvent.ToolProgress -> event.sessionId
                 is WsEvent.ToolGenerating -> event.sessionId
                 is WsEvent.SubagentEvent -> event.sessionId
@@ -86,6 +87,17 @@ object ChatWsEventReducer {
             is WsEvent.SubagentEvent -> onSubagentEvent(state, streamingState, event)
 
             is WsEvent.ClarifyRequest -> onClarifyRequest(state, streamingState, event)
+
+            is WsEvent.ClarifyExpire ->
+                ReducerResult(
+                    state =
+                        if (state.clarifyRequest?.clarifyId == event.clarifyId) {
+                            state.copy(clarifyRequest = null)
+                        } else {
+                            state
+                        },
+                    streamingState = streamingState,
+                )
 
             is WsEvent.ReviewSummary -> onReviewSummary(state, streamingState, event)
 
@@ -523,6 +535,15 @@ object ChatWsEventReducer {
                             text = event.text.orEmpty(),
                             options = event.options.orEmpty(),
                             clarifyId = event.clarifyId,
+                            questionId = event.questionId,
+                            multiSelect = event.multiSelect,
+                            questions =
+                                event.questions.map {
+                                    ClarifyQuestionUi(it.qid, it.question, it.choices, it.multiSelect)
+                                },
+                            sessionId = event.sessionId,
+                            sourceProfileId = event.sourceProfileId,
+                            connectionGeneration = event.connectionGeneration,
                         ),
                     isAgentTyping = false,
                 ),

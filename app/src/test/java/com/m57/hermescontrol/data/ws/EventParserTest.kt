@@ -6,6 +6,7 @@ import io.mockk.unmockkAll
 import kotlinx.serialization.json.JsonObject
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -258,6 +259,72 @@ class EventParserTest {
         val clarifyEvent = event as WsEvent.ClarifyRequest
         assertEquals("Which environment?", clarifyEvent.text)
         assertEquals(listOf("staging", "production"), clarifyEvent.options)
+    }
+
+    @Test
+    fun testParseClarifyRequest_preservesBatchQuestionIdentityAndSelectionMode() {
+        val response =
+            createJsonRpcResponse(
+                jsonrpc = "2.0",
+                id = null,
+                result = null,
+                error = null,
+                method = "event",
+                params =
+                    mapOf(
+                        "type" to "clarify.request",
+                        "session_id" to "session-1",
+                        "payload" to
+                            mapOf(
+                                "request_id" to "request-1",
+                                "questions" to
+                                    listOf(
+                                        mapOf(
+                                            "qid" to "language",
+                                            "question" to "Languages?",
+                                            "choices" to listOf("Kotlin", "Rust"),
+                                            "multi_select" to true,
+                                        ),
+                                        mapOf(
+                                            "qid" to "target",
+                                            "question" to "Target?",
+                                            "choices" to listOf("Android", "Desktop"),
+                                            "multi_select" to false,
+                                        ),
+                                    ),
+                            ),
+                    ),
+            )
+
+        val event = EventParser.parse(response) as WsEvent.ClarifyRequest
+
+        assertEquals("request-1", event.clarifyId)
+        assertEquals("session-1", event.sessionId)
+        assertEquals(listOf("language", "target"), event.questions.map { it.qid })
+        assertTrue(event.questions.first().multiSelect)
+        assertFalse(event.questions.last().multiSelect)
+    }
+
+    @Test
+    fun testParseClarifyExpire_preservesRequestAndSessionIdentity() {
+        val response =
+            createJsonRpcResponse(
+                jsonrpc = "2.0",
+                id = null,
+                result = null,
+                error = null,
+                method = "event",
+                params =
+                    mapOf(
+                        "type" to "clarify.expire",
+                        "session_id" to "session-1",
+                        "payload" to mapOf("request_id" to "request-1"),
+                    ),
+            )
+
+        val event = EventParser.parse(response) as WsEvent.ClarifyExpire
+        assertEquals("request-1", event.clarifyId)
+        assertEquals("session-1", event.sessionId)
     }
 
     // ── TEST-07: Untested subtypes ─────────────────────────────────────

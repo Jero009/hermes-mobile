@@ -627,7 +627,7 @@ fun ChatScreen(
                     viewModel = viewModel,
                     openingAttachmentPath = state.openingAttachmentPath,
                     clarifyRequest = state.clarifyRequest,
-                    onRespondClarify = viewModel::respondToClarify,
+                    onRespondClarify = viewModel::respondToClarifyBatch,
                     onDismissClarify = viewModel::dismissClarify,
                     onImageClick = { viewingImage = it },
                 )

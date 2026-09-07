@@ -60,7 +60,7 @@ fun ChatMessageList(
     viewModel: ChatViewModel,
     openingAttachmentPath: String? = null,
     clarifyRequest: ClarifyUi? = null,
-    onRespondClarify: ((String) -> Unit)? = null,
+    onRespondClarify: ((ClarifyUi, Map<String, String>) -> Unit)? = null,
     onDismissClarify: (() -> Unit)? = null,
     onImageClick: (ImageViewerModel) -> Unit = {},
 ) {
@@ -162,9 +162,8 @@ fun ChatMessageList(
             if (clarifyRequest != null) {
                 item(key = "clarify_bubble") {
                     ClarifyBubble(
-                        text = clarifyRequest.text,
-                        options = clarifyRequest.options,
-                        onOptionSelected = { option -> onRespondClarify?.invoke(option) },
+                        clarifyRequest = clarifyRequest,
+                        onSubmit = { expected, answers -> onRespondClarify?.invoke(expected, answers) },
                         onDismiss = { onDismissClarify?.invoke() },
                     )
                 }

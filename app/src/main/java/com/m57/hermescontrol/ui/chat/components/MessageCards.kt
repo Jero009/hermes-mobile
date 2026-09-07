@@ -38,12 +38,11 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.SuggestionChip
-import androidx.compose.material3.SuggestionChipDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -78,6 +77,7 @@ import com.m57.hermescontrol.theme.CodeTerminalBg
 import com.m57.hermescontrol.theme.CodeTerminalBorder
 import com.m57.hermescontrol.theme.CodeTerminalMuted
 import com.m57.hermescontrol.theme.CodeTerminalText
+import com.m57.hermescontrol.ui.chat.ClarifyUi
 import com.m57.hermescontrol.ui.chat.SubagentIndicator
 
 // ── ReasoningCard ─────────────────────────────────────────────────────────
@@ -369,13 +369,14 @@ private fun copyToClipboard(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ClarifyBubble(
-    text: String,
-    options: List<String>,
-    onOptionSelected: (String) -> Unit,
+    clarifyRequest: ClarifyUi,
+    onSubmit: (ClarifyUi, Map<String, String>) -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var typedText by remember { mutableStateOf("") }
+    val questions = clarifyRequest.resolvedQuestions
+    var selected by remember(clarifyRequest) { mutableStateOf<Map<String, Set<String>>>(emptyMap()) }
+    var typed by remember(clarifyRequest) { mutableStateOf<Map<String, String>>(emptyMap()) }
 
     Surface(
         modifier =
@@ -395,54 +396,66 @@ fun ClarifyBubble(
             modifier = Modifier.padding(12.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Text(
-                text = text,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-            if (options.isNotEmpty()) {
-                Spacer(Modifier.height(10.dp))
-                FlowRow(
+            questions.forEachIndexed { index, question ->
+                Text(
+                    text = if (questions.size > 1) "${index + 1}. ${question.question}" else question.question,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    fontWeight = if (questions.size > 1) FontWeight.SemiBold else FontWeight.Normal,
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    options.forEach { option ->
-                        SuggestionChip(
-                            onClick = { onOptionSelected(option) },
-                            label = { Text(option) },
-                            colors =
-                                SuggestionChipDefaults.suggestionChipColors(
-                                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                                    labelColor = MaterialTheme.colorScheme.onSecondaryContainer,
-                                ),
-                        )
+                )
+                if (question.multiSelect) Text("Select all that apply", style = MaterialTheme.typography.labelSmall)
+                if (question.choices.isNotEmpty()) {
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        question.choices.forEach { choice ->
+                            val values = selected[question.qid].orEmpty()
+                            val isSelected = choice in values
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = {
+                                    val next =
+                                        if (question.multiSelect) {
+                                            if (isSelected) values - choice else values + choice
+                                        } else {
+                                            setOf(choice)
+                                        }
+                                    selected = selected + (question.qid to next)
+                                },
+                                label = { Text(choice) },
+                            )
+                        }
                     }
                 }
+                OutlinedTextField(
+                    value = typed[question.qid].orEmpty(),
+                    onValueChange = { typed = typed + (question.qid to it) },
+                    label = { Text(if (question.choices.isEmpty()) "Your response" else "Other (optional)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+                Spacer(Modifier.height(10.dp))
             }
-            Spacer(Modifier.height(10.dp))
-            OutlinedTextField(
-                value = typedText,
-                onValueChange = { typedText = it },
-                label = { Text("Your response") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-            )
             Spacer(Modifier.height(8.dp))
+            val answers =
+                questions.associate { question ->
+                    val choices = selected[question.qid].orEmpty().toList()
+                    val custom = typed[question.qid].orEmpty().trim()
+                    question.qid to (choices + listOfNotNull(custom.takeIf(String::isNotEmpty))).joinToString(", ")
+                }
+            val hasAnswer = answers.values.any(String::isNotBlank)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
             ) {
                 FilledTonalButton(
-                    onClick = {
-                        if (typedText.isNotBlank()) {
-                            onOptionSelected(typedText)
-                            typedText = ""
-                        }
-                    },
-                    enabled = typedText.isNotBlank(),
+                    onClick = { onSubmit(clarifyRequest, answers) },
+                    enabled = hasAnswer,
                 ) {
-                    Text("Send")
+                    Text(if (questions.size > 1) "Submit all" else "Send")
                 }
                 TextButton(onClick = onDismiss) {
                     Text("Dismiss")

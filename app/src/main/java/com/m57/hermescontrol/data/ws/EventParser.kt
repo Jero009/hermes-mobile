@@ -132,10 +132,34 @@ object EventParser {
                     payload?.get("choices")
                         ?: payload?.get("options")
                 val clarifyId = payload?.get("clarify_id") as? String ?: payload?.get("request_id") as? String
+                val questionId = payload?.get("qid") as? String ?: payload?.get("question_id") as? String
+                val multiSelect = payload?.get("multi_select") as? Boolean ?: false
 
                 @Suppress("UNCHECKED_CAST")
                 val options = (rawOptions as? List<*>)?.filterIsInstance<String>()
-                WsEvent.ClarifyRequest(text, options, clarifyId, sessionId)
+                val questions =
+                    (payload?.get("questions") as? List<*>)
+                        .orEmpty()
+                        .mapIndexedNotNull { index, raw ->
+                            val question = raw as? Map<*, *> ?: return@mapIndexedNotNull null
+                            val qid = question["qid"] as? String ?: "q$index"
+                            val prompt = question["question"] as? String ?: return@mapIndexedNotNull null
+                            WsEvent.ClarifyQuestion(
+                                qid = qid,
+                                question = prompt,
+                                choices = (question["choices"] as? List<*>)?.filterIsInstance<String>().orEmpty(),
+                                multiSelect = question["multi_select"] as? Boolean ?: false,
+                            )
+                        }
+                WsEvent.ClarifyRequest(text, options, clarifyId, sessionId, questionId, multiSelect, questions)
+            }
+
+            "clarify.expire" -> {
+                val clarifyId =
+                    payload?.get("request_id") as? String
+                        ?: payload?.get("clarify_id") as? String
+                        ?: return WsEvent.Unknown(rawJson)
+                WsEvent.ClarifyExpire(clarifyId, sessionId)
             }
 
             "status.update" -> {

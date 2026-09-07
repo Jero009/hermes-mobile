@@ -133,6 +133,7 @@ class ChatViewModelTest {
             arg<((String) -> Unit)?>(2)?.invoke(id)
             id
         }
+        every { HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any()) } returns true
         every { HermesWsClient.request(WsMethods.CONFIG_SET, any(), any()) } returns
             CompletableDeferred<Any?>(mapOf("ok" to true))
 
@@ -1425,7 +1426,16 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
 
-            mockEventsFlow.emit(WsEvent.ClarifyRequest("Please choose:", listOf("Yes", "No"), "clarify-123"))
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = "Please choose:",
+                    options = listOf("Yes", "No"),
+                    clarifyId = "clarify-123",
+                    sessionId = sessionId,
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 7,
+                ),
+            )
             advanceUntilIdle()
 
             assertEquals(
@@ -1451,17 +1461,13 @@ class ChatViewModelTest {
             assertEquals(2, viewModel.uiState.value.messages.size)
 
             verify {
-                HermesWsClient.send(
-                    method = WsMethods.CLARIFY_RESPOND,
-                    params =
-                        mapOf(
-                            "session_id" to sessionId,
-                            "response" to "Yes",
-                            "answer" to "Yes",
-                            "clarify_id" to "clarify-123",
-                            "request_id" to "clarify-123",
-                        ),
-                    onSent = any(),
+                HermesWsClient.respondToClarify(
+                    sessionId = sessionId,
+                    clarifyRequestId = "clarify-123",
+                    questionId = "q0",
+                    answer = "Yes",
+                    sourceProfileId = "profile-a",
+                    sourceConnectionGeneration = 7,
                 )
             }
         }
@@ -1471,7 +1477,16 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
 
-            mockEventsFlow.emit(WsEvent.ClarifyRequest("Please explain:", emptyList(), "clarify-456"))
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = "Please explain:",
+                    options = emptyList(),
+                    clarifyId = "clarify-456",
+                    sessionId = sessionId,
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 8,
+                ),
+            )
             advanceUntilIdle()
 
             assertEquals(
@@ -1502,18 +1517,79 @@ class ChatViewModelTest {
             )
 
             verify {
-                HermesWsClient.send(
-                    WsMethods.CLARIFY_RESPOND,
-                    params =
-                        mapOf(
-                            "session_id" to sessionId,
-                            "response" to "This is my custom response text",
-                            "answer" to "This is my custom response text",
-                            "clarify_id" to "clarify-456",
-                            "request_id" to "clarify-456",
-                        ),
-                    onSent = any(),
+                HermesWsClient.respondToClarify(
+                    sessionId = sessionId,
+                    clarifyRequestId = "clarify-456",
+                    questionId = "q0",
+                    answer = "This is my custom response text",
+                    sourceProfileId = "profile-a",
+                    sourceConnectionGeneration = 8,
                 )
+            }
+        }
+
+    @Test
+    fun testClarifyBatch_retainsUnansweredQuestions() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = null,
+                    options = null,
+                    clarifyId = "clarify-batch",
+                    sessionId = sessionId,
+                    questions =
+                        listOf(
+                            WsEvent.ClarifyQuestion("q0", "First?"),
+                            WsEvent.ClarifyQuestion("q1", "Second?"),
+                        ),
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 9,
+                ),
+            )
+            advanceUntilIdle()
+            val expected = viewModel.uiState.value.clarifyRequest!!
+
+            viewModel.respondToClarifyBatch(expected, mapOf("q0" to "first answer"))
+            advanceUntilIdle()
+
+            assertEquals(listOf("q1"), viewModel.uiState.value.clarifyRequest?.questions?.map { it.qid })
+            verify(exactly = 1) {
+                HermesWsClient.respondToClarify(
+                    sessionId,
+                    "clarify-batch",
+                    "q0",
+                    "first answer",
+                    "profile-a",
+                    9,
+                )
+            }
+        }
+
+    @Test
+    fun testExpiredClarify_cannotRespondFromCapturedPrompt() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = "Question?",
+                    options = emptyList(),
+                    clarifyId = "clarify-expired",
+                    sessionId = sessionId,
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 10,
+                ),
+            )
+            advanceUntilIdle()
+            val expired = viewModel.uiState.value.clarifyRequest!!
+            mockEventsFlow.emit(WsEvent.ClarifyExpire("clarify-expired", sessionId))
+            advanceUntilIdle()
+
+            viewModel.respondToClarifyBatch(expired, mapOf("q0" to "too late"))
+            advanceUntilIdle()
+
+            verify(exactly = 0) {
+                HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any())
             }
         }
 

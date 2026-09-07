@@ -191,6 +191,32 @@ data class ClarifyUi(
     val text: String,
     val options: List<String>,
     val clarifyId: String? = null,
+    val questionId: String? = null,
+    val multiSelect: Boolean = false,
+    val questions: List<ClarifyQuestionUi> = emptyList(),
+    val sessionId: String? = null,
+    val sourceProfileId: String? = null,
+    val connectionGeneration: Int? = null,
+) {
+    val resolvedQuestions: List<ClarifyQuestionUi>
+        get() =
+            questions.ifEmpty {
+                listOf(
+                    ClarifyQuestionUi(
+                        qid = questionId ?: "q0",
+                        question = text,
+                        choices = options,
+                        multiSelect = multiSelect,
+                    ),
+                )
+            }
+}
+
+data class ClarifyQuestionUi(
+    val qid: String,
+    val question: String,
+    val choices: List<String> = emptyList(),
+    val multiSelect: Boolean = false,
 )
 
 /**
@@ -2823,43 +2849,66 @@ class ChatViewModel(
     }
 
     fun respondToClarify(option: String) {
-        val sessionId = _uiState.value.currentSessionId ?: return
-        val clarifyId = _uiState.value.clarifyRequest?.clarifyId
-        _uiState.update { it.copy(clarifyRequest = null) }
+        val clarify = _uiState.value.clarifyRequest ?: return
+        val qid = clarify.questionId ?: clarify.questions.singleOrNull()?.qid
+        respondToClarifyBatch(clarify, mapOf((qid ?: "q0") to option))
+    }
 
-        val userMessage =
-            ChatMessage(
-                role = MessageRole.USER,
-                content = option,
-            )
-
-        _uiState.update { state ->
-            state.copy(
-                messages = state.messages + userMessage,
-                isAgentTyping = true,
-            )
+    fun respondToClarifyBatch(
+        expected: ClarifyUi,
+        answers: Map<String, String>,
+    ) {
+        val state = _uiState.value
+        val sessionId = state.currentSessionId ?: return
+        val runtimeId = runtimeSessionId ?: return
+        val profileId = expected.sourceProfileId ?: return
+        val generation = expected.connectionGeneration ?: return
+        if (state.clarifyRequest != expected ||
+            expected.sessionId != runtimeId
+        ) {
+            return
         }
-
+        val questions = expected.resolvedQuestions
+        val normalized = answers.mapValues { it.value.trim() }.filterValues { it.isNotEmpty() }
+        if (normalized.isEmpty() || normalized.keys.any { answerId -> questions.none { it.qid == answerId } }) return
+        val requestId = expected.clarifyId ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            repo.persistMessage(userMessage, sessionId)
-        }
+            val answeredIds =
+                questions.mapNotNull { question ->
+                    val answer = normalized[question.qid] ?: return@mapNotNull null
+                    val sent =
+                        wsClient.respondToClarify(
+                            sessionId = runtimeId,
+                            clarifyRequestId = requestId,
+                            questionId = question.qid,
+                            answer = answer,
+                            sourceProfileId = profileId,
+                            sourceConnectionGeneration = generation,
+                        )
+                    question.qid.takeIf { sent }
+                }.toSet()
+            if (answeredIds.isEmpty()) return@launch
 
-        viewModelScope.launch(Dispatchers.IO) {
-            val params =
-                mutableMapOf<String, Any>(
-                    "session_id" to sessionId,
-                    "response" to option,
-                    "answer" to option,
-                )
-            if (clarifyId != null) {
-                params["clarify_id"] = clarifyId
-                params["request_id"] = clarifyId
+            val remaining = questions.filterNot { it.qid in answeredIds }
+            val displayAnswer =
+                questions.filter { it.qid in answeredIds }.joinToString(
+                    "\n",
+                ) { normalized.getValue(it.qid) }
+            val userMessage = ChatMessage(role = MessageRole.USER, content = displayAnswer)
+            _uiState.update { current ->
+                if (current.clarifyRequest == expected) {
+                    current.copy(
+                        clarifyRequest = expected.copy(questions = remaining),
+                        messages = current.messages + userMessage,
+                        isAgentTyping = remaining.isEmpty(),
+                    ).let { updated ->
+                        if (remaining.isEmpty()) updated.copy(clarifyRequest = null) else updated
+                    }
+                } else {
+                    current
+                }
             }
-            wsClient.send(
-                method = WsMethods.CLARIFY_RESPOND,
-                params = params,
-                onSent = { id -> trackRequest(id, WsMethods.CLARIFY_RESPOND) },
-            )
+            repo.persistMessage(userMessage, sessionId)
         }
     }
 
