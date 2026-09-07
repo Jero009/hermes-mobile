@@ -1,6 +1,7 @@
 package com.m57.hermescontrol.ui.chat
 
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.LayoutDirection
 import com.m57.hermescontrol.theme.HermesStatusColors
 import com.m57.hermescontrol.theme.StatusBlue
 import com.m57.hermescontrol.theme.StatusBlueContainer
@@ -640,5 +641,48 @@ class MarkdownTextFeatureTest {
         val parsed = parseInline(input, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
         val expected = "راجع ${BidiUtils.LRI}https://example.com/path${BidiUtils.PDI} ثم تابع"
         assertEquals(expected, parsed.toString())
+    }
+
+    @Test
+    fun testEnglishSearchInArabicParagraph_preservesIsolationAndHighlightStyle() {
+        val parsed =
+            parseInline(
+                "ابحث عن Android الآن",
+                Color.Black,
+                "Android",
+                false,
+                Color.Blue,
+                DEFAULT_HIGHLIGHTS,
+            )
+        val highlightedText = "${BidiUtils.LRI}Android${BidiUtils.PDI}"
+        val highlightStart = parsed.indexOf(highlightedText)
+        val highlightEnd = highlightStart + highlightedText.length
+
+        assertTrue("English query should remain LTR-isolated", highlightStart >= 0)
+        assertTrue(
+            "isolated English query should retain its search highlight",
+            parsed.spanStyles.any { style ->
+                style.start == highlightStart &&
+                    style.end == highlightEnd &&
+                    style.item.background == DEFAULT_HIGHLIGHTS.searchBackground &&
+                    style.item.color == DEFAULT_HIGHLIGHTS.searchForeground
+            },
+        )
+    }
+
+    @Test
+    fun testTableWithOneRtlCell_keepsAmbientColumnDirection() {
+        val markdown =
+            """
+            | Name | Status |
+            |------|--------|
+            | Alice | جاهز |
+            """.trimIndent()
+        val table = parseBlocks(markdown).single() as MdBlock.Table
+
+        assertTrue(BidiUtils.isRtlText(table.rows.single()[1]))
+        assertEquals(LayoutDirection.Ltr, tableStructureDirection(LayoutDirection.Ltr))
+        assertEquals(listOf("Name", "Status"), table.header)
+        assertEquals(listOf("Alice", "جاهز"), table.rows.single())
     }
 }

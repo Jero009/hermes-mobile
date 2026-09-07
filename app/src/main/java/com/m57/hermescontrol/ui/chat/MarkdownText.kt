@@ -618,12 +618,7 @@ private fun MarkdownTable(
     block: MdBlock.Table,
     textColor: Color,
 ) {
-    val isRtl =
-        remember(block) {
-            block.header.any { BidiUtils.isRtlText(it) } ||
-                block.rows.any { row -> row.any { BidiUtils.isRtlText(it) } }
-        }
-    val tableDirection = if (isRtl) LayoutDirection.Rtl else LocalLayoutDirection.current
+    val tableDirection = tableStructureDirection(LocalLayoutDirection.current)
     val headerBg = textColor.copy(alpha = 0.08f)
     val alignments = block.alignments
     CompositionLocalProvider(LocalLayoutDirection provides tableDirection) {
@@ -680,6 +675,8 @@ private fun MarkdownTable(
         }
     }
 }
+
+internal fun tableStructureDirection(ambient: LayoutDirection): LayoutDirection = ambient
 
 private fun tableTextAlign(align: TableAlign?): TextAlign? =
     when (align) {
@@ -1578,6 +1575,23 @@ private fun parseInlineSource(
                     i = match.range.last + 1
                 }
 
+                // Search highlighting must win before an LTR run is isolated, otherwise an English
+                // query in an RTL paragraph is consumed without receiving its highlight style.
+                searchQuery.isNotEmpty() &&
+                    src.regionMatches(i, searchQuery, 0, searchQuery.length, ignoreCase = true) -> {
+                    val match = src.substring(i, i + searchQuery.length)
+                    val toAppend = if (isRtl) BidiUtils.wrapLtrIsolate(match) else match
+                    withStyle(
+                        SpanStyle(
+                            background = searchHighlightColor.first,
+                            color = searchHighlightColor.second,
+                        ),
+                    ) {
+                        append(toAppend)
+                    }
+                    i += searchQuery.length
+                }
+
                 // Keep consecutive Latin words together inside a resolved RTL paragraph.
                 isRtl && Character.isLetterOrDigit(src.codePointAt(i)) &&
                     Character.getDirectionality(src.codePointAt(i)) == Character.DIRECTIONALITY_LEFT_TO_RIGHT -> {
@@ -1602,20 +1616,6 @@ private fun parseInlineSource(
                     }
                     append(BidiUtils.wrapLtrIsolate(src.substring(i, end)))
                     i = end
-                }
-
-                // search highlight
-                searchQuery.isNotEmpty() &&
-                    src.regionMatches(i, searchQuery, 0, searchQuery.length, ignoreCase = true) -> {
-                    withStyle(
-                        SpanStyle(
-                            background = searchHighlightColor.first,
-                            color = searchHighlightColor.second,
-                        ),
-                    ) {
-                        append(src.substring(i, i + searchQuery.length))
-                    }
-                    i += searchQuery.length
                 }
 
                 else -> {
