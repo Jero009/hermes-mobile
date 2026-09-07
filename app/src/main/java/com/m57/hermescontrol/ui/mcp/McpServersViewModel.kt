@@ -7,6 +7,7 @@ import com.m57.hermescontrol.data.model.McpCatalogEntry
 import com.m57.hermescontrol.data.model.McpCatalogInstallRequest
 import com.m57.hermescontrol.data.model.McpOAuthFlowResponse
 import com.m57.hermescontrol.data.model.McpServer
+import com.m57.hermescontrol.data.model.McpServerTestResponse
 import com.m57.hermescontrol.data.model.McpServerToggleRequest
 import com.m57.hermescontrol.data.remote.ApiClient
 import com.m57.hermescontrol.data.remote.NetworkResult
@@ -15,6 +16,8 @@ import com.m57.hermescontrol.ui.common.ToastHost
 import com.m57.hermescontrol.ui.common.safeLaunchLoad
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -41,6 +44,9 @@ data class McpServersUiState(
     val addServerAuth: String = "none", // "none" | "header" | "oauth"
     val addServerBearerToken: String = "",
     val addingServer: Boolean = false,
+    val serverTestResults: Map<String, McpServerTestResponse> = emptyMap(),
+    val testingServers: Set<String> = emptySet(),
+    val isTestingAll: Boolean = false,
     // Env vars for editing
     val editingEnvFor: String? = null,
     val envKeyInput: String = "",
@@ -55,9 +61,11 @@ data class McpServersUiState(
     val activeOAuthFlow: McpOAuthFlowResponse? = null,
 )
 
-class McpServersViewModel :
+class McpServersViewModel(
+    private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.IO,
+) :
     ViewModel(),
-    ToastHost {
+        ToastHost {
     private val _uiState = MutableStateFlow(McpServersUiState())
     val uiState: StateFlow<McpServersUiState> = _uiState.asStateFlow()
 
@@ -65,6 +73,7 @@ class McpServersViewModel :
 
     fun loadServers() {
         safeLaunchLoad(
+            ioDispatcher = ioDispatcher,
             apiCall = { safeApiCall { ApiClient.hermesApi.getMcpServers() } },
             onStart = { _uiState.update { it.copy(isLoading = true, errorMessage = null) } },
             onSuccess = { data ->
@@ -72,6 +81,8 @@ class McpServersViewModel :
                     it.copy(
                         isLoading = false,
                         servers = data.servers.orEmpty(),
+                        serverTestResults = emptyMap(),
+                        testingServers = emptySet(),
                     )
                 }
             },
@@ -129,19 +140,88 @@ class McpServersViewModel :
 
     fun testServer(name: String) {
         viewModelScope.launch {
-            _uiState.update { it.copy(toastMessage = "Testing server '$name'…") }
+            _uiState.update {
+                it.copy(testingServers = it.testingServers + name, toastMessage = "Testing server '$name'…")
+            }
             val result =
-                withContext(Dispatchers.IO) {
+                withContext(ioDispatcher) {
                     safeApiCall { ApiClient.hermesApi.testMcpServer(name) }
                 }
             when (result) {
                 is NetworkResult.Success -> {
-                    _uiState.update { it.copy(toastMessage = "Server '$name' tested — OK") }
+                    val response = result.data
+                    val overhead =
+                        McpTokenEstimator.formatTokenOverhead(
+                            response.tools.size,
+                            McpTokenEstimator.estimateTokens(response.tools),
+                        )
+                    _uiState.update {
+                        it.copy(
+                            serverTestResults = it.serverTestResults + (name to response),
+                            testingServers = it.testingServers - name,
+                            toastMessage =
+                                if (response.ok) {
+                                    "Server '$name' tested — OK ($overhead)"
+                                } else {
+                                    "Server '$name' test failed: ${response.error ?: "unknown error"}"
+                                },
+                        )
+                    }
                 }
 
                 is NetworkResult.Failure -> {
-                    _uiState.update { it.copy(toastMessage = "Server '$name' test failed: ${result.error.message}") }
+                    val response = McpServerTestResponse(error = result.error.message)
+                    _uiState.update {
+                        it.copy(
+                            serverTestResults = it.serverTestResults + (name to response),
+                            testingServers = it.testingServers - name,
+                            toastMessage = "Server '$name' test failed: ${result.error.message}",
+                        )
+                    }
                 }
+            }
+        }
+    }
+
+    fun testAllServers() {
+        val enabledServers = _uiState.value.servers.filter { it.enabled }
+        if (enabledServers.isEmpty()) {
+            _uiState.update { it.copy(toastMessage = "No enabled servers to test") }
+            return
+        }
+        viewModelScope.launch {
+            val names = enabledServers.mapTo(mutableSetOf()) { it.name }
+            _uiState.update {
+                it.copy(
+                    isTestingAll = true,
+                    testingServers = it.testingServers + names,
+                    toastMessage = "Testing ${enabledServers.size} servers…",
+                )
+            }
+            val results =
+                enabledServers
+                    .map { server ->
+                        async(ioDispatcher) {
+                            val result = safeApiCall { ApiClient.hermesApi.testMcpServer(server.name) }
+                            val response =
+                                when (result) {
+                                    is NetworkResult.Success -> result.data
+                                    is NetworkResult.Failure -> McpServerTestResponse(error = result.error.message)
+                                }
+                            server.name to response
+                        }
+                    }.awaitAll()
+                    .toMap()
+            val passed = results.values.count { it.ok }
+            _uiState.update {
+                it.copy(
+                    isTestingAll = false,
+                    serverTestResults = it.serverTestResults + results,
+                    testingServers = it.testingServers - names,
+                    toastMessage =
+                        "Tested ${enabledServers.size} servers: $passed passed, " +
+                            "${enabledServers.size - passed} failed",
+                )
             }
         }
     }
