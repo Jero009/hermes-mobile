@@ -59,6 +59,13 @@ internal data class SourcedWsEvent(
     val storedSessionId: String? = null,
 )
 
+data class PrivilegedRequestBinding(
+    val requestId: String,
+    val runtimeSessionId: String,
+    val profileId: String,
+    val connectionGeneration: Int,
+)
+
 /**
  * WebSocket client for the Hermes Dashboard JSON-RPC 2.0 interface.
  *
@@ -579,6 +586,48 @@ object HermesWsClient {
             deferred
         }
 
+    /** Sensitive controls are never queued or retried onto a replacement connection. */
+    fun privilegedRequest(
+        method: String,
+        binding: PrivilegedRequestBinding,
+        valueKey: String,
+        value: String,
+    ): CompletableDeferred<Any?> =
+        synchronized(connectionLock) {
+            val deferred = CompletableDeferred<Any?>()
+            val ws = webSocket
+            if (!appInForeground.get() || !connected.get() || ws == null ||
+                binding.connectionGeneration != connectionGeneration.get() ||
+                binding.profileId != AuthManager.getSelectedProfileId()
+            ) {
+                deferred.completeExceptionally(HermesRpcException("Privileged request is no longer active"))
+                return@synchronized deferred
+            }
+            val id = requestId.incrementAndGet().toString()
+            val params =
+                mapOf(
+                    "session_id" to binding.runtimeSessionId,
+                    "request_id" to binding.requestId,
+                    valueKey to value,
+                )
+            val request =
+                JsonRpcRequest(id = id, method = method, params = params.mapValues { it.value.toJsonElement() })
+            val json = OkHttpProvider.json.encodeToString(request)
+            val pending = PendingCall(method, deferred)
+            pendingCalls[id] = pending
+            if (!ws.send(json)) {
+                pendingCalls.remove(id)
+                deferred.completeExceptionally(HermesRpcException("Privileged request was not sent"))
+            } else {
+                pending.timeoutJob =
+                    wsScope.launch {
+                        delay(REQUEST_TIMEOUT_MS)
+                        resolvePending(id, null, JsonRpcError(-1, "Request timed out: $method"))
+                    }
+            }
+            deferred
+        }
+
     /** Complete (or fail) a single pending call and cancel its timer. */
     private fun resolvePending(
         id: String,
@@ -1052,7 +1101,7 @@ object HermesWsClient {
             }
             // Resolve any in-flight `request()` awaiting this RPC result/error
             // (issue #526) before fanning the parsed event out to collectors.
-            val event =
+            val parsedEvent =
                 try {
                     val rpc = OkHttpProvider.json.decodeFromString<JsonRpcResponse>(text)
                     EventParser.parse(rpc, text)
@@ -1062,6 +1111,16 @@ object HermesWsClient {
                         "Failed to parse WebSocket message (${e.javaClass.simpleName})",
                     )
                     WsEvent.Unknown(text)
+                }
+            val event =
+                when (parsedEvent) {
+                    is WsEvent.ApprovalRequest ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
+                    is WsEvent.SudoRequest ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
+                    is WsEvent.SecretRequest ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
+                    else -> parsedEvent
                 }
             synchronized(connectionLock) {
                 if (generation != connectionGeneration.get() ||

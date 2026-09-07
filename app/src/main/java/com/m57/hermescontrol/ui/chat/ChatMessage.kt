@@ -1,6 +1,7 @@
 package com.m57.hermescontrol.ui.chat
 
 import com.m57.hermescontrol.data.model.Attachment
+import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import java.util.UUID
 
 /**
@@ -12,6 +13,7 @@ data class ApprovalInfo(
     val command: String?,
     val description: String?,
     val patternKeys: List<String>?,
+    val privilegedBinding: PrivilegedRequestBinding? = null,
 )
 
 /**

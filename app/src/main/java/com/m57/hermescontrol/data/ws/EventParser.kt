@@ -202,7 +202,8 @@ object EventParser {
 
                 @Suppress("UNCHECKED_CAST")
                 val patternKeys = (payload?.get("pattern_keys") as? List<*>)?.filterIsInstance<String>()
-                WsEvent.ApprovalRequest(command, description, patternKeys, sessionId)
+                val requestId = payload?.get("request_id") as? String
+                WsEvent.ApprovalRequest(command, description, patternKeys, sessionId, requestId)
             }
 
             "sudo.request" -> {
@@ -210,9 +211,21 @@ object EventParser {
                 WsEvent.SudoRequest(requestId, sessionId)
             }
 
+            "sudo.expire" -> {
+                val requestId = payload?.get("request_id") as? String
+                WsEvent.SudoExpire(requestId, sessionId)
+            }
+
             "secret.request" -> {
                 val requestId = payload?.get("request_id") as? String
-                WsEvent.SecretRequest(requestId, sessionId)
+                val envVar = payload?.get("env_var") as? String
+                val prompt = payload?.get("prompt") as? String
+                WsEvent.SecretRequest(requestId, sessionId, envVar, prompt)
+            }
+
+            "secret.expire" -> {
+                val requestId = payload?.get("request_id") as? String
+                WsEvent.SecretExpire(requestId, sessionId)
             }
 
             else -> {

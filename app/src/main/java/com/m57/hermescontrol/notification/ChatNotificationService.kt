@@ -109,6 +109,17 @@ class ChatNotificationService : Service() {
                                         )
                                     }
 
+                                    is WsEvent.SudoRequest,
+                                    is WsEvent.SecretRequest,
+                                    is WsEvent.ApprovalRequest,
+                                    -> {
+                                        showReplyNotification(
+                                            getString(R.string.notif_input_needed),
+                                            null,
+                                            notificationProfileId,
+                                        )
+                                    }
+
                                     else -> {}
                                 }
                             }

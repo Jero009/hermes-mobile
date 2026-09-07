@@ -194,6 +194,9 @@ sealed class WsEvent {
         val description: String?,
         val patternKeys: List<String>?,
         val sessionId: String?,
+        val requestId: String? = null,
+        val sourceProfileId: String? = null,
+        val connectionGeneration: Int? = null,
     ) : WsEvent()
 
     // ── Sudo / secret requests ─────────────────────────────────────────
@@ -206,6 +209,13 @@ sealed class WsEvent {
     data class SudoRequest(
         val requestId: String?,
         val sessionId: String?,
+        val sourceProfileId: String? = null,
+        val connectionGeneration: Int? = null,
+    ) : WsEvent()
+
+    data class SudoExpire(
+        val requestId: String?,
+        val sessionId: String?,
     ) : WsEvent()
 
     /**
@@ -214,6 +224,15 @@ sealed class WsEvent {
      * Mobile previously dropped this and the agent hung forever.
      */
     data class SecretRequest(
+        val requestId: String?,
+        val sessionId: String?,
+        val envVar: String? = null,
+        val prompt: String? = null,
+        val sourceProfileId: String? = null,
+        val connectionGeneration: Int? = null,
+    ) : WsEvent()
+
+    data class SecretExpire(
         val requestId: String?,
         val sessionId: String?,
     ) : WsEvent()

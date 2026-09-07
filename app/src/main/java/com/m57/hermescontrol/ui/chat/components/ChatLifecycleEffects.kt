@@ -172,6 +172,8 @@ fun ChatLifecycleEffects(
         SecretPromptDialog(
             onConfirm = viewModel::respondToSecret,
             onDismiss = viewModel::dismissSecret,
+            envVar = prompt.envVar,
+            prompt = prompt.prompt,
         )
     }
 

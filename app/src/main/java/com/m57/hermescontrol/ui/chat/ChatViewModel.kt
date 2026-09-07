@@ -34,6 +34,7 @@ import com.m57.hermescontrol.data.ws.CommandCatalog
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.JsonRpcError
+import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
 import com.m57.hermescontrol.data.ws.toJsonElement
@@ -232,15 +233,19 @@ private const val CLARIFY_DISMISS_RESPONSE = "The user cancelled — no answer p
 
 /** Transient — not persisted. Holds a pending sudo.password request. */
 data class SudoPromptUi(
-    val requestId: String?,
-    val sessionId: String?,
-)
+    val binding: PrivilegedRequestBinding,
+) {
+    val requestId: String get() = binding.requestId
+}
 
 /** Transient — not persisted. Holds a pending secret (token/password) request. */
 data class SecretPromptUi(
-    val requestId: String?,
-    val sessionId: String?,
-)
+    val binding: PrivilegedRequestBinding,
+    val envVar: String? = null,
+    val prompt: String? = null,
+) {
+    val requestId: String get() = binding.requestId
+}
 
 /** Expensive-model confirmation returned by the gateway's config.set RPC. */
 data class ModelSwitchConfirmation(
@@ -678,8 +683,32 @@ class ChatViewModel(
                 handleSudoRequest(event)
             }
 
+            is WsEvent.SudoExpire -> {
+                _uiState.update { state ->
+                    if (state.sudoPrompt?.binding?.requestId == event.requestId) {
+                        state.copy(
+                            sudoPrompt = null,
+                        )
+                    } else {
+                        state
+                    }
+                }
+            }
+
             is WsEvent.SecretRequest -> {
                 handleSecretRequest(event)
+            }
+
+            is WsEvent.SecretExpire -> {
+                _uiState.update { state ->
+                    if (state.secretPrompt?.binding?.requestId == event.requestId) {
+                        state.copy(
+                            secretPrompt = null,
+                        )
+                    } else {
+                        state
+                    }
+                }
             }
 
             is WsEvent.GatewayError -> {
@@ -2967,6 +2996,8 @@ class ChatViewModel(
     // ── Approval flow ───────────────────────────────────────────────────
 
     private fun handleApprovalRequest(event: WsEvent.ApprovalRequest) {
+        val binding =
+            privilegedBinding(event.requestId, event.sessionId, event.sourceProfileId, event.connectionGeneration)
         val description = event.description ?: event.command ?: "Unknown command"
         val content = "**Approval Required**\n$description"
         val msg =
@@ -2978,6 +3009,7 @@ class ChatViewModel(
                         command = event.command,
                         description = event.description,
                         patternKeys = event.patternKeys,
+                        privilegedBinding = binding,
                     ),
             )
         _uiState.update { state ->
@@ -2991,33 +3023,38 @@ class ChatViewModel(
     fun respondToApproval(action: String) {
         val state = _uiState.value
         val approvalMsg = state.messages.lastOrNull { it.approvalInfo != null } ?: return
-        val sessionId = state.currentSessionId ?: return
+        val binding = approvalMsg.approvalInfo?.privilegedBinding ?: return
+        val choice = if (action == "approve") "once" else action
+        if (choice !in setOf("once", "deny")) return
 
-        // Clear buttons immediately
-        _uiState.update { s ->
-            s.copy(
-                messages =
-                    s.messages.map {
-                        if (it.id == approvalMsg.id) {
-                            it.copy(approvalInfo = null)
-                        } else {
-                            it
-                        }
-                    },
+        if (binding.connectionGeneration < 0) {
+            _uiState.update { s ->
+                s.copy(messages = s.messages.map { if (it.id == approvalMsg.id) it.copy(approvalInfo = null) else it })
+            }
+            wsClient.send(
+                WsMethods.APPROVAL_RESPOND,
+                mapOf("session_id" to binding.runtimeSessionId, "choice" to action, "all" to false),
             )
+            return
         }
 
         viewModelScope.launch(Dispatchers.IO) {
-            wsClient.send(
-                method = WsMethods.APPROVAL_RESPOND,
-                params =
-                    mapOf(
-                        "session_id" to sessionId,
-                        "choice" to action,
-                        "all" to false,
-                    ),
-                onSent = { id -> trackRequest(id, WsMethods.APPROVAL_RESPOND) },
-            )
+            runCatching {
+                wsClient.privilegedRequest(
+                    method = WsMethods.APPROVAL_RESPOND,
+                    binding = binding,
+                    valueKey = "choice",
+                    value = choice,
+                ).await()
+            }.onSuccess {
+                _uiState.update { s ->
+                    s.copy(
+                        messages = s.messages.map { if (it.id == approvalMsg.id) it.copy(approvalInfo = null) else it },
+                    )
+                }
+            }.onFailure { error ->
+                _uiState.update { it.copy(errorMessage = error.message) }
+            }
         }
     }
 
@@ -3028,9 +3065,12 @@ class ChatViewModel(
      * hung forever. Now we surface a secure dialog and reply via sudo.respond.
      */
     private fun handleSudoRequest(event: WsEvent.SudoRequest) {
+        val binding =
+            privilegedBinding(event.requestId, event.sessionId, event.sourceProfileId, event.connectionGeneration)
+                ?: return
         _uiState.update {
             it.copy(
-                sudoPrompt = SudoPromptUi(event.requestId, event.sessionId),
+                sudoPrompt = SudoPromptUi(binding),
                 isAgentTyping = false,
             )
         }
@@ -3042,20 +3082,23 @@ class ChatViewModel(
      * secret.respond.
      */
     private fun handleSecretRequest(event: WsEvent.SecretRequest) {
+        val binding =
+            privilegedBinding(event.requestId, event.sessionId, event.sourceProfileId, event.connectionGeneration)
+                ?: return
         _uiState.update {
             it.copy(
-                secretPrompt = SecretPromptUi(event.requestId, event.sessionId),
+                secretPrompt = SecretPromptUi(binding, event.envVar, event.prompt),
                 isAgentTyping = false,
             )
         }
     }
 
     fun dismissSudo() {
-        _uiState.update { it.copy(sudoPrompt = null) }
+        // Dismissal is not authorization or a response. The live request remains visible.
     }
 
     fun dismissSecret() {
-        _uiState.update { it.copy(secretPrompt = null) }
+        // Dismissal is not authorization or a response. The live request remains visible.
     }
 
     /**
@@ -3064,23 +3107,27 @@ class ChatViewModel(
      */
     fun respondToSudo(password: String) {
         val prompt = _uiState.value.sudoPrompt ?: return
-        val sessionId = prompt.sessionId ?: _uiState.value.currentSessionId ?: return
         if (password.isBlank()) return
 
-        _uiState.update { it.copy(sudoPrompt = null) }
+        if (prompt.binding.connectionGeneration < 0) {
+            _uiState.update { it.copy(sudoPrompt = null) }
+            wsClient.send(
+                WsMethods.SUDO_RESPOND,
+                mapOf(
+                    "session_id" to prompt.binding.runtimeSessionId,
+                    "password" to password,
+                    "request_id" to prompt.requestId,
+                ),
+            )
+            return
+        }
 
         viewModelScope.launch(Dispatchers.IO) {
-            val params =
-                mutableMapOf<String, Any>(
-                    "session_id" to sessionId,
-                    "password" to password,
-                )
-            prompt.requestId?.let { id -> params["request_id"] = id }
-            wsClient.send(
-                method = WsMethods.SUDO_RESPOND,
-                params = params,
-                onSent = { id -> trackRequest(id, WsMethods.SUDO_RESPOND) },
-            )
+            runCatching {
+                wsClient.privilegedRequest(WsMethods.SUDO_RESPOND, prompt.binding, "password", password).await()
+            }.onSuccess {
+                _uiState.update { if (it.sudoPrompt == prompt) it.copy(sudoPrompt = null) else it }
+            }.onFailure { error -> _uiState.update { it.copy(errorMessage = error.message) } }
         }
     }
 
@@ -3089,24 +3136,47 @@ class ChatViewModel(
      */
     fun respondToSecret(value: String) {
         val prompt = _uiState.value.secretPrompt ?: return
-        val sessionId = prompt.sessionId ?: _uiState.value.currentSessionId ?: return
         if (value.isBlank()) return
 
-        _uiState.update { it.copy(secretPrompt = null) }
+        if (prompt.binding.connectionGeneration < 0) {
+            _uiState.update { it.copy(secretPrompt = null) }
+            wsClient.send(
+                WsMethods.SECRET_RESPOND,
+                mapOf(
+                    "session_id" to prompt.binding.runtimeSessionId,
+                    "value" to value,
+                    "request_id" to prompt.requestId,
+                ),
+            )
+            return
+        }
 
         viewModelScope.launch(Dispatchers.IO) {
-            val params =
-                mutableMapOf<String, Any>(
-                    "session_id" to sessionId,
-                    "value" to value,
-                )
-            prompt.requestId?.let { id -> params["request_id"] = id }
-            wsClient.send(
-                method = WsMethods.SECRET_RESPOND,
-                params = params,
-                onSent = { id -> trackRequest(id, WsMethods.SECRET_RESPOND) },
-            )
+            runCatching {
+                wsClient.privilegedRequest(WsMethods.SECRET_RESPOND, prompt.binding, "value", value).await()
+            }.onSuccess {
+                _uiState.update { if (it.secretPrompt == prompt) it.copy(secretPrompt = null) else it }
+            }.onFailure { error -> _uiState.update { it.copy(errorMessage = error.message) } }
         }
+    }
+
+    private fun privilegedBinding(
+        requestId: String?,
+        eventSessionId: String?,
+        profileId: String?,
+        generation: Int?,
+    ): PrivilegedRequestBinding? {
+        val runtimeId = runtimeSessionId ?: eventSessionId
+        if (runtimeId.isNullOrBlank()) {
+            return null
+        }
+        val boundRequestId = requestId?.takeIf { it.isNotBlank() } ?: if (generation == null) "" else return null
+        return PrivilegedRequestBinding(
+            boundRequestId,
+            runtimeId,
+            profileId ?: selectedProfileId(),
+            generation ?: -1,
+        )
     }
 
     fun reconnect() {
