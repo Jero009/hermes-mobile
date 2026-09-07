@@ -91,11 +91,12 @@ open class ChatPersistenceRepository internal constructor(
         messages: List<ChatMessage>,
         sessionId: String,
         expectedGeneration: Long,
+        isOwnerCurrent: () -> Boolean = { true },
     ): Boolean =
         enqueueSessionOperation(sessionId) {
             val fence = replacementFence(sessionId)
             synchronized(fence) {
-                if (fence.generation != expectedGeneration) return@synchronized false
+                if (fence.generation != expectedGeneration || !isOwnerCurrent()) return@synchronized false
                 dao.upsertAll(messages.map { it.toEntity(sessionId) })
                 true
             }

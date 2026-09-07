@@ -436,6 +436,38 @@ class ChatPersistenceRepositoryTest {
         assertEquals(listOf("current page"), dao.contents("session-a"))
     }
 
+    @Test
+    fun pagedPersistenceChecksOwnerInsideSerializedWrite() {
+        val dao = RacingDao(blockContent = "blocker")
+        val repository = ChatPersistenceRepository(dao)
+        val revision = repository.replacementGeneration("session-a")
+        val executor = Executors.newSingleThreadExecutor()
+        var ownerCurrent = true
+        try {
+            val blocker = executor.submit { runBlocking { repository.persistMessage(message("blocker"), "session-a") } }
+            assertTrue(dao.blockedWriteStarted.await(5, TimeUnit.SECONDS))
+            val stale =
+                executor.submit<Boolean> {
+                    runBlocking {
+                        repository.persistMessagesIfCurrent(
+                            listOf(message("stale page")),
+                            "session-a",
+                            revision,
+                        ) { ownerCurrent }
+                    }
+                }
+            ownerCurrent = false
+            dao.allowBlockedWrite.countDown()
+
+            blocker.get(5, TimeUnit.SECONDS)
+            assertFalse(stale.get(5, TimeUnit.SECONDS))
+            assertEquals(listOf("blocker"), dao.contents("session-a"))
+        } finally {
+            dao.allowBlockedWrite.countDown()
+            executor.shutdownNow()
+        }
+    }
+
     private fun message(content: String) =
         ChatMessage(
             id = content,

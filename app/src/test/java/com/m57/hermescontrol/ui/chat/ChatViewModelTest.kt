@@ -2880,6 +2880,177 @@ class ChatViewModelTest {
         }
 
     @Test
+    fun concurrentFullRefresh_newestOwnerWinsAllHistoryState() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val releaseOlder = CompletableDeferred<Unit>()
+            var initialCalls = 0
+            val requests = mutableListOf<Pair<Int, String?>>()
+            coEvery { mockApi.getSessionMessages(sessionId, any(), any(), true, any()) } coAnswers {
+                val offset = arg<Int>(2)
+                val order = arg<String?>(4)
+                requests += offset to order
+                initialCalls++
+                val response =
+                    when (initialCalls) {
+                        1 -> {
+                            withContext(NonCancellable) { releaseOlder.await() }
+                            retrofit2.Response.success(
+                                com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                                    messages =
+                                        listOf(
+                                            com.m57.hermescontrol.data.model.SessionMessage(
+                                                role = "assistant",
+                                                content = "stale",
+                                            ),
+                                        ),
+                                    pagination =
+                                        com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                            150,
+                                            250,
+                                            null,
+                                            1,
+                                            400,
+                                        ),
+                                ),
+                            )
+                        }
+                        2 ->
+                            retrofit2.Response.success(
+                                com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                                    messages =
+                                        listOf(
+                                            com.m57.hermescontrol.data.model.SessionMessage(
+                                                id = 9,
+                                                role = "assistant",
+                                                content = "newest",
+                                            ),
+                                        ),
+                                    pagination =
+                                        com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                            150,
+                                            0,
+                                            "latest",
+                                            150,
+                                            400,
+                                        ),
+                                ),
+                            )
+                        else ->
+                            retrofit2.Response.success(
+                                com.m57.hermescontrol.data.model.SessionMessagesResponse(messages = emptyList()),
+                            )
+                    }
+                response
+            }
+
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            assertEquals("newest", viewModel.uiState.value.messages.last().content)
+            assertFalse(viewModel.uiState.value.isLoading)
+            assertNull(viewModel.uiState.value.errorMessage)
+
+            releaseOlder.complete(Unit)
+            advanceUntilIdle()
+            viewModel.loadOlderMessages()
+            advanceUntilIdle()
+
+            assertEquals("newest", viewModel.uiState.value.messages.last().content)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale" })
+            assertFalse(fakeRepo.loadMessages(sessionId).any { it.content == "stale" })
+            assertTrue(requests.contains(150 to "latest"))
+            assertFalse(viewModel.uiState.value.isLoading)
+            assertNull(viewModel.uiState.value.errorMessage)
+        }
+
+    @Test
+    fun concurrentFullRefresh_staleFailureCannotMutateNewestOwner() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val releaseFailure = CompletableDeferred<Unit>()
+            var calls = 0
+            coEvery { mockApi.getSessionMessages(sessionId, 150, 0, true, "latest") } coAnswers {
+                calls++
+                if (calls == 1) {
+                    withContext(NonCancellable) { releaseFailure.await() }
+                    retrofit2.Response.error(500, okhttp3.ResponseBody.create(null, "stale failure"))
+                } else {
+                    retrofit2.Response.success(
+                        com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                            messages =
+                                listOf(
+                                    com.m57.hermescontrol.data.model.SessionMessage(
+                                        id = 2,
+                                        role = "assistant",
+                                        content = "current",
+                                    ),
+                                ),
+                            pagination =
+                                com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                    150,
+                                    0,
+                                    "latest",
+                                    1,
+                                    1,
+                                ),
+                        ),
+                    )
+                }
+            }
+
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            releaseFailure.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals("current", viewModel.uiState.value.messages.last().content)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale failure" })
+            assertFalse(fakeRepo.loadMessages(sessionId).any { it.content == "stale failure" })
+            assertFalse(viewModel.uiState.value.isLoading)
+            assertNull(viewModel.uiState.value.errorMessage)
+        }
+
+    @Test
+    fun staleMessageCountResponseCannotMutateSessionsOrDriveHistoryRequest() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val releaseCount = CompletableDeferred<Unit>()
+            val requests = mutableListOf<Pair<String, Int>>()
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), true, "latest") } answers {
+                requests += arg<String>(0) to arg<Int>(2)
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(messages = emptyList()),
+                )
+            }
+            coEvery { mockApi.getSessions(any(), any(), any()) } coAnswers {
+                withContext(NonCancellable) { releaseCount.await() }
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionListResponse(
+                        sessions =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionInfo(id = sessionId, message_count = 400),
+                            ),
+                    ),
+                )
+            }
+
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            viewModel.switchSession("replacement")
+            runCurrent()
+            releaseCount.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals("replacement", viewModel.uiState.value.currentSessionId)
+            assertFalse(viewModel.uiState.value.sessions.any { it.id == sessionId && it.messageCount == 400 })
+            assertFalse(requests.contains(sessionId to 250))
+        }
+
+    @Test
     fun testCompactedHistory_usesLatestOrderAndPagesBackward() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
