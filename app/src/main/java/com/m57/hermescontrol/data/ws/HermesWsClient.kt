@@ -853,6 +853,7 @@ object HermesWsClient {
                 !connected.get() ||
                 ws == null ||
                 sessionId.isBlank() ||
+                clarifyRequestId.isBlank() ||
                 sourceConnectionGeneration != activeConnectionGeneration ||
                 sourceProfileId != activeConnectionProfileId ||
                 sourceProfileId != AuthManager.getSelectedProfileId() ||

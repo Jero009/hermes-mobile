@@ -157,11 +157,9 @@ object EventParser {
             }
 
             "clarify.expire" -> {
-                val clarifyId =
-                    payload?.get("request_id") as? String
-                        ?: payload?.get("clarify_id") as? String
-                        ?: return WsEvent.Unknown(rawJson)
-                WsEvent.ClarifyExpire(clarifyId, sessionId)
+                val clarifyId = exactClarifyRequestId(payload) ?: return WsEvent.Unknown(rawJson)
+                val clarifySessionId = privilegedSessionId ?: return WsEvent.Unknown(rawJson)
+                WsEvent.ClarifyExpire(clarifyId, clarifySessionId)
             }
 
             "status.update" -> {
@@ -273,10 +271,14 @@ object EventParser {
     private fun privilegedRequestId(payload: Map<String, Any?>?): String? =
         (payload?.get("request_id") as? String)?.takeIf { it.isNotBlank() }
 
-    /** Require one non-blank clarification request id from either supported alias. */
-    private fun exactClarifyRequestId(payload: Map<String, Any?>?): String? =
-        ((payload?.get("clarify_id") as? String) ?: (payload?.get("request_id") as? String))
-            ?.takeIf { it.isNotBlank() }
+    /** Require one non-blank, non-conflicting clarification id across both aliases. */
+    private fun exactClarifyRequestId(payload: Map<String, Any?>?): String? {
+        val clarifyId = payload?.get("clarify_id")?.let { it as? String ?: return null }
+        val requestId = payload?.get("request_id")?.let { it as? String ?: return null }
+        if (clarifyId.isNullOrBlank() && requestId.isNullOrBlank()) return null
+        if (clarifyId != null && requestId != null && clarifyId != requestId) return null
+        return (clarifyId ?: requestId)?.takeIf { it.isNotBlank() }
+    }
 
     /** Require one non-blank runtime session, with no conflicting payload alias. */
     private fun exactPrivilegedSessionId(

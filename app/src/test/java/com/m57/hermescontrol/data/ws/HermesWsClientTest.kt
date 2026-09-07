@@ -825,6 +825,30 @@ class HermesWsClientTest {
         assertTrue(outboundQueue().isEmpty())
     }
 
+    @Test
+    fun clarifyResponseRejectsBlankRequestIdentityWithoutWritingOrQueueing() {
+        val socket = mockk<WebSocket>(relaxed = true)
+        every { socket.send(any<String>()) } returns true
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        installActiveListener(socket)
+        ActiveSessionHolder.set("runtime-session")
+
+        listOf("", "   ").forEach { requestId ->
+            assertFalse(
+                HermesWsClient.respondToClarify(
+                    sessionId = "runtime-session",
+                    clarifyRequestId = requestId,
+                    questionId = null,
+                    answer = "answer",
+                    sourceProfileId = "profile-a",
+                    sourceConnectionGeneration = activeConnectionGeneration(),
+                ),
+            )
+        }
+        verify(exactly = 0) { socket.send(any<String>()) }
+        assertTrue(outboundQueue().isEmpty())
+    }
+
     private fun outboundQueue(): java.util.Queue<*> {
         val queueField = HermesWsClient::class.java.getDeclaredField("messageQueue")
         queueField.isAccessible = true

@@ -845,6 +845,35 @@ class EventParserPrivilegedTest {
     }
 
     @Test
+    fun clarifyExpiryRequiresExactRequestAndRuntimeSessionProvenance() {
+        val valid =
+            EventParser.parse(
+                privilegedEvent(
+                    "clarify.expire",
+                    mapOf("clarify_id" to "clarify-1", "request_id" to "clarify-1"),
+                ),
+            )
+        assertEquals(WsEvent.ClarifyExpire("clarify-1", "session-a"), valid)
+
+        val malformed =
+            listOf(
+                privilegedEvent("clarify.expire", mapOf("request_id" to "")),
+                privilegedEvent("clarify.expire", mapOf("request_id" to "   ")),
+                privilegedEvent(
+                    "clarify.expire",
+                    mapOf("request_id" to "clarify-1", "clarify_id" to "clarify-2"),
+                ),
+                privilegedEvent("clarify.expire", mapOf("request_id" to "clarify-1"), null),
+                privilegedEvent("clarify.expire", mapOf("request_id" to "clarify-1"), " "),
+                privilegedEvent(
+                    "clarify.expire",
+                    mapOf("request_id" to "clarify-1", "session_id" to "other-session"),
+                ),
+            )
+        malformed.forEach { assertTrue(EventParser.parse(it) is WsEvent.Unknown) }
+    }
+
+    @Test
     fun approvalRequestWithoutARequestIdIsRejected() {
         val event =
             EventParser.parse(
