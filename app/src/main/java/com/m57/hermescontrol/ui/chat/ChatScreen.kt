@@ -631,6 +631,8 @@ fun ChatScreen(
                     lastAnimatedMessageId = lastAnimatedMessageId,
                     onLastAnimatedMessageIdChange = { lastAnimatedMessageId = it },
                     viewModel = viewModel,
+                    onRespondApproval = viewModel::respondToApproval,
+                    onCancelApproval = viewModel::cancelApproval,
                     openingAttachmentPath = state.openingAttachmentPath,
                     clarifyRequest = state.clarifyRequest,
                     onRespondClarify = viewModel::respondToClarifyBatch,

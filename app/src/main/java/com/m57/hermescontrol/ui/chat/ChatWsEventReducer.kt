@@ -91,7 +91,13 @@ object ChatWsEventReducer {
             is WsEvent.ClarifyExpire ->
                 ReducerResult(
                     state =
-                        if (state.clarifyRequest?.clarifyId == event.clarifyId) {
+                        if (state.clarifyRequest?.let { clarify ->
+                                clarify.clarifyId == event.clarifyId &&
+                                    clarify.sessionId == event.sessionId &&
+                                    clarify.sourceProfileId == event.sourceProfileId &&
+                                    clarify.connectionGeneration == event.connectionGeneration
+                            } == true
+                        ) {
                             state.copy(clarifyRequest = null)
                         } else {
                             state

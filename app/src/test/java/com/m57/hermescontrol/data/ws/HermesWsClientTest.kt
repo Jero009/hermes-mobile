@@ -533,6 +533,8 @@ class HermesWsClientTest {
                     """"session_id":"session-a","payload":{"request_id":"r1"}}}""",
                 """{"jsonrpc":"2.0","method":"event","params":{"type":"secret.expire",""" +
                     """"session_id":"session-a","payload":{"request_id":"r2"}}}""",
+                """{"jsonrpc":"2.0","method":"event","params":{"type":"clarify.expire",""" +
+                    """"session_id":"session-a","payload":{"request_id":"r3"}}}""",
             )
 
         val received =
@@ -563,6 +565,10 @@ class HermesWsClientTest {
         val secretExpire = received.filterIsInstance<WsEvent.SecretExpire>().first()
         assertEquals("profile-a", secretExpire.sourceProfileId)
         assertEquals(generation, secretExpire.connectionGeneration)
+
+        val clarifyExpire = received.filterIsInstance<WsEvent.ClarifyExpire>().first()
+        assertEquals("profile-a", clarifyExpire.sourceProfileId)
+        assertEquals(generation, clarifyExpire.connectionGeneration)
     }
 
     @Test

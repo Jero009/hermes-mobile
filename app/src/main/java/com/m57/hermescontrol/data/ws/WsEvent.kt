@@ -146,6 +146,8 @@ sealed class WsEvent {
     data class ClarifyExpire(
         val clarifyId: String,
         val sessionId: String? = null,
+        val sourceProfileId: String? = null,
+        val connectionGeneration: Int? = null,
     ) : WsEvent()
 
     /**

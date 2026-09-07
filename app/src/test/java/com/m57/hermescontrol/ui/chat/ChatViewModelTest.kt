@@ -1819,7 +1819,9 @@ class ChatViewModelTest {
             )
             advanceUntilIdle()
             val expired = viewModel.uiState.value.clarifyRequest!!
-            mockEventsFlow.emit(WsEvent.ClarifyExpire("clarify-expired", sessionId))
+            mockEventsFlow.emit(
+                WsEvent.ClarifyExpire("clarify-expired", sessionId, "profile-a", 10),
+            )
             advanceUntilIdle()
 
             viewModel.respondToClarifyBatch(expired, mapOf("q0" to "too late"))
@@ -2829,6 +2831,16 @@ class ChatViewModelTest {
     private fun ChatViewModel.approvalMessage(): ChatMessage? =
         uiState.value.messages.lastOrNull { it.approvalInfo != null }
 
+    private fun ChatViewModel.respondToApproval(action: String) {
+        val message = requireNotNull(approvalMessage())
+        respondToApproval(message.id, requireNotNull(message.approvalInfo).privilegedBinding, action)
+    }
+
+    private fun ChatViewModel.cancelApproval() {
+        val message = requireNotNull(approvalMessage())
+        cancelApproval(message.id, requireNotNull(message.approvalInfo).privilegedBinding)
+    }
+
     // ── Approval flow ────────────────────────────────────────────────────────
 
     @Test
@@ -3032,6 +3044,59 @@ class ChatViewModelTest {
             val live = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
             assertEquals(1, live.size)
             assertEquals("approval-2", live[0].approvalInfo?.privilegedBinding?.requestId)
+        }
+
+    @Test
+    fun olderApprovalCardClickTargetsThatExactRequestAndDisablesOnlyThatCard() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            val calls = capturePrivileged(ack)
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-old"))
+            runCurrent()
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-new"))
+            runCurrent()
+            val cards = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            val older = cards.first()
+            val olderBinding = requireNotNull(older.approvalInfo).privilegedBinding
+
+            viewModel.respondToApproval(older.id, olderBinding, "approve")
+            viewModel.respondToApproval(older.id, olderBinding, "deny")
+            runCurrent()
+
+            assertEquals(listOf("approval-old"), calls.map { it.binding.requestId })
+            val pending = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            assertTrue(requireNotNull(pending.first { it.id == older.id }.approvalInfo).isSubmitting)
+            assertFalse(requireNotNull(pending.first { it.id != older.id }.approvalInfo).isSubmitting)
+
+            ack.complete(mapOf("status" to "ok"))
+            runCurrent()
+            val live = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            assertEquals(listOf("approval-new"), live.map { it.approvalInfo!!.privilegedBinding.requestId })
+        }
+
+    @Test
+    fun failedOlderApprovalRestoresOnlyThatExactCard() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val rejected = CompletableDeferred<Any?>()
+            val calls = capturePrivileged(rejected)
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-old"))
+            runCurrent()
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-new"))
+            runCurrent()
+            val older = viewModel.uiState.value.messages.first { it.approvalInfo != null }
+            val binding = older.approvalInfo!!.privilegedBinding
+
+            viewModel.cancelApproval(older.id, binding)
+            runCurrent()
+            rejected.completeExceptionally(IllegalStateException("not acknowledged"))
+            runCurrent()
+
+            assertEquals(listOf("approval-old"), calls.map { it.binding.requestId })
+            val cards = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            assertFalse(cards.any { it.approvalInfo!!.isSubmitting })
+            assertEquals("not acknowledged", viewModel.uiState.value.errorMessage)
         }
 
     // ── Sudo / secret prompt flow (issue #524) ───────────────────────────

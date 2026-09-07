@@ -3205,7 +3205,11 @@ class ChatViewModel(
     }
 
     /** Approve exactly once. Session-wide and permanent allows are not offered. */
-    fun respondToApproval(action: String) {
+    fun respondToApproval(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+        action: String,
+    ) {
         val choice =
             when (action) {
                 "approve" -> "once"
@@ -3214,32 +3218,77 @@ class ChatViewModel(
                 // cannot show what a standing allow would later authorize.
                 else -> return
             }
-        submitApproval(WsMethods.APPROVAL_RESPOND, mapOf("choice" to choice))
+        submitApproval(messageId, binding, WsMethods.APPROVAL_RESPOND, mapOf("choice" to choice))
     }
 
     /** Explicit Cancel — a typed `approval.cancel`, not a denial and not a dismissal. */
-    fun cancelApproval() {
-        submitApproval(WsMethods.APPROVAL_CANCEL, emptyMap())
+    fun cancelApproval(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+    ) {
+        submitApproval(messageId, binding, WsMethods.APPROVAL_CANCEL, emptyMap())
     }
 
     private fun submitApproval(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
         method: String,
         params: Map<String, String>,
     ) {
-        val approvalMsg = _uiState.value.messages.lastOrNull { it.approvalInfo != null } ?: return
-        val binding = approvalMsg.approvalInfo?.privilegedBinding ?: return
+        if (!claimApprovalSubmission(messageId, binding)) return
 
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
                 wsClient.privilegedRequest(method = method, binding = binding, params = params).await()
             }.onSuccess {
                 approvalExpiryJobs.remove(binding.requestId)?.cancel()
-                clearApprovalControls(approvalMsg.id, binding)
+                clearApprovalControls(messageId, binding)
             }.onFailure { error ->
-                // The gateway never saw it, or never acknowledged it. Leave the
-                // controls live so the user can retry the same exact request.
-                _uiState.update { it.copy(errorMessage = error.message) }
+                restoreApprovalControls(messageId, binding, error.message)
             }
+        }
+    }
+
+    private fun claimApprovalSubmission(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+    ): Boolean {
+        while (true) {
+            val state = _uiState.value
+            var matched = false
+            val messages =
+                state.messages.map { message ->
+                    val info = message.approvalInfo
+                    if (message.id == messageId && info?.privilegedBinding == binding && !info.isSubmitting) {
+                        matched = true
+                        message.copy(approvalInfo = info.copy(isSubmitting = true))
+                    } else {
+                        message
+                    }
+                }
+            if (!matched) return false
+            if (_uiState.compareAndSet(state, state.copy(messages = messages))) return true
+        }
+    }
+
+    private fun restoreApprovalControls(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+        errorMessage: String?,
+    ) {
+        _uiState.update { state ->
+            state.copy(
+                messages =
+                    state.messages.map { message ->
+                        val info = message.approvalInfo
+                        if (message.id == messageId && info?.privilegedBinding == binding) {
+                            message.copy(approvalInfo = info.copy(isSubmitting = false))
+                        } else {
+                            message
+                        }
+                    },
+                errorMessage = errorMessage,
+            )
         }
     }
 

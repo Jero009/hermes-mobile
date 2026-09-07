@@ -18,6 +18,7 @@ data class ApprovalInfo(
     val description: String?,
     val patternKeys: List<String>?,
     val privilegedBinding: PrivilegedRequestBinding,
+    val isSubmitting: Boolean = false,
 )
 
 /**

@@ -1206,6 +1206,8 @@ object HermesWsClient {
                         parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
                     is WsEvent.SecretExpire ->
                         parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
+                    is WsEvent.ClarifyExpire ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
                     else -> parsedEvent
                 }
             synchronized(connectionLock) {

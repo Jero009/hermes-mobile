@@ -85,6 +85,7 @@ import androidx.compose.ui.unit.sp
 import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.model.Attachment
 import com.m57.hermescontrol.data.remote.OkHttpProvider
+import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import com.m57.hermescontrol.theme.ChatFontScale
 import com.m57.hermescontrol.theme.DarkOnSurface
 import com.m57.hermescontrol.theme.HermesStatusColors
@@ -115,8 +116,8 @@ fun ChatBubble(
     isDarkTheme: Boolean,
     searchQuery: String = "",
     isCurrentMatch: Boolean = false,
-    onRespondApproval: (String) -> Unit = {},
-    onCancelApproval: () -> Unit = {},
+    onRespondApproval: (String, PrivilegedRequestBinding, String) -> Unit = { _, _, _ -> },
+    onCancelApproval: (String, PrivilegedRequestBinding) -> Unit = { _, _ -> },
     onOpenAttachment: (Attachment) -> Unit = {},
     openingAttachmentPath: String? = null,
     onImageClick: (ImageViewerModel) -> Unit = {},
@@ -566,8 +567,8 @@ private fun SelfImprovementReviewCard(
 @Composable
 private fun SystemBubble(
     message: ChatMessage,
-    onRespondApproval: (String) -> Unit = {},
-    onCancelApproval: () -> Unit = {},
+    onRespondApproval: (String, PrivilegedRequestBinding, String) -> Unit = { _, _, _ -> },
+    onCancelApproval: (String, PrivilegedRequestBinding) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     if (message.content.contains("Self-improvement review:", ignoreCase = true)) {
@@ -594,13 +595,15 @@ private fun SystemBubble(
         // Approval action buttons. Approve is a single-use "once" — there is
         // deliberately no session-wide or permanent allow, because nothing on
         // this screen shows what a standing allow would later authorize.
-        if (message.approvalInfo != null) {
+        val approvalInfo = message.approvalInfo
+        if (approvalInfo != null) {
             Spacer(Modifier.height(8.dp))
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 FilledTonalButton(
-                    onClick = { onRespondApproval("approve") },
+                    onClick = { onRespondApproval(message.id, approvalInfo.privilegedBinding, "approve") },
+                    enabled = !approvalInfo.isSubmitting,
                     modifier =
                         Modifier
                             .height(36.dp)
@@ -620,7 +623,8 @@ private fun SystemBubble(
                 }
 
                 FilledTonalButton(
-                    onClick = { onRespondApproval("deny") },
+                    onClick = { onRespondApproval(message.id, approvalInfo.privilegedBinding, "deny") },
+                    enabled = !approvalInfo.isSubmitting,
                     modifier =
                         Modifier
                             .height(36.dp)
@@ -642,7 +646,8 @@ private fun SystemBubble(
                 // Withdraw the request entirely (typed `approval.cancel`).
                 // Distinct from Deny, which is an answer the agent can adapt to.
                 TextButton(
-                    onClick = onCancelApproval,
+                    onClick = { onCancelApproval(message.id, approvalInfo.privilegedBinding) },
+                    enabled = !approvalInfo.isSubmitting,
                     modifier =
                         Modifier
                             .height(36.dp)
