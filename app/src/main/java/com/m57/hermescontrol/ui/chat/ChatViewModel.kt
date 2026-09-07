@@ -407,8 +407,8 @@ class ChatViewModel(
         // B7 (Jun 30 2026, kanban t_connection_loading): clear loading state on connection failure or status change
         viewModelScope.launch {
             wsClient.connectionStatus.collect { status ->
+                _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
                 conversationGeneration++
-                repo.invalidateReplacementWrites()
                 if (status == ConnectionStatus.DISCONNECTED ||
                     status == ConnectionStatus.RECONNECTING ||
                     status == ConnectionStatus.NO_NETWORK ||
@@ -1402,7 +1402,7 @@ class ChatViewModel(
                 profileId = profileId,
                 connectionBinding = connectionBinding,
                 generation = conversationGeneration,
-                persistenceGeneration = repo.replacementGeneration(),
+                persistenceGeneration = repo.replacementGeneration(storageSessionId),
             )
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -1710,8 +1710,8 @@ class ChatViewModel(
         onDispatched: (() -> Unit)? = null,
     ) {
         clearPrivilegedControls()
+        _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
         conversationGeneration++
-        repo.invalidateReplacementWrites()
         val generation = ++sessionCreateCounter
         sessionCreateJob?.cancel()
         sessionCreateJob = null
@@ -2162,8 +2162,8 @@ class ChatViewModel(
         if (sessionId == _uiState.value.currentSessionId) return
 
         clearPrivilegedControls()
+        _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
         conversationGeneration++
-        repo.invalidateReplacementWrites()
         // A pending session.create belongs to the conversation the user just
         // left. Retiring the generation makes any late answer inert, and the
         // timer must go with it or it would retry a create into this session.

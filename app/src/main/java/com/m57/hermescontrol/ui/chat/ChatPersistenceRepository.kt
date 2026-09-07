@@ -23,9 +23,15 @@ open class ChatPersistenceRepository internal constructor(
 ) {
     constructor(dao: ChatMessageDao) : this(dao, OperationRegistrationHook {})
 
-    private val replacementLock = Any()
+    private class ReplacementFence(var generation: Long = 0L)
+
+    private val replacementFences = mutableMapOf<String, ReplacementFence>()
     private val operationTails = mutableMapOf<String, CompletableDeferred<Unit>>()
-    private var replacementGeneration = 0L
+
+    private fun replacementFence(sessionId: String): ReplacementFence =
+        synchronized(replacementFences) {
+            replacementFences.getOrPut(sessionId) { ReplacementFence() }
+        }
 
     private suspend fun <T> enqueueSessionOperation(
         sessionId: String,
@@ -53,10 +59,11 @@ open class ChatPersistenceRepository internal constructor(
 
     internal fun queuedSessionCount(): Int = synchronized(operationTails) { operationTails.size }
 
-    fun replacementGeneration(): Long = synchronized(replacementLock) { replacementGeneration }
+    fun replacementGeneration(sessionId: String): Long =
+        replacementFence(sessionId).let { fence -> synchronized(fence) { fence.generation } }
 
-    fun invalidateReplacementWrites() {
-        synchronized(replacementLock) { replacementGeneration++ }
+    fun invalidateReplacementWrites(sessionId: String) {
+        replacementFence(sessionId).let { fence -> synchronized(fence) { fence.generation++ } }
     }
 
     /** Persist a single message for the given session. */
@@ -90,8 +97,9 @@ open class ChatPersistenceRepository internal constructor(
         expectedGeneration: Long,
     ): Boolean =
         enqueueSessionOperation(sessionId) {
-            synchronized(replacementLock) {
-                if (replacementGeneration != expectedGeneration) return@synchronized false
+            val fence = replacementFence(sessionId)
+            synchronized(fence) {
+                if (fence.generation != expectedGeneration) return@synchronized false
                 dao.replaceMessagesForSession(sessionId, messages.map { it.toEntity(sessionId) })
                 true
             }

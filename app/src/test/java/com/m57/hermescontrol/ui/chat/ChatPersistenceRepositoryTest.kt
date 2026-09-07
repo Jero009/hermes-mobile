@@ -48,7 +48,7 @@ class ChatPersistenceRepositoryTest {
                     repository.replaceMessagesIfCurrent(
                         listOf(message("replacement")),
                         "session-a",
-                        repository.replacementGeneration(),
+                        repository.replacementGeneration("session-a"),
                     )
                 }
             secondRegistered.await()
@@ -184,7 +184,7 @@ class ChatPersistenceRepositoryTest {
                         repository.replaceMessagesIfCurrent(
                             listOf(message("replacement")),
                             "session-a",
-                            repository.replacementGeneration(),
+                            repository.replacementGeneration("session-a"),
                         )
                     }
                 }
@@ -229,7 +229,7 @@ class ChatPersistenceRepositoryTest {
                         repository.replaceMessagesIfCurrent(
                             listOf(message("replacement")),
                             "session-a",
-                            repository.replacementGeneration(),
+                            repository.replacementGeneration("session-a"),
                         )
                     }
                 }
@@ -262,7 +262,7 @@ class ChatPersistenceRepositoryTest {
                 repository.replaceMessagesIfCurrent(
                     listOf(message("replacement")),
                     "session-a",
-                    repository.replacementGeneration(),
+                    repository.replacementGeneration("session-a"),
                 ),
             )
             repository.persistMessage(message("new message"), "session-a")
@@ -294,7 +294,7 @@ class ChatPersistenceRepositoryTest {
                         repository.replaceMessagesIfCurrent(
                             listOf(message("other replacement")),
                             "session-b",
-                            repository.replacementGeneration(),
+                            repository.replacementGeneration("session-b"),
                         )
                     }
                 }
@@ -313,7 +313,7 @@ class ChatPersistenceRepositoryTest {
     fun replacementAndInvalidationAreAtomic() {
         val dao = RacingDao(blockReplacement = true)
         val repository = ChatPersistenceRepository(dao)
-        val generation = repository.replacementGeneration()
+        val generation = repository.replacementGeneration("session-a")
         val executor = Executors.newFixedThreadPool(2)
 
         try {
@@ -326,7 +326,7 @@ class ChatPersistenceRepositoryTest {
             assertTrue(dao.blockedReplacementStarted.await(5, TimeUnit.SECONDS))
             val invalidationFinished = CountDownLatch(1)
             executor.submit {
-                repository.invalidateReplacementWrites()
+                repository.invalidateReplacementWrites("session-a")
                 invalidationFinished.countDown()
             }
 
@@ -345,6 +345,76 @@ class ChatPersistenceRepositoryTest {
         }
     }
 
+    @Test
+    fun blockedReplacementAndItsInvalidationDoNotBlockAnotherSession() {
+        val dao = RacingDao(blockReplacementSessionId = "session-a")
+        val repository = ChatPersistenceRepository(dao)
+        val generationA = repository.replacementGeneration("session-a")
+        val generationB = repository.replacementGeneration("session-b")
+        val executor = Executors.newFixedThreadPool(3)
+
+        try {
+            val blocked =
+                executor.submit<Boolean> {
+                    runBlocking {
+                        repository.replaceMessagesIfCurrent(listOf(message("current-a")), "session-a", generationA)
+                    }
+                }
+            assertTrue(dao.blockedReplacementStarted.await(5, TimeUnit.SECONDS))
+            val invalidationFinished = CountDownLatch(1)
+            executor.submit {
+                repository.invalidateReplacementWrites("session-a")
+                invalidationFinished.countDown()
+            }
+            assertFalse(invalidationFinished.await(100, TimeUnit.MILLISECONDS))
+            assertTrue(
+                runBlocking {
+                    repository.replaceMessagesIfCurrent(listOf(message("current-b")), "session-b", generationB)
+                },
+            )
+            assertEquals(listOf("current-b"), dao.contents("session-b"))
+            dao.allowBlockedReplacement.countDown()
+            assertTrue(blocked.get(5, TimeUnit.SECONDS))
+            assertTrue(invalidationFinished.await(5, TimeUnit.SECONDS))
+            assertFalse(
+                runBlocking {
+                    repository.replaceMessagesIfCurrent(listOf(message("stale-a")), "session-a", generationA)
+                },
+            )
+            assertTrue(
+                runBlocking {
+                    repository.replaceMessagesIfCurrent(listOf(message("still-current-b")), "session-b", generationB)
+                },
+            )
+        } finally {
+            dao.allowBlockedReplacement.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun replacementGenerationsAreIsolatedAndNeverReset() {
+        val repository = ChatPersistenceRepository(RacingDao())
+        val initialA = repository.replacementGeneration("session-a")
+        val initialB = repository.replacementGeneration("session-b")
+        repository.invalidateReplacementWrites("session-a")
+        val nextA = repository.replacementGeneration("session-a")
+        repository.invalidateReplacementWrites("session-a")
+
+        assertEquals(initialA + 2, repository.replacementGeneration("session-a"))
+        assertEquals(initialB, repository.replacementGeneration("session-b"))
+        assertFalse(
+            runBlocking {
+                repository.replaceMessagesIfCurrent(listOf(message("stale-a")), "session-a", initialA)
+            },
+        )
+        assertFalse(
+            runBlocking {
+                repository.replaceMessagesIfCurrent(listOf(message("also-stale-a")), "session-a", nextA)
+            },
+        )
+    }
+
     private fun message(content: String) =
         ChatMessage(
             id = content,
@@ -355,6 +425,7 @@ class ChatPersistenceRepositoryTest {
     private class RacingDao(
         private val blockContent: String? = null,
         private val blockReplacement: Boolean = false,
+        private val blockReplacementSessionId: String? = null,
         private val failContent: String? = null,
     ) : ChatMessageDao {
         private val messages = ConcurrentHashMap<String, MutableList<ChatMessageEntity>>()
@@ -388,7 +459,7 @@ class ChatPersistenceRepositoryTest {
             sessionId: String,
             messages: List<ChatMessageEntity>,
         ) {
-            if (blockReplacement) {
+            if (blockReplacement || sessionId == blockReplacementSessionId) {
                 blockedReplacementStarted.countDown()
                 assertTrue(allowBlockedReplacement.await(5, TimeUnit.SECONDS))
             }
