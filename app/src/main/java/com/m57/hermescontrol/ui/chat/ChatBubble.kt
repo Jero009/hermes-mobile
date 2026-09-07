@@ -48,6 +48,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -64,6 +65,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
@@ -74,6 +76,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -90,6 +93,7 @@ import com.m57.hermescontrol.theme.onColorFor
 import com.m57.hermescontrol.ui.chat.components.DiffViewCard
 import com.m57.hermescontrol.ui.chat.components.ReasoningCard
 import com.m57.hermescontrol.ui.chat.components.SystemTimelineMarker
+import com.m57.hermescontrol.util.BidiUtils
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonArray
@@ -264,12 +268,20 @@ private fun UserBubble(
             ) {
                 Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
                     ChatFontScale {
-                        SelectionContainer {
-                            Text(
-                                text = highlightedText,
-                                color = userBubbleTextColor,
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
+                        val isRtl = remember(message.content) { BidiUtils.isRtlText(message.content) }
+                        val textDirection =
+                            if (isRtl) androidx.compose.ui.unit.LayoutDirection.Rtl else LocalLayoutDirection.current
+                        CompositionLocalProvider(LocalLayoutDirection provides textDirection) {
+                            SelectionContainer {
+                                Text(
+                                    text = highlightedText,
+                                    color = userBubbleTextColor,
+                                    style =
+                                        MaterialTheme.typography.bodyMedium.copy(
+                                            textDirection = if (isRtl) TextDirection.Rtl else TextDirection.Ltr,
+                                        ),
+                                )
+                            }
                         }
                     }
                     // Render inline attachments
