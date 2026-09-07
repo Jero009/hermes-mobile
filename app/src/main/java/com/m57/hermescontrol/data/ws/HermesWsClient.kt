@@ -678,7 +678,13 @@ object HermesWsClient {
                 activeConnectionGeneration == binding.generation
         }
 
-    /** Atomically refuse requests captured for a superseded profile/socket. */
+    /**
+     * Atomically send an awaited request on an exact live foreground socket.
+     *
+     * This bound path is intentionally separate from [request]/[send]: a control
+     * request must fail closed rather than enter [messageQueue] or trigger a
+     * reconnect when its captured profile, runtime session, or socket changes.
+     */
     fun requestForConnection(
         binding: ConnectionBinding,
         method: String,
@@ -686,16 +692,43 @@ object HermesWsClient {
         timeoutMs: Long = REQUEST_TIMEOUT_MS,
     ): CompletableDeferred<Any?> =
         synchronized(connectionLock) {
-            if (!connected.get() ||
+            val deferred = CompletableDeferred<Any?>()
+            val runtimeSessionId = params["session_id"] as? String
+            if (!appInForeground.get() ||
+                !connected.get() ||
                 webSocket !== binding.socket ||
                 activeConnectionProfileId != binding.profileId ||
-                activeConnectionGeneration != binding.generation
+                activeConnectionGeneration != binding.generation ||
+                AuthManager.getSelectedProfileId() != binding.profileId ||
+                runtimeSessionId == null ||
+                ActiveSessionHolder.activeSessionId.value != runtimeSessionId
             ) {
-                return@synchronized CompletableDeferred<Any?>().also {
-                    it.completeExceptionally(HermesRpcException("WebSocket connection changed — request cancelled"))
-                }
+                deferred.completeExceptionally(
+                    HermesRpcException("WebSocket binding changed — request cancelled"),
+                )
+                return@synchronized deferred
             }
-            request(method, params, timeoutMs)
+
+            val id = requestId.incrementAndGet().toString()
+            val request =
+                JsonRpcRequest(
+                    id = id,
+                    method = method,
+                    params = params.mapValues { it.value.toJsonElement() },
+                )
+            val pending = PendingCall(method, deferred)
+            pendingCalls[id] = pending
+            if (!binding.socket.send(OkHttpProvider.json.encodeToString(request))) {
+                pendingCalls.remove(id)
+                deferred.completeExceptionally(HermesRpcException("Bound request was not sent"))
+            } else {
+                pending.timeoutJob =
+                    wsScope.launch {
+                        delay(timeoutMs)
+                        resolvePending(id, null, JsonRpcError(-1, "Request timed out: $method"))
+                    }
+            }
+            deferred
         }
 
     /** Complete (or fail) a single pending call and cancel its timer. */
@@ -813,7 +846,8 @@ object HermesWsClient {
         sourceConnectionGeneration: Int,
     ): Boolean =
         synchronized(connectionLock) {
-            if (!connected.get() ||
+            if (!appInForeground.get() ||
+                !connected.get() ||
                 sourceConnectionGeneration != activeConnectionGeneration ||
                 sourceProfileId != activeConnectionProfileId ||
                 sourceProfileId != AuthManager.getSelectedProfileId()
