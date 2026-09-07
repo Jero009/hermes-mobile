@@ -586,12 +586,23 @@ object HermesWsClient {
             deferred
         }
 
-    /** Sensitive controls are never queued or retried onto a replacement connection. */
+    /**
+     * Answer or cancel exactly one privileged gateway request.
+     *
+     * Unlike [send] this has no queue, no reconnect retry, and no fallback: the
+     * frame either goes out on the very socket generation that dispatched the
+     * request, under the same profile, or the call fails. A privileged frame
+     * replayed onto a replacement connection would authorize a request the user
+     * never saw, so a stale [binding] must never reach the wire.
+     *
+     * The returned deferred completes only on the gateway's own acknowledgement
+     * (or its error / the request timeout), so callers can gate destructive UI
+     * transitions on a real ack.
+     */
     fun privilegedRequest(
         method: String,
         binding: PrivilegedRequestBinding,
-        valueKey: String,
-        value: String,
+        params: Map<String, String> = emptyMap(),
     ): CompletableDeferred<Any?> =
         synchronized(connectionLock) {
             val deferred = CompletableDeferred<Any?>()
@@ -604,14 +615,14 @@ object HermesWsClient {
                 return@synchronized deferred
             }
             val id = requestId.incrementAndGet().toString()
-            val params =
-                mapOf(
-                    "session_id" to binding.runtimeSessionId,
-                    "request_id" to binding.requestId,
-                    valueKey to value,
-                )
+            val allParams =
+                params +
+                    mapOf(
+                        "session_id" to binding.runtimeSessionId,
+                        "request_id" to binding.requestId,
+                    )
             val request =
-                JsonRpcRequest(id = id, method = method, params = params.mapValues { it.value.toJsonElement() })
+                JsonRpcRequest(id = id, method = method, params = allParams.mapValues { it.value.toJsonElement() })
             val json = OkHttpProvider.json.encodeToString(request)
             val pending = PendingCall(method, deferred)
             pendingCalls[id] = pending
@@ -1112,13 +1123,22 @@ object HermesWsClient {
                     )
                     WsEvent.Unknown(text)
                 }
+            // Stamp the dispatching profile and socket generation onto every
+            // privileged frame — request *and* expiry. Provenance has to come
+            // from the connection that delivered the frame; re-deriving it when
+            // the user acts would let a profile switch or reconnect rebind a
+            // live request (or let a stale expiry clear a fresh dialog).
             val event =
                 when (parsedEvent) {
                     is WsEvent.ApprovalRequest ->
                         parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
                     is WsEvent.SudoRequest ->
                         parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
+                    is WsEvent.SudoExpire ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
                     is WsEvent.SecretRequest ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
+                    is WsEvent.SecretExpire ->
                         parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
                     else -> parsedEvent
                 }

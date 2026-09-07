@@ -121,6 +121,7 @@ fun ChatMessageList(
                         searchQuery = if (isSearchActive) searchQuery else "",
                         isCurrentMatch = isCurrentMatch,
                         onRespondApproval = viewModel::respondToApproval,
+                        onCancelApproval = viewModel::cancelApproval,
                         onOpenAttachment = viewModel::openAttachment,
                         openingAttachmentPath = openingAttachmentPath,
                         onImageClick = onImageClick,

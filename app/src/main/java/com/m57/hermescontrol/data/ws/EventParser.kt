@@ -197,35 +197,63 @@ object EventParser {
             }
 
             "approval.request" -> {
-                val command = payload?.get("command") as? String
-                val description = payload?.get("description") as? String
+                val requestId = privilegedRequestId(payload)
+                val timeoutSeconds = approvalTimeoutSeconds(payload)
+                if (requestId == null || timeoutSeconds == null) {
+                    reject(eventType, sessionId)
+                } else {
+                    val command = payload?.get("command") as? String
+                    val description = payload?.get("description") as? String
 
-                @Suppress("UNCHECKED_CAST")
-                val patternKeys = (payload?.get("pattern_keys") as? List<*>)?.filterIsInstance<String>()
-                val requestId = payload?.get("request_id") as? String
-                WsEvent.ApprovalRequest(command, description, patternKeys, sessionId, requestId)
+                    @Suppress("UNCHECKED_CAST")
+                    val patternKeys = (payload?.get("pattern_keys") as? List<*>)?.filterIsInstance<String>()
+                    WsEvent.ApprovalRequest(
+                        command = command,
+                        description = description,
+                        patternKeys = patternKeys,
+                        sessionId = sessionId,
+                        requestId = requestId,
+                        timeoutSeconds = timeoutSeconds,
+                    )
+                }
             }
 
             "sudo.request" -> {
-                val requestId = payload?.get("request_id") as? String
-                WsEvent.SudoRequest(requestId, sessionId)
+                val requestId = privilegedRequestId(payload)
+                if (requestId == null) {
+                    reject(eventType, sessionId)
+                } else {
+                    WsEvent.SudoRequest(requestId, sessionId)
+                }
             }
 
             "sudo.expire" -> {
-                val requestId = payload?.get("request_id") as? String
-                WsEvent.SudoExpire(requestId, sessionId)
+                val requestId = privilegedRequestId(payload)
+                if (requestId == null) {
+                    reject(eventType, sessionId)
+                } else {
+                    WsEvent.SudoExpire(requestId, sessionId)
+                }
             }
 
             "secret.request" -> {
-                val requestId = payload?.get("request_id") as? String
-                val envVar = payload?.get("env_var") as? String
-                val prompt = payload?.get("prompt") as? String
-                WsEvent.SecretRequest(requestId, sessionId, envVar, prompt)
+                val requestId = privilegedRequestId(payload)
+                if (requestId == null) {
+                    reject(eventType, sessionId)
+                } else {
+                    val envVar = payload?.get("env_var") as? String
+                    val prompt = payload?.get("prompt") as? String
+                    WsEvent.SecretRequest(requestId, sessionId, envVar, prompt)
+                }
             }
 
             "secret.expire" -> {
-                val requestId = payload?.get("request_id") as? String
-                WsEvent.SecretExpire(requestId, sessionId)
+                val requestId = privilegedRequestId(payload)
+                if (requestId == null) {
+                    reject(eventType, sessionId)
+                } else {
+                    WsEvent.SecretExpire(requestId, sessionId)
+                }
             }
 
             else -> {
@@ -233,5 +261,32 @@ object EventParser {
                 WsEvent.Unknown(rawJson)
             }
         }
+    }
+
+    /**
+     * The opaque request id every privileged frame must carry. Blank, missing,
+     * or non-string ids identify a legacy gateway whose responses cannot be
+     * bound to one exact pending request.
+     */
+    private fun privilegedRequestId(payload: Map<String, Any?>?): String? =
+        (payload?.get("request_id") as? String)?.takeIf { it.isNotBlank() }
+
+    /**
+     * The exact relative approval lifetime the gateway's waiting thread uses.
+     * Only a finite, strictly positive value can drive a local expiry, so
+     * anything else rejects the request rather than leaving controls live past
+     * the server's own deadline.
+     */
+    private fun approvalTimeoutSeconds(payload: Map<String, Any?>?): Double? =
+        (payload?.get("timeout_seconds") as? Number)
+            ?.toDouble()
+            ?.takeIf { it.isFinite() && it > 0.0 }
+
+    private fun reject(
+        eventType: String,
+        sessionId: String?,
+    ): WsEvent {
+        Log.w(TAG, "Rejecting unbindable privileged event: $eventType")
+        return WsEvent.PrivilegedRequestRejected(eventType, sessionId)
     }
 }

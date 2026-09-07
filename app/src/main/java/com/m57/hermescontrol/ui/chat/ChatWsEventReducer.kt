@@ -135,6 +135,9 @@ object ChatWsEventReducer {
 
             is WsEvent.SecretExpire -> ReducerResult(state = state, streamingState = streamingState)
 
+            // A privileged frame the parser refused to bind. Never surfaced.
+            is WsEvent.PrivilegedRequestRejected -> ReducerResult(state = state, streamingState = streamingState)
+
             // ReactionEvent is handled by the ViewModel — purely cosmetic animation
             is WsEvent.ReactionEvent -> ReducerResult(state = state, streamingState = streamingState)
         }

@@ -32,10 +32,16 @@ import com.m57.hermescontrol.theme.LocalHermesStatusColors
  * Secure password dialog for a pending `sudo.request` (issue #524).
  * The backend blocked the turn waiting for the sudo password — previously
  * mobile dropped the event and the agent hung forever.
+ *
+ * [onDismiss] (back gesture / outside tap) is an incidental gesture and must
+ * stay a no-op; only [onCancel] tells the gateway anything. The typed password
+ * lives in this composition and in the single call [onConfirm] makes — it is
+ * never lifted into ViewModel state, logs, or errors.
  */
 @Composable
 fun SudoPromptDialog(
     onConfirm: (String) -> Unit,
+    onCancel: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     var password by remember { mutableStateOf("") }
@@ -71,8 +77,11 @@ fun SudoPromptDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(stringResource(R.string.chat_dismiss))
+            TextButton(
+                onClick = onCancel,
+                modifier = Modifier.testTag("sudo_cancel_button"),
+            ) {
+                Text(stringResource(R.string.chat_privileged_cancel))
             }
         },
     )
@@ -82,10 +91,15 @@ fun SudoPromptDialog(
  * Secure value dialog for a pending `secret.request` (issue #524).
  * The backend blocked the turn waiting for a secret (token/password) —
  * previously mobile dropped the event and the agent hung forever.
+ *
+ * Same contract as [SudoPromptDialog]: dismissal is a no-op, [onCancel] is the
+ * only cancellation, and the entered value never leaves this composition except
+ * through [onConfirm].
  */
 @Composable
 fun SecretPromptDialog(
     onConfirm: (String) -> Unit,
+    onCancel: () -> Unit,
     onDismiss: () -> Unit,
     envVar: String? = null,
     prompt: String? = null,
@@ -126,8 +140,11 @@ fun SecretPromptDialog(
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(stringResource(R.string.chat_dismiss))
+            TextButton(
+                onClick = onCancel,
+                modifier = Modifier.testTag("secret_cancel_button"),
+            ) {
+                Text(stringResource(R.string.chat_privileged_cancel))
             }
         },
     )

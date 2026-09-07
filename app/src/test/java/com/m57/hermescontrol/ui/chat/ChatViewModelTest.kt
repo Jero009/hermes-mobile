@@ -21,6 +21,7 @@ import com.m57.hermescontrol.data.session.ActiveSessionHolder
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.JsonRpcError
+import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
 import com.m57.hermescontrol.ui.chat.fakes.FakeChatPersistenceRepository
@@ -56,6 +57,9 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+
+/** Fixed, value-free text the VM shows when a secret-bearing verb is not acknowledged. */
+private const val PRIVILEGED_FAILURE_TEXT = "Hermes did not acknowledge that. The request is still waiting."
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChatViewModelTest {
@@ -97,6 +101,7 @@ class ChatViewModelTest {
             val formatArgs = arg<Array<out Any>>(1)
             "Failed to switch model: ${formatArgs.first()}"
         }
+        every { app.getString(R.string.chat_privileged_not_acknowledged) } returns PRIVILEGED_FAILURE_TEXT
         fakeRepo = FakeChatPersistenceRepository()
         fakeSlashUsageStore = FakeSlashUsageStore()
         every { AuthManager.getSelectedProfileId() } returns "profile-a"
@@ -136,6 +141,11 @@ class ChatViewModelTest {
         every { HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any()) } returns true
         every { HermesWsClient.request(WsMethods.CONFIG_SET, any(), any()) } returns
             CompletableDeferred<Any?>(mapOf("ok" to true))
+
+        // Default: the gateway acknowledges. Tests that care about the ack
+        // boundary re-stub this via capturePrivileged().
+        every { HermesWsClient.privilegedRequest(any(), any(), any()) } returns
+            CompletableDeferred<Any?>(mapOf("status" to "ok"))
 
         // Stub model-options so preloadModelOptions() (fired at GatewayReady) is safe.
         mockApi = mockk(relaxed = true)
@@ -2563,80 +2573,280 @@ class ChatViewModelTest {
             )
         }
 
+    // ── Privileged request binding (hermes-agent d90045be2 / a77692158) ──────
+    //
+    // Every privileged frame is answered on the exact request, runtime session,
+    // profile, and socket generation that dispatched it. Anything else is
+    // dropped rather than surfaced with controls that would resolve some other
+    // request.
+
+    private data class PrivilegedCall(
+        val method: String,
+        val binding: PrivilegedRequestBinding,
+        val params: Map<String, String>,
+    )
+
+    /** Route [HermesWsClient.privilegedRequest] into a recording list. */
+    private fun capturePrivileged(
+        result: CompletableDeferred<Any?> = CompletableDeferred<Any?>(mapOf("status" to "ok")),
+    ): MutableList<PrivilegedCall> {
+        val calls = mutableListOf<PrivilegedCall>()
+        every { HermesWsClient.privilegedRequest(any(), any(), any()) } answers {
+            calls += PrivilegedCall(arg(0), arg(1), arg(2))
+            result
+        }
+        return calls
+    }
+
+    private fun approvalRequest(
+        requestId: String = "approval-1",
+        sessionId: String? = "session-123",
+        profileId: String? = "profile-a",
+        generation: Int? = 7,
+        timeoutSeconds: Double = 300.0,
+    ) = WsEvent.ApprovalRequest(
+        command = "rm -rf /data",
+        description = "The agent wants to execute: rm -rf /data",
+        patternKeys = listOf("shell:rm"),
+        sessionId = sessionId,
+        requestId = requestId,
+        timeoutSeconds = timeoutSeconds,
+        sourceProfileId = profileId,
+        connectionGeneration = generation,
+    )
+
+    private fun sudoRequest(
+        requestId: String = "sudo-1",
+        sessionId: String? = "session-123",
+        profileId: String? = "profile-a",
+        generation: Int? = 7,
+    ) = WsEvent.SudoRequest(
+        requestId = requestId,
+        sessionId = sessionId,
+        sourceProfileId = profileId,
+        connectionGeneration = generation,
+    )
+
+    private fun secretRequest(
+        requestId: String = "secret-1",
+        sessionId: String? = "session-123",
+        profileId: String? = "profile-a",
+        generation: Int? = 7,
+    ) = WsEvent.SecretRequest(
+        requestId = requestId,
+        sessionId = sessionId,
+        envVar = "GITHUB_TOKEN",
+        prompt = "Token for github.com",
+        sourceProfileId = profileId,
+        connectionGeneration = generation,
+    )
+
+    private fun ChatViewModel.approvalMessage(): ChatMessage? =
+        uiState.value.messages.lastOrNull { it.approvalInfo != null }
+
     // ── Approval flow ────────────────────────────────────────────────────────
 
     @Test
-    fun testApprovalRequest_addsSystemMessage() =
+    fun approvalRequest_bindsToDispatchingProfileSessionAndGeneration() =
         runTest {
-            val viewModel = createViewModel()
-            advanceUntilIdle()
+            val (viewModel, sessionId) = createViewModelWithSession()
 
-            mockEventsFlow.emit(
-                WsEvent.ApprovalRequest(
-                    command = "rm -rf /data",
-                    description = "The agent wants to execute: rm -rf /data",
-                    patternKeys = listOf("shell:rm"),
-                    sessionId = null,
-                ),
-            )
-            advanceUntilIdle()
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
 
-            val msg =
-                viewModel.uiState.value.messages
-                    .first { it.content.contains("Approval Required") }
-            assertNotNull(msg.approvalInfo)
+            val msg = viewModel.approvalMessage()
+            assertNotNull(msg)
+            assertTrue(msg!!.content.contains("Approval Required"))
             assertEquals("rm -rf /data", msg.approvalInfo?.command)
+            assertEquals(
+                PrivilegedRequestBinding(
+                    requestId = "approval-1",
+                    runtimeSessionId = sessionId,
+                    profileId = "profile-a",
+                    connectionGeneration = 7,
+                ),
+                msg.approvalInfo?.privilegedBinding,
+            )
         }
 
     @Test
-    fun testRespondToApproval_sendsRpc() =
+    fun approvalRequest_fromAnotherProfileIsDropped() =
         runTest {
-            val (viewModel, sessionId) = createViewModelWithSession()
+            val (viewModel, _) = createViewModelWithSession()
 
-            mockEventsFlow.emit(
-                WsEvent.ApprovalRequest(
-                    command = "rm",
-                    description = "Dangerous command",
-                    patternKeys = null,
-                    sessionId = null,
-                ),
-            )
-            advanceUntilIdle()
+            mockEventsFlow.emit(approvalRequest(profileId = "profile-b"))
+            runCurrent()
 
-            viewModel.respondToApproval("approve")
-            advanceUntilIdle()
-
-            verify { HermesWsClient.send(WsMethods.APPROVAL_RESPOND, any(), any()) }
+            assertNull(viewModel.approvalMessage())
         }
 
     @Test
-    fun testRespondToApproval_clearsButtons() =
+    fun approvalRequest_withoutSocketGenerationIsDropped() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            mockEventsFlow.emit(approvalRequest(generation = null))
+            runCurrent()
+
+            assertNull(viewModel.approvalMessage())
+        }
+
+    @Test
+    fun approvalRequest_forAnotherRuntimeSessionIsDropped() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            mockEventsFlow.emit(approvalRequest(sessionId = "session-other"))
+            runCurrent()
+
+            assertNull(viewModel.approvalMessage())
+        }
+
+    @Test
+    fun respondToApproval_approveSendsOnceOnTheBoundRequest() =
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
+            val calls = capturePrivileged()
 
-            mockEventsFlow.emit(
-                WsEvent.ApprovalRequest(
-                    command = "rm",
-                    description = "Dangerous",
-                    patternKeys = null,
-                    sessionId = null,
-                ),
-            )
-            advanceUntilIdle()
-
-            val approvalMsg =
-                viewModel.uiState.value.messages
-                    .firstOrNull { it.approvalInfo != null }
-            assertNotNull(approvalMsg)
-
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
             viewModel.respondToApproval("approve")
-            advanceUntilIdle()
+            runCurrent()
 
-            val msgAfter =
-                viewModel.uiState.value.messages
-                    .firstOrNull { it.id == approvalMsg!!.id }
-            assertNotNull(msgAfter)
-            assertNull(msgAfter!!.approvalInfo)
+            assertEquals(1, calls.size)
+            assertEquals(WsMethods.APPROVAL_RESPOND, calls[0].method)
+            assertEquals(mapOf("choice" to "once"), calls[0].params)
+            assertEquals("approval-1", calls[0].binding.requestId)
+            assertEquals(sessionId, calls[0].binding.runtimeSessionId)
+            assertEquals("profile-a", calls[0].binding.profileId)
+            assertEquals(7, calls[0].binding.connectionGeneration)
+        }
+
+    @Test
+    fun respondToApproval_denySendsDeny() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
+            viewModel.respondToApproval("deny")
+            runCurrent()
+
+            assertEquals(listOf(mapOf("choice" to "deny")), calls.map { it.params })
+        }
+
+    /** A phone cannot show what a standing allow would later authorize. */
+    @Test
+    fun respondToApproval_refusesSessionAndAlwaysChoices() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
+            viewModel.respondToApproval("session")
+            viewModel.respondToApproval("always")
+            viewModel.respondToApproval("once")
+            runCurrent()
+
+            assertTrue("no standing allow may reach the gateway", calls.isEmpty())
+            assertNotNull("controls stay live", viewModel.approvalMessage())
+        }
+
+    @Test
+    fun respondToApproval_clearsControlsOnlyAfterTheGatewayAck() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            capturePrivileged(ack)
+
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
+            viewModel.respondToApproval("approve")
+            runCurrent()
+
+            assertNotNull("controls survive an unacknowledged send", viewModel.approvalMessage())
+
+            ack.complete(mapOf("status" to "ok"))
+            runCurrent()
+
+            assertNull(viewModel.approvalMessage())
+        }
+
+    @Test
+    fun respondToApproval_keepsControlsLiveWhenTheSendFails() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val rejected = CompletableDeferred<Any?>()
+            rejected.completeExceptionally(IllegalStateException("no longer active"))
+            capturePrivileged(rejected)
+
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
+            viewModel.respondToApproval("approve")
+            runCurrent()
+
+            assertNotNull(
+                "an unsent approval must remain answerable",
+                viewModel.approvalMessage(),
+            )
+            assertEquals("no longer active", viewModel.uiState.value.errorMessage)
+        }
+
+    @Test
+    fun cancelApproval_sendsTypedCancelNotAChoice() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
+            viewModel.cancelApproval()
+            runCurrent()
+
+            assertEquals(1, calls.size)
+            assertEquals(WsMethods.APPROVAL_CANCEL, calls[0].method)
+            assertTrue("cancel carries no choice", calls[0].params.isEmpty())
+            assertEquals("approval-1", calls[0].binding.requestId)
+            assertNull(viewModel.approvalMessage())
+        }
+
+    @Test
+    fun approvalControls_retireAtTheGatewayPublishedTimeout() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            mockEventsFlow.emit(approvalRequest(timeoutSeconds = 30.0))
+            runCurrent()
+            assertNotNull(viewModel.approvalMessage())
+
+            advanceTimeBy(29_000)
+            runCurrent()
+            assertNotNull("controls live until the server's own deadline", viewModel.approvalMessage())
+
+            advanceTimeBy(2_000)
+            runCurrent()
+            assertNull("controls retire once the request is gone", viewModel.approvalMessage())
+        }
+
+    @Test
+    fun approvalExpiry_neverRetiresALaterRequestsControls() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-1", timeoutSeconds = 10.0))
+            runCurrent()
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-2", timeoutSeconds = 600.0))
+            runCurrent()
+            assertEquals(2, viewModel.uiState.value.messages.count { it.approvalInfo != null })
+
+            advanceTimeBy(11_000)
+            runCurrent()
+
+            val live = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            assertEquals(1, live.size)
+            assertEquals("approval-2", live[0].approvalInfo?.privilegedBinding?.requestId)
         }
 
     // ── Sudo / secret prompt flow (issue #524) ───────────────────────────
@@ -2644,55 +2854,56 @@ class ChatViewModelTest {
     @Test
     fun testSudoRequest_setsPromptState() =
         runTest {
-            val (viewModel, _) = createViewModelWithSession()
-            advanceUntilIdle()
+            val (viewModel, sessionId) = createViewModelWithSession()
 
-            mockEventsFlow.emit(
-                WsEvent.SudoRequest(requestId = "sudo-1", sessionId = null),
-            )
+            mockEventsFlow.emit(sudoRequest())
             advanceUntilIdle()
 
             val prompt = viewModel.uiState.value.sudoPrompt
             assertNotNull(prompt)
             assertEquals("sudo-1", prompt?.requestId)
+            assertEquals(sessionId, prompt?.binding?.runtimeSessionId)
+            assertEquals("profile-a", prompt?.binding?.profileId)
+            assertEquals(7, prompt?.binding?.connectionGeneration)
+        }
+
+    @Test
+    fun sudoRequest_fromAnotherProfileIsDropped() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            mockEventsFlow.emit(sudoRequest(profileId = "profile-b"))
+            advanceUntilIdle()
+
+            assertNull(viewModel.uiState.value.sudoPrompt)
         }
 
     @Test
     fun testRespondToSudo_sendsRpc() =
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
-            advanceUntilIdle()
+            val calls = capturePrivileged()
 
-            mockEventsFlow.emit(
-                WsEvent.SudoRequest(requestId = "sudo-1", sessionId = null),
-            )
+            mockEventsFlow.emit(sudoRequest())
             advanceUntilIdle()
-
             viewModel.respondToSudo("hunter2")
             advanceUntilIdle()
 
-            verify {
-                HermesWsClient.send(
-                    WsMethods.SUDO_RESPOND,
-                    withArg { params ->
-                        assertEquals(sessionId, params["session_id"])
-                        assertEquals("hunter2", params["password"])
-                        assertEquals("sudo-1", params["request_id"])
-                    },
-                    any(),
-                )
-            }
+            assertEquals(1, calls.size)
+            assertEquals(WsMethods.SUDO_RESPOND, calls[0].method)
+            assertEquals(mapOf("password" to "hunter2"), calls[0].params)
+            assertEquals("sudo-1", calls[0].binding.requestId)
+            assertEquals(sessionId, calls[0].binding.runtimeSessionId)
+            assertEquals(7, calls[0].binding.connectionGeneration)
         }
 
     @Test
     fun testRespondToSudo_clearsPrompt() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
-            advanceUntilIdle()
+            capturePrivileged()
 
-            mockEventsFlow.emit(
-                WsEvent.SudoRequest(requestId = "sudo-1", sessionId = null),
-            )
+            mockEventsFlow.emit(sudoRequest())
             advanceUntilIdle()
             assertNotNull(viewModel.uiState.value.sudoPrompt)
 
@@ -2703,57 +2914,167 @@ class ChatViewModelTest {
         }
 
     @Test
-    fun testSecretRequest_setsPromptState() =
+    fun respondToSudo_keepsPromptUntilTheGatewayAcks() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            capturePrivileged(ack)
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+            viewModel.respondToSudo("hunter2")
             advanceUntilIdle()
 
-            mockEventsFlow.emit(
-                WsEvent.SecretRequest(requestId = "secret-1", sessionId = null),
+            assertNotNull("prompt survives an unacknowledged send", viewModel.uiState.value.sudoPrompt)
+
+            ack.complete(mapOf("status" to "ok"))
+            advanceUntilIdle()
+
+            assertNull(viewModel.uiState.value.sudoPrompt)
+        }
+
+    /** A gateway error string could echo the submitted value; `errorMessage` is durable UI state. */
+    @Test
+    fun respondToSudo_failureNeverSurfacesTheGatewayString() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val rejected = CompletableDeferred<Any?>()
+            rejected.completeExceptionally(IllegalStateException("rejected value hunter2"))
+            capturePrivileged(rejected)
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+            viewModel.respondToSudo("hunter2")
+            advanceUntilIdle()
+
+            assertEquals(PRIVILEGED_FAILURE_TEXT, viewModel.uiState.value.errorMessage)
+            assertFalse(
+                viewModel.uiState.value.errorMessage
+                    .orEmpty()
+                    .contains("hunter2"),
             )
+            assertNotNull(viewModel.uiState.value.sudoPrompt)
+        }
+
+    @Test
+    fun respondToSudo_ignoresABlankPassword() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+            viewModel.respondToSudo("   ")
+            advanceUntilIdle()
+
+            assertTrue(calls.isEmpty())
+            assertNotNull(viewModel.uiState.value.sudoPrompt)
+        }
+
+    @Test
+    fun cancelSudo_sendsTypedCancel() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+            viewModel.cancelSudo()
+            advanceUntilIdle()
+
+            assertEquals(listOf(WsMethods.SUDO_CANCEL), calls.map { it.method })
+            assertTrue(calls[0].params.isEmpty())
+            assertEquals("sudo-1", calls[0].binding.requestId)
+            assertNull(viewModel.uiState.value.sudoPrompt)
+        }
+
+    /** A back gesture is neither an answer nor a cancellation. */
+    @Test
+    fun dismissSudo_isANoOp() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+            viewModel.dismissSudo()
+            advanceUntilIdle()
+
+            assertTrue(calls.isEmpty())
+            assertNotNull(viewModel.uiState.value.sudoPrompt)
+        }
+
+    @Test
+    fun sudoExpire_clearsOnlyTheExactBoundRequest() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+
+            val mismatches =
+                listOf(
+                    WsEvent.SudoExpire("sudo-2", sessionId, "profile-a", 7),
+                    WsEvent.SudoExpire("sudo-1", sessionId, "profile-b", 7),
+                    WsEvent.SudoExpire("sudo-1", sessionId, "profile-a", 8),
+                    WsEvent.SudoExpire("sudo-1", "session-other", "profile-a", 7),
+                )
+            mismatches.forEach {
+                mockEventsFlow.emit(it)
+                advanceUntilIdle()
+                assertNotNull(
+                    "a non-matching expiry must not clear the prompt: $it",
+                    viewModel.uiState.value.sudoPrompt,
+                )
+            }
+
+            mockEventsFlow.emit(WsEvent.SudoExpire("sudo-1", sessionId, "profile-a", 7))
+            advanceUntilIdle()
+
+            assertNull(viewModel.uiState.value.sudoPrompt)
+        }
+
+    @Test
+    fun testSecretRequest_setsPromptState() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+
+            mockEventsFlow.emit(secretRequest())
             advanceUntilIdle()
 
             val prompt = viewModel.uiState.value.secretPrompt
             assertNotNull(prompt)
             assertEquals("secret-1", prompt?.requestId)
+            assertEquals("GITHUB_TOKEN", prompt?.envVar)
+            assertEquals(sessionId, prompt?.binding?.runtimeSessionId)
+            assertEquals(7, prompt?.binding?.connectionGeneration)
         }
 
     @Test
     fun testRespondToSecret_sendsRpc() =
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
-            advanceUntilIdle()
+            val calls = capturePrivileged()
 
-            mockEventsFlow.emit(
-                WsEvent.SecretRequest(requestId = "secret-1", sessionId = null),
-            )
+            mockEventsFlow.emit(secretRequest())
             advanceUntilIdle()
-
             viewModel.respondToSecret("super-secret-token")
             advanceUntilIdle()
 
-            verify {
-                HermesWsClient.send(
-                    WsMethods.SECRET_RESPOND,
-                    withArg { params ->
-                        assertEquals(sessionId, params["session_id"])
-                        assertEquals("super-secret-token", params["value"])
-                        assertEquals("secret-1", params["request_id"])
-                    },
-                    any(),
-                )
-            }
+            assertEquals(1, calls.size)
+            assertEquals(WsMethods.SECRET_RESPOND, calls[0].method)
+            assertEquals(mapOf("value" to "super-secret-token"), calls[0].params)
+            assertEquals("secret-1", calls[0].binding.requestId)
+            assertEquals(sessionId, calls[0].binding.runtimeSessionId)
         }
 
     @Test
     fun testRespondToSecret_clearsPrompt() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
-            advanceUntilIdle()
+            capturePrivileged()
 
-            mockEventsFlow.emit(
-                WsEvent.SecretRequest(requestId = "secret-1", sessionId = null),
-            )
+            mockEventsFlow.emit(secretRequest())
             advanceUntilIdle()
             assertNotNull(viewModel.uiState.value.secretPrompt)
 
@@ -2761,6 +3082,97 @@ class ChatViewModelTest {
             advanceUntilIdle()
 
             assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun respondToSecret_failureNeverSurfacesTheGatewayString() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val rejected = CompletableDeferred<Any?>()
+            rejected.completeExceptionally(IllegalStateException("rejected super-secret-token"))
+            capturePrivileged(rejected)
+
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+            viewModel.respondToSecret("super-secret-token")
+            advanceUntilIdle()
+
+            assertEquals(PRIVILEGED_FAILURE_TEXT, viewModel.uiState.value.errorMessage)
+            assertFalse(
+                viewModel.uiState.value.errorMessage
+                    .orEmpty()
+                    .contains("super-secret-token"),
+            )
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun cancelSecret_sendsTypedCancel() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+            viewModel.cancelSecret()
+            advanceUntilIdle()
+
+            assertEquals(listOf(WsMethods.SECRET_CANCEL), calls.map { it.method })
+            assertTrue(calls[0].params.isEmpty())
+            assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun dismissSecret_isANoOp() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+            viewModel.dismissSecret()
+            advanceUntilIdle()
+
+            assertTrue(calls.isEmpty())
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun secretExpire_clearsOnlyTheExactBoundRequest() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+
+            mockEventsFlow.emit(WsEvent.SecretExpire("secret-1", sessionId, "profile-b", 7))
+            advanceUntilIdle()
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+
+            mockEventsFlow.emit(WsEvent.SecretExpire("secret-1", sessionId, "profile-a", 9))
+            advanceUntilIdle()
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+
+            mockEventsFlow.emit(WsEvent.SecretExpire("secret-1", sessionId, "profile-a", 7))
+            advanceUntilIdle()
+            assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    /** A frame the parser refused to bind reaches the VM as an inert event. */
+    @Test
+    fun privilegedRequestRejected_changesNothing() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val before = viewModel.uiState.value
+
+            mockEventsFlow.emit(WsEvent.PrivilegedRequestRejected("approval.request", "session-123"))
+            mockEventsFlow.emit(WsEvent.PrivilegedRequestRejected("sudo.request", "session-123"))
+            advanceUntilIdle()
+
+            assertEquals(before.messages, viewModel.uiState.value.messages)
+            assertNull(viewModel.uiState.value.sudoPrompt)
+            assertNull(viewModel.uiState.value.secretPrompt)
+            assertNull(viewModel.uiState.value.errorMessage)
         }
 
     // ── Settings ─────────────────────────────────────────────────────────────
@@ -2937,17 +3349,11 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, _) = createViewModelWithSession()
 
-            mockEventsFlow.emit(
-                WsEvent.ApprovalRequest(
-                    command = "rm",
-                    description = "Dangerous",
-                    patternKeys = null,
-                    sessionId = null,
-                ),
-            )
-            advanceUntilIdle()
+            capturePrivileged()
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
             viewModel.respondToApproval("approve")
-            advanceUntilIdle()
+            runCurrent()
 
             // Simulate socket drop → reconnecting (triggers rejectAllPending).
             mockConnectionStatus.value = ConnectionStatus.RECONNECTING
@@ -2967,17 +3373,11 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, _) = createViewModelWithSession()
 
-            mockEventsFlow.emit(
-                WsEvent.ApprovalRequest(
-                    command = "rm",
-                    description = "Dangerous",
-                    patternKeys = null,
-                    sessionId = null,
-                ),
-            )
-            advanceUntilIdle()
+            capturePrivileged()
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
             viewModel.respondToApproval("approve")
-            advanceUntilIdle()
+            runCurrent()
 
             // User-initiated reconnect must not throw / hang.
             viewModel.reconnect()

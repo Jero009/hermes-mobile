@@ -29,6 +29,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -299,6 +300,265 @@ class HermesWsClientTest {
 
         assertTrue(HermesWsClient.pendingReply)
         assertTrue(HermesWsClient.isConnected)
+    }
+
+    // ── Privileged sends (hermes-agent d90045be2 / a77692158) ────────────
+    //
+    // A privileged frame is never queued, never retried, and never replayed
+    // onto a replacement connection: it goes out on the exact socket
+    // generation and profile that dispatched the request, or it fails.
+
+    private fun binding(
+        requestId: String = "req-1",
+        sessionId: String = "session-a",
+        profileId: String = "profile-a",
+        generation: Int = connectionGeneration(),
+    ) = PrivilegedRequestBinding(requestId, sessionId, profileId, generation)
+
+    /** Connect and return a queue of every frame the server received. */
+    private fun connectCapturingFrames(): java.util.Queue<String> {
+        val frames: java.util.Queue<String> = java.util.concurrent.ConcurrentLinkedQueue()
+        val openLatch = CountDownLatch(1)
+        mockWebServer.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onOpen(
+                        webSocket: WebSocket,
+                        response: okhttp3.Response,
+                    ) {
+                        openLatch.countDown()
+                    }
+
+                    override fun onMessage(
+                        webSocket: WebSocket,
+                        text: String,
+                    ) {
+                        frames.add(text)
+                    }
+                },
+            ),
+        )
+        HermesWsClient.connect()
+        runBlocking { withTimeout(5000) { HermesWsClient.connectionStatus.first { it == ConnectionStatus.CONNECTED } } }
+        assertTrue(openLatch.await(5, TimeUnit.SECONDS))
+        return frames
+    }
+
+    private fun awaitFrame(
+        frames: java.util.Queue<String>,
+        needle: String,
+    ): String? {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (System.nanoTime() < deadline) {
+            frames.firstOrNull { it.contains(needle) }?.let { return it }
+            Thread.sleep(10)
+        }
+        return null
+    }
+
+    @Test
+    fun privilegedRequestSendsTheBoundRequestOnTheDispatchingSocket() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val frames = connectCapturingFrames()
+
+        HermesWsClient.privilegedRequest(
+            method = WsMethods.SUDO_RESPOND,
+            binding = binding(requestId = "req-1", sessionId = "session-a"),
+            params = mapOf("password" to "hunter2"),
+        )
+
+        val frame = awaitFrame(frames, WsMethods.SUDO_RESPOND)
+        assertNotNull("privileged frame was not sent", frame)
+        assertTrue(frame!!.contains("\"request_id\":\"req-1\""))
+        assertTrue(frame.contains("\"session_id\":\"session-a\""))
+        assertTrue(frame.contains("\"password\":\"hunter2\""))
+    }
+
+    /** Caller params can never displace the binding the gateway will match on. */
+    @Test
+    fun privilegedRequestParamsCannotOverrideTheBinding() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val frames = connectCapturingFrames()
+
+        HermesWsClient.privilegedRequest(
+            method = WsMethods.APPROVAL_RESPOND,
+            binding = binding(requestId = "real-req", sessionId = "real-session"),
+            params = mapOf("choice" to "once", "request_id" to "spoofed", "session_id" to "spoofed"),
+        )
+
+        val frame = awaitFrame(frames, WsMethods.APPROVAL_RESPOND)
+        assertNotNull(frame)
+        assertFalse(frame!!.contains("spoofed"))
+        assertTrue(frame.contains("\"request_id\":\"real-req\""))
+        assertTrue(frame.contains("\"session_id\":\"real-session\""))
+    }
+
+    @Test
+    fun privilegedRequestRefusesAStaleSocketGeneration() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val frames = connectCapturingFrames()
+
+        val deferred =
+            HermesWsClient.privilegedRequest(
+                method = WsMethods.APPROVAL_RESPOND,
+                binding = binding(generation = connectionGeneration() - 1),
+                params = mapOf("choice" to "once"),
+            )
+
+        assertTrue(deferred.isCompleted)
+        assertNotNull(deferred.getCompletionExceptionOrNull())
+        assertNull(awaitFrame(frames, WsMethods.APPROVAL_RESPOND))
+        assertTrue("a refused privileged frame is never queued", outboundQueue().isEmpty())
+    }
+
+    @Test
+    fun privilegedRequestRefusesAnotherProfile() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val frames = connectCapturingFrames()
+        every { AuthManager.getSelectedProfileId() } returns "profile-b"
+
+        val deferred =
+            HermesWsClient.privilegedRequest(
+                method = WsMethods.SECRET_RESPOND,
+                binding = binding(),
+                params = mapOf("value" to "super-secret-token"),
+            )
+
+        assertNotNull(deferred.getCompletionExceptionOrNull())
+        assertNull(awaitFrame(frames, WsMethods.SECRET_RESPOND))
+        assertTrue(outboundQueue().isEmpty())
+    }
+
+    /** Secrets are a foreground-only surface. */
+    @Test
+    fun privilegedRequestRefusesWhileBackgrounded() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val frames = connectCapturingFrames()
+        HermesWsClient.setAppForeground(false)
+
+        val deferred =
+            HermesWsClient.privilegedRequest(
+                method = WsMethods.SUDO_RESPOND,
+                binding = binding(),
+                params = mapOf("password" to "hunter2"),
+            )
+
+        assertNotNull(deferred.getCompletionExceptionOrNull())
+        assertNull(awaitFrame(frames, WsMethods.SUDO_RESPOND))
+        assertTrue(outboundQueue().isEmpty())
+        HermesWsClient.setAppForeground(true)
+    }
+
+    @Test
+    fun privilegedRequestIsNeverQueuedWhileDisconnected() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        HermesWsClient.disconnect()
+
+        val deferred =
+            HermesWsClient.privilegedRequest(
+                method = WsMethods.SUDO_CANCEL,
+                binding = binding(),
+            )
+
+        assertNotNull(deferred.getCompletionExceptionOrNull())
+        assertTrue(outboundQueue().isEmpty())
+    }
+
+    /** The deferred resolves on the gateway's own ack, not on a successful write. */
+    @Test
+    fun privilegedRequestCompletesOnlyOnTheGatewayAck() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        var serverSocket: WebSocket? = null
+        val openLatch = CountDownLatch(1)
+        val frames: java.util.Queue<String> = java.util.concurrent.ConcurrentLinkedQueue()
+        mockWebServer.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                object : WebSocketListener() {
+                    override fun onOpen(
+                        webSocket: WebSocket,
+                        response: okhttp3.Response,
+                    ) {
+                        serverSocket = webSocket
+                        openLatch.countDown()
+                    }
+
+                    override fun onMessage(
+                        webSocket: WebSocket,
+                        text: String,
+                    ) {
+                        frames.add(text)
+                    }
+                },
+            ),
+        )
+        HermesWsClient.connect()
+        runBlocking { withTimeout(5000) { HermesWsClient.connectionStatus.first { it == ConnectionStatus.CONNECTED } } }
+        assertTrue(openLatch.await(5, TimeUnit.SECONDS))
+
+        val deferred =
+            HermesWsClient.privilegedRequest(
+                method = WsMethods.APPROVAL_RESPOND,
+                binding = binding(),
+                params = mapOf("choice" to "once"),
+            )
+
+        val frame = awaitFrame(frames, WsMethods.APPROVAL_RESPOND)
+        assertNotNull(frame)
+        assertFalse("a written frame is not an acknowledgement", deferred.isCompleted)
+
+        val rpcId = Regex("\"id\":\"(\\d+)\"").find(frame!!)!!.groupValues[1]
+        serverSocket!!.send("""{"jsonrpc":"2.0","id":"$rpcId","result":{"status":"ok"}}""")
+
+        runBlocking { withTimeout(5000) { deferred.await() } }
+        assertTrue(deferred.isCompleted)
+    }
+
+    /** Provenance comes from the delivering connection — requests *and* expiries. */
+    @Test
+    fun privilegedFramesAreStampedWithTheDispatchingProfileAndGeneration() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val socket = mockk<WebSocket>(relaxed = true)
+        val listener = installActiveListener(socket)
+        val generation = connectionGeneration()
+
+        val payloads =
+            listOf(
+                """{"jsonrpc":"2.0","method":"event","params":{"type":"approval.request",""" +
+                    """"session_id":"session-a","payload":{"request_id":"r1","timeout_seconds":300}}}""",
+                """{"jsonrpc":"2.0","method":"event","params":{"type":"sudo.expire",""" +
+                    """"session_id":"session-a","payload":{"request_id":"r1"}}}""",
+                """{"jsonrpc":"2.0","method":"event","params":{"type":"secret.expire",""" +
+                    """"session_id":"session-a","payload":{"request_id":"r2"}}}""",
+            )
+
+        val received =
+            runBlocking {
+                withTimeout(5000) {
+                    val collected = Collections.synchronizedList(mutableListOf<WsEvent>())
+                    val job =
+                        launch {
+                            HermesWsClient.events.collect { collected.add(it) }
+                        }
+                    while (collected.size < payloads.size) {
+                        payloads.forEach { listener.onMessage(socket, it) }
+                        kotlinx.coroutines.delay(20)
+                    }
+                    job.cancel()
+                    collected.toList()
+                }
+            }
+
+        val approval = received.filterIsInstance<WsEvent.ApprovalRequest>().first()
+        assertEquals("profile-a", approval.sourceProfileId)
+        assertEquals(generation, approval.connectionGeneration)
+
+        val sudoExpire = received.filterIsInstance<WsEvent.SudoExpire>().first()
+        assertEquals("profile-a", sudoExpire.sourceProfileId)
+        assertEquals(generation, sudoExpire.connectionGeneration)
+
+        val secretExpire = received.filterIsInstance<WsEvent.SecretExpire>().first()
+        assertEquals("profile-a", secretExpire.sourceProfileId)
+        assertEquals(generation, secretExpire.connectionGeneration)
     }
 
     private fun outboundQueue(): java.util.Queue<*> {

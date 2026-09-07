@@ -27,6 +27,8 @@
     <string name="chat_secret_title">Secret Required</string>
     <string name="chat_secret_body">The agent needs a secret value (token or password) to continue. It will not be shown.</string>
     <string name="chat_secret_value">Secret</string>
+    <string name="chat_privileged_cancel">Cancel request</string>
+    <string name="chat_privileged_not_acknowledged">Hermes did not acknowledge that. The request is still waiting.</string>
     <string name="chat_search_placeholder">Search messages\u2026</string>
     <string name="chat_clear_search_desc">Clear</string>
     <string name="chat_prev_match_desc">Previous match</string>
@@ -111,7 +113,6 @@
     <string name="notif_waiting_replies">Waiting for Hermes replies</string>
     <string name="notif_new_message">New message</string>
     <string name="notif_clarification_needed">Hermes needs a clarification</string>
-    <string name="notif_input_needed">Hermes needs your input</string>
     <string name="notif_channel_service_name">Hermes Background Service</string>
     <string name="notif_channel_service_desc">Keeps connection alive in the background</string>
     <string name="notif_channel_chat_name">Hermes Chat Replies</string>

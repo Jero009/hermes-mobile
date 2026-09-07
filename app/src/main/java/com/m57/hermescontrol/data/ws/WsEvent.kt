@@ -189,12 +189,23 @@ sealed class WsEvent {
 
     // ── Approval request ────────────────────────────────────────────────
 
+    /**
+     * The gateway blocks a turn on an explicit user decision.
+     *
+     * [requestId] and [timeoutSeconds] are mandatory: the gateway binds every
+     * `approval.respond` / `approval.cancel` to the exact opaque request id
+     * (hermes-agent `d90045be2`) and publishes the exact relative lifetime the
+     * waiting thread uses (`a77692158`). A frame without both is a legacy
+     * request this client cannot answer safely, so [EventParser] rejects it
+     * instead of surfacing an unbindable approval.
+     */
     data class ApprovalRequest(
         val command: String?,
         val description: String?,
         val patternKeys: List<String>?,
         val sessionId: String?,
-        val requestId: String? = null,
+        val requestId: String,
+        val timeoutSeconds: Double,
         val sourceProfileId: String? = null,
         val connectionGeneration: Int? = null,
     ) : WsEvent()
@@ -207,15 +218,17 @@ sealed class WsEvent {
      * Mobile previously dropped this and the agent hung forever.
      */
     data class SudoRequest(
-        val requestId: String?,
+        val requestId: String,
         val sessionId: String?,
         val sourceProfileId: String? = null,
         val connectionGeneration: Int? = null,
     ) : WsEvent()
 
     data class SudoExpire(
-        val requestId: String?,
+        val requestId: String,
         val sessionId: String?,
+        val sourceProfileId: String? = null,
+        val connectionGeneration: Int? = null,
     ) : WsEvent()
 
     /**
@@ -224,7 +237,7 @@ sealed class WsEvent {
      * Mobile previously dropped this and the agent hung forever.
      */
     data class SecretRequest(
-        val requestId: String?,
+        val requestId: String,
         val sessionId: String?,
         val envVar: String? = null,
         val prompt: String? = null,
@@ -233,7 +246,22 @@ sealed class WsEvent {
     ) : WsEvent()
 
     data class SecretExpire(
-        val requestId: String?,
+        val requestId: String,
+        val sessionId: String?,
+        val sourceProfileId: String? = null,
+        val connectionGeneration: Int? = null,
+    ) : WsEvent()
+
+    /**
+     * A privileged frame that cannot be bound to an exact request, and is
+     * therefore never surfaced or answered.
+     *
+     * Carries only the event type and session so the rejection is observable
+     * without retaining the rejected payload. Every consumer treats it as a
+     * no-op — that is the point.
+     */
+    data class PrivilegedRequestRejected(
+        val eventType: String,
         val sessionId: String?,
     ) : WsEvent()
 

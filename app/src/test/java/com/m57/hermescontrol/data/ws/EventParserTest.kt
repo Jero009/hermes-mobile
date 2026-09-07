@@ -725,3 +725,176 @@ class EventParserTest {
         assertEquals(2, (usage?.get("compressions") as? Number)?.toInt())
     }
 }
+
+// ── Privileged request binding (hermes-agent d90045be2 / a77692158) ──────────
+//
+// The gateway stamps an opaque `request_id` on every privileged frame and
+// publishes the approval's exact `timeout_seconds`. A frame missing either is a
+// legacy request this client cannot bind a response to, so it is rejected
+// rather than surfaced with controls that would resolve some other request.
+
+private fun privilegedEvent(
+    type: String,
+    payload: Map<String, Any?>,
+    sessionId: String? = "session-a",
+): JsonRpcResponse =
+    createJsonRpcResponse(
+        jsonrpc = "2.0",
+        id = null,
+        method = "event",
+        params =
+            mapOf(
+                "type" to type,
+                "session_id" to sessionId,
+                "payload" to payload,
+            ),
+    )
+
+class EventParserPrivilegedTest {
+    @Before
+    fun setUp() {
+        mockkStatic(android.util.Log::class)
+        every { android.util.Log.w(any<String>(), any<String>()) } returns 0
+    }
+
+    @After
+    fun tearDown() {
+        unmockkAll()
+    }
+
+    @Test
+    fun approvalRequestCarriesTheRequestIdAndPublishedTimeout() {
+        val event =
+            EventParser.parse(
+                privilegedEvent(
+                    "approval.request",
+                    mapOf(
+                        "command" to "rm -rf /data",
+                        "description" to "Dangerous",
+                        "pattern_keys" to listOf("shell:rm", 7),
+                        "request_id" to "req-abc",
+                        "timeout_seconds" to 300,
+                    ),
+                ),
+            )
+
+        assertTrue(event is WsEvent.ApprovalRequest)
+        val approval = event as WsEvent.ApprovalRequest
+        assertEquals("req-abc", approval.requestId)
+        assertEquals(300.0, approval.timeoutSeconds, 0.0)
+        assertEquals("session-a", approval.sessionId)
+        assertEquals(listOf("shell:rm"), approval.patternKeys)
+    }
+
+    @Test
+    fun approvalRequestWithoutARequestIdIsRejected() {
+        val event =
+            EventParser.parse(
+                privilegedEvent(
+                    "approval.request",
+                    mapOf("command" to "rm", "timeout_seconds" to 300),
+                ),
+            )
+
+        assertEquals(
+            WsEvent.PrivilegedRequestRejected("approval.request", "session-a"),
+            event,
+        )
+    }
+
+    @Test
+    fun approvalRequestWithABlankRequestIdIsRejected() {
+        val event =
+            EventParser.parse(
+                privilegedEvent(
+                    "approval.request",
+                    mapOf("request_id" to "   ", "timeout_seconds" to 300),
+                ),
+            )
+
+        assertTrue(event is WsEvent.PrivilegedRequestRejected)
+    }
+
+    @Test
+    fun approvalRequestWithoutATimeoutIsRejected() {
+        val event =
+            EventParser.parse(
+                privilegedEvent("approval.request", mapOf("request_id" to "req-abc")),
+            )
+
+        assertEquals(
+            WsEvent.PrivilegedRequestRejected("approval.request", "session-a"),
+            event,
+        )
+    }
+
+    /** Only a finite, strictly positive lifetime can drive a local expiry. */
+    @Test
+    fun approvalRequestWithAnUnusableTimeoutIsRejected() {
+        listOf(0, -5, Double.NaN, Double.POSITIVE_INFINITY, "300").forEach { timeout ->
+            val event =
+                EventParser.parse(
+                    privilegedEvent(
+                        "approval.request",
+                        mapOf("request_id" to "req-abc", "timeout_seconds" to timeout),
+                    ),
+                )
+            assertTrue("timeout_seconds=$timeout must reject", event is WsEvent.PrivilegedRequestRejected)
+        }
+    }
+
+    @Test
+    fun sudoAndSecretFramesRequireARequestId() {
+        listOf("sudo.request", "sudo.expire", "secret.request", "secret.expire").forEach { type ->
+            assertEquals(
+                WsEvent.PrivilegedRequestRejected(type, "session-a"),
+                EventParser.parse(privilegedEvent(type, mapOf("env_var" to "TOKEN"))),
+            )
+            assertEquals(
+                WsEvent.PrivilegedRequestRejected(type, "session-a"),
+                EventParser.parse(privilegedEvent(type, mapOf("request_id" to ""))),
+            )
+        }
+    }
+
+    @Test
+    fun boundSudoAndSecretFramesParse() {
+        assertEquals(
+            WsEvent.SudoRequest("req-1", "session-a"),
+            EventParser.parse(privilegedEvent("sudo.request", mapOf("request_id" to "req-1"))),
+        )
+        assertEquals(
+            WsEvent.SudoExpire("req-1", "session-a"),
+            EventParser.parse(privilegedEvent("sudo.expire", mapOf("request_id" to "req-1"))),
+        )
+        assertEquals(
+            WsEvent.SecretExpire("req-2", "session-a"),
+            EventParser.parse(privilegedEvent("secret.expire", mapOf("request_id" to "req-2"))),
+        )
+
+        val secret =
+            EventParser.parse(
+                privilegedEvent(
+                    "secret.request",
+                    mapOf("request_id" to "req-2", "env_var" to "GITHUB_TOKEN", "prompt" to "Token?"),
+                ),
+            )
+        assertEquals(WsEvent.SecretRequest("req-2", "session-a", "GITHUB_TOKEN", "Token?"), secret)
+    }
+
+    /** A rejection is observable, but must not retain the rejected payload. */
+    @Test
+    fun aRejectionRetainsOnlyTheEventTypeAndSession() {
+        val event =
+            EventParser.parse(
+                privilegedEvent(
+                    "secret.request",
+                    mapOf("env_var" to "GITHUB_TOKEN", "prompt" to "Token for github.com"),
+                ),
+            ) as WsEvent.PrivilegedRequestRejected
+
+        assertEquals("secret.request", event.eventType)
+        assertEquals("session-a", event.sessionId)
+        assertFalse(event.toString().contains("GITHUB_TOKEN"))
+    }
+}

@@ -161,9 +161,10 @@ fun ChatLifecycleEffects(
     }
 
     // Sudo / secret prompt dialogs (issue #524)
-    sudoPrompt?.let { prompt ->
+    sudoPrompt?.let {
         SudoPromptDialog(
             onConfirm = viewModel::respondToSudo,
+            onCancel = viewModel::cancelSudo,
             onDismiss = viewModel::dismissSudo,
         )
     }
@@ -171,6 +172,7 @@ fun ChatLifecycleEffects(
     secretPrompt?.let { prompt ->
         SecretPromptDialog(
             onConfirm = viewModel::respondToSecret,
+            onCancel = viewModel::cancelSecret,
             onDismiss = viewModel::dismissSecret,
             envVar = prompt.envVar,
             prompt = prompt.prompt,

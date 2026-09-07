@@ -231,14 +231,24 @@ data class ClarifyQuestionUi(
  */
 private const val CLARIFY_DISMISS_RESPONSE = "The user cancelled — no answer provided."
 
-/** Transient — not persisted. Holds a pending sudo.password request. */
+/**
+ * Transient — not persisted. Holds a pending sudo.password request.
+ *
+ * Carries only the routing binding, never the password: the entered value lives
+ * in the dialog's own composition and in the single transient RPC call.
+ */
 data class SudoPromptUi(
     val binding: PrivilegedRequestBinding,
 ) {
     val requestId: String get() = binding.requestId
 }
 
-/** Transient — not persisted. Holds a pending secret (token/password) request. */
+/**
+ * Transient — not persisted. Holds a pending secret (token/password) request.
+ *
+ * Like [SudoPromptUi], this holds no secret value — only the request's routing
+ * binding and the gateway's own non-secret prompt labels.
+ */
 data class SecretPromptUi(
     val binding: PrivilegedRequestBinding,
     val envVar: String? = null,
@@ -297,6 +307,13 @@ class ChatViewModel(
 
     /** Tracks the auto-clear coroutine for reaction animations. */
     private var reactionClearJob: Job? = null
+
+    /**
+     * Local expiry timers for live approval requests, keyed by the gateway's
+     * opaque request id, so a resolved request cancels its own timer and a
+     * second request never retires the first one's controls.
+     */
+    private val approvalExpiryJobs = ConcurrentHashMap<String, Job>()
 
     private val wsClient = HermesWsClient
 
@@ -685,13 +702,17 @@ class ChatViewModel(
 
             is WsEvent.SudoExpire -> {
                 _uiState.update { state ->
-                    if (state.sudoPrompt?.binding?.requestId == event.requestId) {
-                        state.copy(
-                            sudoPrompt = null,
-                        )
-                    } else {
-                        state
-                    }
+                    val expired =
+                        state.sudoPrompt?.binding?.let {
+                            expiryMatches(
+                                binding = it,
+                                requestId = event.requestId,
+                                sessionId = event.sessionId,
+                                profileId = event.sourceProfileId,
+                                generation = event.connectionGeneration,
+                            )
+                        } ?: false
+                    if (expired) state.copy(sudoPrompt = null) else state
                 }
             }
 
@@ -701,14 +722,23 @@ class ChatViewModel(
 
             is WsEvent.SecretExpire -> {
                 _uiState.update { state ->
-                    if (state.secretPrompt?.binding?.requestId == event.requestId) {
-                        state.copy(
-                            secretPrompt = null,
-                        )
-                    } else {
-                        state
-                    }
+                    val expired =
+                        state.secretPrompt?.binding?.let {
+                            expiryMatches(
+                                binding = it,
+                                requestId = event.requestId,
+                                sessionId = event.sessionId,
+                                profileId = event.sourceProfileId,
+                                generation = event.connectionGeneration,
+                            )
+                        } ?: false
+                    if (expired) state.copy(secretPrompt = null) else state
                 }
+            }
+
+            is WsEvent.PrivilegedRequestRejected -> {
+                // A privileged frame without a bindable request id. Never
+                // surfaced and never answered — the parser already dropped it.
             }
 
             is WsEvent.GatewayError -> {
@@ -2997,7 +3027,12 @@ class ChatViewModel(
 
     private fun handleApprovalRequest(event: WsEvent.ApprovalRequest) {
         val binding =
-            privilegedBinding(event.requestId, event.sessionId, event.sourceProfileId, event.connectionGeneration)
+            privilegedBinding(
+                requestId = event.requestId,
+                eventSessionId = event.sessionId,
+                profileId = event.sourceProfileId,
+                generation = event.connectionGeneration,
+            ) ?: return
         val description = event.description ?: event.command ?: "Unknown command"
         val content = "**Approval Required**\n$description"
         val msg =
@@ -3018,43 +3053,83 @@ class ChatViewModel(
                 isAgentTyping = false,
             )
         }
+        scheduleApprovalExpiry(msg.id, binding, event.timeoutSeconds)
     }
 
-    fun respondToApproval(action: String) {
-        val state = _uiState.value
-        val approvalMsg = state.messages.lastOrNull { it.approvalInfo != null } ?: return
-        val binding = approvalMsg.approvalInfo?.privilegedBinding ?: return
-        val choice = if (action == "approve") "once" else action
-        if (choice !in setOf("once", "deny")) return
-
-        if (binding.connectionGeneration < 0) {
-            _uiState.update { s ->
-                s.copy(messages = s.messages.map { if (it.id == approvalMsg.id) it.copy(approvalInfo = null) else it })
+    /**
+     * Retire the controls once the gateway's own approval deadline has elapsed
+     * locally. The gateway publishes the exact lifetime its waiting thread uses
+     * (`timeout_seconds`), so the buttons disappear when the request they would
+     * answer is already gone, rather than lingering and resolving nothing.
+     */
+    private fun scheduleApprovalExpiry(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+        timeoutSeconds: Double,
+    ) {
+        approvalExpiryJobs.remove(binding.requestId)?.cancel()
+        approvalExpiryJobs[binding.requestId] =
+            viewModelScope.launch {
+                delay((timeoutSeconds * 1_000.0).toLong().coerceAtLeast(1L))
+                approvalExpiryJobs.remove(binding.requestId)
+                clearApprovalControls(messageId, binding)
             }
-            wsClient.send(
-                WsMethods.APPROVAL_RESPOND,
-                mapOf("session_id" to binding.runtimeSessionId, "choice" to action, "all" to false),
-            )
-            return
-        }
+    }
+
+    /** Approve exactly once. Session-wide and permanent allows are not offered. */
+    fun respondToApproval(action: String) {
+        val choice =
+            when (action) {
+                "approve" -> "once"
+                "deny" -> "deny"
+                // "session" / "always" are deliberately unreachable: a phone
+                // cannot show what a standing allow would later authorize.
+                else -> return
+            }
+        submitApproval(WsMethods.APPROVAL_RESPOND, mapOf("choice" to choice))
+    }
+
+    /** Explicit Cancel — a typed `approval.cancel`, not a denial and not a dismissal. */
+    fun cancelApproval() {
+        submitApproval(WsMethods.APPROVAL_CANCEL, emptyMap())
+    }
+
+    private fun submitApproval(
+        method: String,
+        params: Map<String, String>,
+    ) {
+        val approvalMsg = _uiState.value.messages.lastOrNull { it.approvalInfo != null } ?: return
+        val binding = approvalMsg.approvalInfo?.privilegedBinding ?: return
 
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                wsClient.privilegedRequest(
-                    method = WsMethods.APPROVAL_RESPOND,
-                    binding = binding,
-                    valueKey = "choice",
-                    value = choice,
-                ).await()
+                wsClient.privilegedRequest(method = method, binding = binding, params = params).await()
             }.onSuccess {
-                _uiState.update { s ->
-                    s.copy(
-                        messages = s.messages.map { if (it.id == approvalMsg.id) it.copy(approvalInfo = null) else it },
-                    )
-                }
+                approvalExpiryJobs.remove(binding.requestId)?.cancel()
+                clearApprovalControls(approvalMsg.id, binding)
             }.onFailure { error ->
+                // The gateway never saw it, or never acknowledged it. Leave the
+                // controls live so the user can retry the same exact request.
                 _uiState.update { it.copy(errorMessage = error.message) }
             }
+        }
+    }
+
+    private fun clearApprovalControls(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+    ) {
+        _uiState.update { state ->
+            state.copy(
+                messages =
+                    state.messages.map { message ->
+                        if (message.id == messageId && message.approvalInfo?.privilegedBinding == binding) {
+                            message.copy(approvalInfo = null)
+                        } else {
+                            message
+                        }
+                    },
+            )
         }
     }
 
@@ -3066,8 +3141,12 @@ class ChatViewModel(
      */
     private fun handleSudoRequest(event: WsEvent.SudoRequest) {
         val binding =
-            privilegedBinding(event.requestId, event.sessionId, event.sourceProfileId, event.connectionGeneration)
-                ?: return
+            privilegedBinding(
+                requestId = event.requestId,
+                eventSessionId = event.sessionId,
+                profileId = event.sourceProfileId,
+                generation = event.connectionGeneration,
+            ) ?: return
         _uiState.update {
             it.copy(
                 sudoPrompt = SudoPromptUi(binding),
@@ -3083,8 +3162,12 @@ class ChatViewModel(
      */
     private fun handleSecretRequest(event: WsEvent.SecretRequest) {
         val binding =
-            privilegedBinding(event.requestId, event.sessionId, event.sourceProfileId, event.connectionGeneration)
-                ?: return
+            privilegedBinding(
+                requestId = event.requestId,
+                eventSessionId = event.sessionId,
+                profileId = event.sourceProfileId,
+                generation = event.connectionGeneration,
+            ) ?: return
         _uiState.update {
             it.copy(
                 secretPrompt = SecretPromptUi(binding, event.envVar, event.prompt),
@@ -3093,91 +3176,128 @@ class ChatViewModel(
         }
     }
 
-    fun dismissSudo() {
-        // Dismissal is not authorization or a response. The live request remains visible.
-    }
-
-    fun dismissSecret() {
-        // Dismissal is not authorization or a response. The live request remains visible.
-    }
-
     /**
-     * Send the user's sudo password back to the gateway. Mirrors
-     * respondToApproval: clear the prompt immediately, then fire the RPC.
+     * Back gesture or a tap outside the dialog. Deliberately a no-op: an
+     * incidental dismissal is neither an answer nor a cancellation, and hiding
+     * the dialog would strand a gateway thread that is still blocked. The user
+     * cancels through the explicit Cancel action.
      */
+    fun dismissSudo() = Unit
+
+    /** Ordinary dismissal of the secret dialog. A no-op, for the same reason as [dismissSudo]. */
+    fun dismissSecret() = Unit
+
+    /** Send the user's sudo password back to the gateway on its exact bound request. */
     fun respondToSudo(password: String) {
         val prompt = _uiState.value.sudoPrompt ?: return
         if (password.isBlank()) return
+        submitSudo(prompt, WsMethods.SUDO_RESPOND, mapOf("password" to password))
+    }
 
-        if (prompt.binding.connectionGeneration < 0) {
-            _uiState.update { it.copy(sudoPrompt = null) }
-            wsClient.send(
-                WsMethods.SUDO_RESPOND,
-                mapOf(
-                    "session_id" to prompt.binding.runtimeSessionId,
-                    "password" to password,
-                    "request_id" to prompt.requestId,
-                ),
-            )
-            return
-        }
+    /** Explicit Cancel — a typed `sudo.cancel`, awaited, never a silent dismissal. */
+    fun cancelSudo() {
+        val prompt = _uiState.value.sudoPrompt ?: return
+        submitSudo(prompt, WsMethods.SUDO_CANCEL, emptyMap())
+    }
 
+    /** Send the user's secret value back to the gateway on its exact bound request. */
+    fun respondToSecret(value: String) {
+        val prompt = _uiState.value.secretPrompt ?: return
+        if (value.isBlank()) return
+        submitSecret(prompt, WsMethods.SECRET_RESPOND, mapOf("value" to value))
+    }
+
+    /** Explicit Cancel — a typed `secret.cancel`, awaited, never a silent dismissal. */
+    fun cancelSecret() {
+        val prompt = _uiState.value.secretPrompt ?: return
+        submitSecret(prompt, WsMethods.SECRET_CANCEL, emptyMap())
+    }
+
+    private fun submitSudo(
+        prompt: SudoPromptUi,
+        method: String,
+        params: Map<String, String>,
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                wsClient.privilegedRequest(WsMethods.SUDO_RESPOND, prompt.binding, "password", password).await()
+                wsClient.privilegedRequest(method = method, binding = prompt.binding, params = params).await()
             }.onSuccess {
                 _uiState.update { if (it.sudoPrompt == prompt) it.copy(sudoPrompt = null) else it }
-            }.onFailure { error -> _uiState.update { it.copy(errorMessage = error.message) } }
+            }.onFailure {
+                _uiState.update { it.copy(errorMessage = privilegedFailureMessage()) }
+            }
+        }
+    }
+
+    private fun submitSecret(
+        prompt: SecretPromptUi,
+        method: String,
+        params: Map<String, String>,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                wsClient.privilegedRequest(method = method, binding = prompt.binding, params = params).await()
+            }.onSuccess {
+                _uiState.update { if (it.secretPrompt == prompt) it.copy(secretPrompt = null) else it }
+            }.onFailure {
+                _uiState.update { it.copy(errorMessage = privilegedFailureMessage()) }
+            }
         }
     }
 
     /**
-     * Send the user's secret value back to the gateway. Mirrors respondToSudo.
+     * Fixed failure text for the two secret-bearing verbs.
+     *
+     * A gateway error string is attacker- or bug-reachable and could echo the
+     * submitted value; `errorMessage` is durable UI state. So sudo and secret
+     * failures never render the throwable — only this constant.
      */
-    fun respondToSecret(value: String) {
-        val prompt = _uiState.value.secretPrompt ?: return
-        if (value.isBlank()) return
+    private fun privilegedFailureMessage(): String =
+        getApplication<Application>().getString(R.string.chat_privileged_not_acknowledged)
 
-        if (prompt.binding.connectionGeneration < 0) {
-            _uiState.update { it.copy(secretPrompt = null) }
-            wsClient.send(
-                WsMethods.SECRET_RESPOND,
-                mapOf(
-                    "session_id" to prompt.binding.runtimeSessionId,
-                    "value" to value,
-                    "request_id" to prompt.requestId,
-                ),
-            )
-            return
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                wsClient.privilegedRequest(WsMethods.SECRET_RESPOND, prompt.binding, "value", value).await()
-            }.onSuccess {
-                _uiState.update { if (it.secretPrompt == prompt) it.copy(secretPrompt = null) else it }
-            }.onFailure { error -> _uiState.update { it.copy(errorMessage = error.message) } }
-        }
-    }
-
+    /**
+     * Bind a privileged event to the exact request it can answer.
+     *
+     * Every component has to be present and current at dispatch: the opaque
+     * request id, the runtime session showing the request, the profile whose
+     * connection delivered it, and that connection's generation. Anything
+     * missing or stale yields `null`, and the caller drops the event rather than
+     * surfacing controls that would resolve some other request.
+     */
     private fun privilegedBinding(
-        requestId: String?,
+        requestId: String,
         eventSessionId: String?,
         profileId: String?,
         generation: Int?,
     ): PrivilegedRequestBinding? {
-        val runtimeId = runtimeSessionId ?: eventSessionId
-        if (runtimeId.isNullOrBlank()) {
-            return null
-        }
-        val boundRequestId = requestId?.takeIf { it.isNotBlank() } ?: if (generation == null) "" else return null
+        if (requestId.isBlank()) return null
+        if (generation == null) return null
+        if (profileId.isNullOrBlank() || profileId != selectedProfileId()) return null
+        val runtimeId = eventSessionId?.takeIf { it.isNotBlank() } ?: runtimeSessionId
+        if (runtimeId.isNullOrBlank() || !isCurrentSession(runtimeId)) return null
         return PrivilegedRequestBinding(
-            boundRequestId,
-            runtimeId,
-            profileId ?: selectedProfileId(),
-            generation ?: -1,
+            requestId = requestId,
+            runtimeSessionId = runtimeId,
+            profileId = profileId,
+            connectionGeneration = generation,
         )
     }
+
+    /**
+     * A server expiry clears a live prompt only when it names that same exact
+     * request on the same session, profile, and socket generation.
+     */
+    private fun expiryMatches(
+        binding: PrivilegedRequestBinding,
+        requestId: String,
+        sessionId: String?,
+        profileId: String?,
+        generation: Int?,
+    ): Boolean =
+        requestId == binding.requestId &&
+            profileId == binding.profileId &&
+            generation == binding.connectionGeneration &&
+            (sessionId == null || sessionId == binding.runtimeSessionId)
 
     fun reconnect() {
         AuthSessionState.markAuthenticated()

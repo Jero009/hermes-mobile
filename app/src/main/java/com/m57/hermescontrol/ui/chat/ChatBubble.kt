@@ -47,6 +47,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -115,6 +116,7 @@ fun ChatBubble(
     searchQuery: String = "",
     isCurrentMatch: Boolean = false,
     onRespondApproval: (String) -> Unit = {},
+    onCancelApproval: () -> Unit = {},
     onOpenAttachment: (Attachment) -> Unit = {},
     openingAttachmentPath: String? = null,
     onImageClick: (ImageViewerModel) -> Unit = {},
@@ -162,6 +164,7 @@ fun ChatBubble(
                     SystemBubble(
                         message = message,
                         onRespondApproval = onRespondApproval,
+                        onCancelApproval = onCancelApproval,
                         modifier = modifier,
                     )
                 }
@@ -564,6 +567,7 @@ private fun SelfImprovementReviewCard(
 private fun SystemBubble(
     message: ChatMessage,
     onRespondApproval: (String) -> Unit = {},
+    onCancelApproval: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     if (message.content.contains("Self-improvement review:", ignoreCase = true)) {
@@ -587,7 +591,9 @@ private fun SystemBubble(
                 ),
         )
 
-        // Approval action buttons
+        // Approval action buttons. Approve is a single-use "once" — there is
+        // deliberately no session-wide or permanent allow, because nothing on
+        // this screen shows what a standing allow would later authorize.
         if (message.approvalInfo != null) {
             Spacer(Modifier.height(8.dp))
             Row(
@@ -631,6 +637,18 @@ private fun SystemBubble(
                     )
                     Spacer(Modifier.width(4.dp))
                     Text("Deny")
+                }
+
+                // Withdraw the request entirely (typed `approval.cancel`).
+                // Distinct from Deny, which is an answer the agent can adapt to.
+                TextButton(
+                    onClick = onCancelApproval,
+                    modifier =
+                        Modifier
+                            .height(36.dp)
+                            .testTag("cancel_approval_button"),
+                ) {
+                    Text(stringResource(R.string.chat_privileged_cancel))
                 }
             }
         }
