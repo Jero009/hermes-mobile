@@ -3261,6 +3261,91 @@ class ChatViewModelTest {
         }
 
     @Test
+    fun fullRefreshRetiresSyncAndStaleCleanupCannotReleaseNewSyncOwner() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val releaseStaleSync = CompletableDeferred<Unit>()
+            val releaseRefresh = CompletableDeferred<Unit>()
+            val releaseNewSync = CompletableDeferred<Unit>()
+            var calls = 0
+            coEvery { mockApi.getSessionMessages(sessionId, 150, any(), true, any()) } coAnswers {
+                calls++
+                val content =
+                    when (calls) {
+                        1 -> {
+                            withContext(NonCancellable) { releaseStaleSync.await() }
+                            "stale sync"
+                        }
+                        2 -> {
+                            releaseRefresh.await()
+                            "full refresh"
+                        }
+                        3 -> {
+                            releaseNewSync.await()
+                            "new sync"
+                        }
+                        else -> "post-refresh sync"
+                    }
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = calls,
+                                    role = "assistant",
+                                    content = content,
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                150,
+                                0,
+                                "latest",
+                                1,
+                                1,
+                            ),
+                    ),
+                )
+            }
+
+            viewModel.syncCurrentSession()
+            runCurrent()
+            viewModel.refreshCurrentSession()
+            runCurrent()
+
+            // isLoading fences incremental sync while the replacement is active.
+            viewModel.syncCurrentSession()
+            runCurrent()
+            assertEquals(2, calls)
+
+            releaseRefresh.complete(Unit)
+            runCurrent()
+            assertEquals(listOf("full refresh"), viewModel.uiState.value.messages.map { it.content })
+
+            viewModel.syncCurrentSession()
+            runCurrent()
+            assertEquals(3, calls)
+            releaseStaleSync.complete(Unit)
+            runCurrent()
+
+            // The retired sync's finally block must not clear the newer owner.
+            viewModel.syncCurrentSession()
+            runCurrent()
+            assertEquals(3, calls)
+            assertFalse(fakeRepo.loadMessages(sessionId).any { it.content == "stale sync" })
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale sync" })
+
+            releaseNewSync.complete(Unit)
+            advanceUntilIdle()
+            viewModel.syncCurrentSession()
+            advanceUntilIdle()
+
+            assertEquals(4, calls)
+            assertTrue(viewModel.uiState.value.messages.any { it.content == "post-refresh sync" })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "post-refresh sync" })
+        }
+
+    @Test
     fun staleMessageCountResponseCannotMutateSessionsOrDriveHistoryRequest() =
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()

@@ -321,6 +321,10 @@ class ChatViewModel(
     private var loadedMessageOffset = 0
     private var latestPaging = false
     private var isSyncingMessages = false
+    private var syncCounter = 0L
+
+    @Volatile private var activeSyncOwner: Long? = null
+    private var syncJob: Job? = null
     private var conversationGeneration = 0L
     private val historyLoadJobs = mutableSetOf<Job>()
     private var historyRefreshCounter = 0L
@@ -434,6 +438,7 @@ class ChatViewModel(
                     status == ConnectionStatus.NO_NETWORK ||
                     status == ConnectionStatus.AUTH_EXPIRED
                 ) {
+                    retireSync()
                     _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
                     conversationGeneration++
                     invalidateResumeRequests()
@@ -1469,6 +1474,7 @@ class ChatViewModel(
     ): Boolean = activeHistoryRefreshOwner == owner && isHistoryLoadFenceCurrent(fence)
 
     private fun invalidateHistoryRefresh() {
+        retireSync()
         activeHistoryRefreshOwner = null
         historyRefreshCounter++
         historyRefreshJob?.cancel()
@@ -2359,6 +2365,10 @@ class ChatViewModel(
     }
 
     private fun loadSessionMessages(sessionId: String) {
+        // A full refresh supersedes any incremental sync. Retire it before the
+        // repository FIFO barrier and refresh-fence capture so a sync already
+        // queued for persistence cannot become authoritative afterward.
+        retireSync()
         retireOlderLoad()
         val owner = ++historyRefreshCounter
         activeHistoryRefreshOwner = owner
@@ -2579,53 +2589,84 @@ class ChatViewModel(
                     ?: loadedMessageOffset
             }
         val fence = captureHistoryLoadFence(sessionId) ?: return
+        val owner = ++syncCounter
+        activeSyncOwner = owner
         isSyncingMessages = true
-        launchHistoryLoad {
-            try {
-                val result =
-                    fetchMessagePage(
-                        sessionId,
-                        nextOffset,
-                        MESSAGE_PAGE_SIZE,
-                        order = if (latestPaging) "latest" else null,
-                    )
-                when (result) {
-                    is NetworkResult.Success -> {
-                        if (!isHistoryLoadFenceCurrent(fence)) return@launchHistoryLoad
-                        val incoming = mapServerMessages(sessionId, result.data.messages.orEmpty(), nextOffset)
-                        if (incoming.isEmpty()) return@launchHistoryLoad
-                        val persisted =
-                            withContext(Dispatchers.IO) {
-                                repo.persistMessagesIfCurrent(incoming, sessionId, fence.transcriptRevision)
-                            }
-                        if (!persisted) return@launchHistoryLoad
-                        _uiState.update { current ->
-                            if (!isHistoryLoadFenceCurrent(fence)) return@update current
-                            val merged =
-                                mergeSyncedMessages(
-                                    current = current.messages,
-                                    incoming = incoming,
-                                    isServerMessage = { id ->
-                                        serverMessageIndex(id, sessionId) != null
-                                    },
-                                )
-                            if (sameMessages(current.messages, merged)) {
-                                current
-                            } else {
-                                current.copy(
-                                    messages = merged,
-                                    todos = restoredTodos(current.todos, merged),
-                                )
+        syncJob =
+            launchHistoryLoad {
+                try {
+                    val result =
+                        fetchMessagePage(
+                            sessionId,
+                            nextOffset,
+                            MESSAGE_PAGE_SIZE,
+                            order = if (latestPaging) "latest" else null,
+                        )
+                    if (!isSyncCurrent(fence, owner)) return@launchHistoryLoad
+                    when (result) {
+                        is NetworkResult.Success -> {
+                            if (!isSyncCurrent(fence, owner)) return@launchHistoryLoad
+                            val incoming = mapServerMessages(sessionId, result.data.messages.orEmpty(), nextOffset)
+                            if (!isSyncCurrent(fence, owner)) return@launchHistoryLoad
+                            if (incoming.isEmpty()) return@launchHistoryLoad
+                            val persisted =
+                                withContext(Dispatchers.IO) {
+                                    repo.persistMessagesIfCurrent(
+                                        incoming,
+                                        sessionId,
+                                        fence.transcriptRevision,
+                                    ) {
+                                        isSyncCurrent(fence, owner)
+                                    }
+                                }
+                            if (!persisted || !isSyncCurrent(fence, owner)) return@launchHistoryLoad
+                            _uiState.update { current ->
+                                if (!isSyncCurrent(fence, owner)) return@update current
+                                val merged =
+                                    mergeSyncedMessages(
+                                        current = current.messages,
+                                        incoming = incoming,
+                                        isServerMessage = { id ->
+                                            serverMessageIndex(id, sessionId) != null
+                                        },
+                                    )
+                                if (sameMessages(current.messages, merged)) {
+                                    current
+                                } else {
+                                    current.copy(
+                                        messages = merged,
+                                        todos = restoredTodos(current.todos, merged),
+                                    )
+                                }
                             }
                         }
-                    }
 
-                    is NetworkResult.Failure -> {}
+                        is NetworkResult.Failure -> {}
+                    }
+                } finally {
+                    releaseSync(owner)
                 }
-            } finally {
-                isSyncingMessages = false
             }
-        }
+    }
+
+    private fun isSyncCurrent(
+        fence: HistoryLoadFence,
+        owner: Long,
+    ): Boolean = activeSyncOwner == owner && isHistoryLoadFenceCurrent(fence)
+
+    private fun retireSync() {
+        activeSyncOwner = null
+        syncCounter++
+        syncJob?.cancel()
+        syncJob = null
+        isSyncingMessages = false
+    }
+
+    private fun releaseSync(owner: Long) {
+        if (activeSyncOwner != owner) return
+        activeSyncOwner = null
+        syncJob = null
+        isSyncingMessages = false
     }
 
     private fun restoredTodos(
@@ -3708,6 +3749,7 @@ class ChatViewModel(
             (sessionId == null || sessionId == binding.runtimeSessionId)
 
     fun reconnect() {
+        retireSync()
         AuthSessionState.markAuthenticated()
         _uiState.update {
             it.copy(
