@@ -613,6 +613,15 @@ class MarkdownTextFeatureTest {
     }
 
     @Test
+    fun testArabicMixedWithNeutralInlineCode_wrapsWithLtrIsolate() {
+        listOf("123", "--", "/").forEach { code ->
+            val parsed = parseInline("شغّل `$code` الآن", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+
+            assertEquals("شغّل ${BidiUtils.LRI}$code${BidiUtils.PDI} الآن", parsed.toString())
+        }
+    }
+
+    @Test
     fun testArabicMixedWithBoldEnglish_wrapsWithLtrIsolate() {
         val input = "هذا النص يحتوي على **Android** داخل فقرة"
         val parsed = parseInline(input, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
@@ -641,6 +650,26 @@ class MarkdownTextFeatureTest {
         val parsed = parseInline(input, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
         val expected = "راجع ${BidiUtils.LRI}https://example.com/path${BidiUtils.PDI} ثم تابع"
         assertEquals(expected, parsed.toString())
+    }
+
+    @Test
+    fun testParagraphFinalBareUrl_doesNotIncludePresentationRlmInLinkTarget() {
+        val parsed =
+            parseInline("راجع https://example.com/path", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+        val anchored = anchorTrailingRtlPresentation(parsed, isRtl = true)
+        val urlStart = anchored.indexOf("https://")
+        val links = anchored.getLinkAnnotations(urlStart, anchored.length)
+
+        assertEquals(
+            "راجع ${BidiUtils.LRI}https://example.com/path${BidiUtils.PDI}${BidiUtils.RLM}",
+            anchored.toString(),
+        )
+        assertEquals(1, links.size)
+        assertEquals(
+            "https://example.com/path",
+            (links.single().item as androidx.compose.ui.text.LinkAnnotation.Url).url,
+        )
+        assertEquals(anchored.length - 1, links.single().end)
     }
 
     @Test

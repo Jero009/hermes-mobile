@@ -77,6 +77,15 @@ class BidiUtilsTest {
         assertEquals("${BidiUtils.LRI}val x = 1${BidiUtils.PDI}", BidiUtils.wrapLtrIsolate("val x = 1"))
         // RTL snippet should not be wrapped
         assertEquals("مرحبا", BidiUtils.wrapLtrIsolate("مرحبا"))
+        // Neutral plain text should retain its surrounding paragraph behavior.
+        assertEquals("123", BidiUtils.wrapLtrIsolate("123"))
+    }
+
+    @Test
+    fun testWrapInlineCodeLtrIsolate_wrapsNeutralCode() {
+        listOf("123", "--", "/").forEach { code ->
+            assertEquals("${BidiUtils.LRI}$code${BidiUtils.PDI}", BidiUtils.wrapInlineCodeLtrIsolate(code))
+        }
     }
 
     @Test

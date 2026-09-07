@@ -145,6 +145,9 @@ object BidiUtils {
      */
     fun wrapLtrIsolate(text: String): String = if (isLtrSnippet(text)) "$LRI$text$PDI" else text
 
+    /** Wraps inline code in an LTR isolate, including code made only of neutral characters. */
+    fun wrapInlineCodeLtrIsolate(text: String): String = "$LRI$text$PDI"
+
     /**
      * Appends a Right-to-Left Mark (RLM) to [text] if it is RTL, ensuring trailing
      * punctuation and neutral emojis anchor to the visual end of the RTL sentence.

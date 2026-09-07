@@ -531,20 +531,22 @@ private fun MarkdownInlineText(
     modifier: Modifier = Modifier,
 ) {
     val isRtl = remember(text) { BidiUtils.isRtlText(text) }
-    val processedText = remember(text, isRtl) { if (isRtl) BidiUtils.anchorTrailingRtl(text) else text }
     val resolvedStyle = style.copy(textDirection = bidiTextDirection(isRtl))
-    val markup = remember(processedText) { buildInlineMathMarkup(processedText) }
+    val markup = remember(text) { buildInlineMathMarkup(text) }
     if (markup.math.isEmpty()) {
         Text(
             text =
                 remember(text, searchQuery, isCurrentMatch, textColor, linkColor, highlights) {
-                    parseInlineSource(
-                        processedText,
-                        textColor,
-                        searchQuery,
-                        isCurrentMatch,
-                        linkColor,
-                        highlights,
+                    anchorTrailingRtlPresentation(
+                        parseInlineSource(
+                            text,
+                            textColor,
+                            searchQuery,
+                            isCurrentMatch,
+                            linkColor,
+                            highlights,
+                            isRtl,
+                        ),
                         isRtl,
                     )
                 },
@@ -578,32 +580,35 @@ private fun MarkdownInlineText(
         }
     val byMarker = markup.math.associateBy(InlineMathPlaceholder::marker)
     val annotated =
-        buildAnnotatedString {
-            var plainStart = 0
-            parsed.forEachIndexed { index, char ->
-                val placeholder = byMarker[char] ?: return@forEachIndexed
-                append(parsed.subSequence(plainStart, index))
+        anchorTrailingRtlPresentation(
+            buildAnnotatedString {
+                var plainStart = 0
+                parsed.forEachIndexed { index, char ->
+                    val placeholder = byMarker[char] ?: return@forEachIndexed
+                    append(parsed.subSequence(plainStart, index))
 
-                val styles = parsed.spanStyles.filter { index in it.start until it.end }
-                val links = parsed.getLinkAnnotations(index, index + 1)
-                styles.forEach { pushStyle(it.item) }
-                links.forEach { pushLink(it.item) }
-                formulaSearchColors(placeholder.latex, searchQuery, isCurrentMatch, highlights)
-                    ?.let { (background, foreground) ->
-                        pushStyle(SpanStyle(background = background, color = foreground))
+                    val styles = parsed.spanStyles.filter { index in it.start until it.end }
+                    val links = parsed.getLinkAnnotations(index, index + 1)
+                    styles.forEach { pushStyle(it.item) }
+                    links.forEach { pushLink(it.item) }
+                    formulaSearchColors(placeholder.latex, searchQuery, isCurrentMatch, highlights)
+                        ?.let { (background, foreground) ->
+                            pushStyle(SpanStyle(background = background, color = foreground))
+                        }
+                    if (placeholder.id in inlineContent) {
+                        appendInlineContent(placeholder.id, placeholder.latex)
+                    } else {
+                        append(placeholder.latex)
                     }
-                if (placeholder.id in inlineContent) {
-                    appendInlineContent(placeholder.id, placeholder.latex)
-                } else {
-                    append(placeholder.latex)
+                    val pushedSearchStyle =
+                        formulaSearchColors(placeholder.latex, searchQuery, isCurrentMatch, highlights) != null
+                    repeat(styles.size + links.size + if (pushedSearchStyle) 1 else 0) { pop() }
+                    plainStart = index + 1
                 }
-                val pushedSearchStyle =
-                    formulaSearchColors(placeholder.latex, searchQuery, isCurrentMatch, highlights) != null
-                repeat(styles.size + links.size + if (pushedSearchStyle) 1 else 0) { pop() }
-                plainStart = index + 1
-            }
-            append(parsed.subSequence(plainStart, parsed.length))
-        }
+                append(parsed.subSequence(plainStart, parsed.length))
+            },
+            isRtl,
+        )
     Text(
         text = annotated,
         inlineContent = inlineContent,
@@ -1540,7 +1545,7 @@ private fun parseInlineSource(
                     val end = src.indexOf('`', i + 1)
                     if (end != -1) {
                         val raw = src.substring(i + 1, end)
-                        val toAppend = if (isRtl) BidiUtils.wrapLtrIsolate(raw) else raw
+                        val toAppend = if (isRtl) BidiUtils.wrapInlineCodeLtrIsolate(raw) else raw
                         withStyle(
                             SpanStyle(
                                 fontFamily = FontFamily.Monospace,
@@ -1626,6 +1631,19 @@ private fun parseInlineSource(
         }
     }
 }
+
+internal fun anchorTrailingRtlPresentation(
+    text: AnnotatedString,
+    isRtl: Boolean,
+): AnnotatedString =
+    if (isRtl && !text.endsWith(BidiUtils.RLM)) {
+        buildAnnotatedString {
+            append(text)
+            append(BidiUtils.RLM)
+        }
+    } else {
+        text
+    }
 
 internal sealed interface MdBlock {
     data class Code(
