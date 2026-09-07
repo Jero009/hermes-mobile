@@ -1529,7 +1529,7 @@ class ChatViewModelTest {
         }
 
     @Test
-    fun testClarifyBatch_retainsUnansweredQuestions() =
+    fun testClarifyBatch_midBatchFailureRetainsFailedAndUnsentQuestions() =
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
             mockEventsFlow.emit(
@@ -1537,6 +1537,54 @@ class ChatViewModelTest {
                     text = null,
                     options = null,
                     clarifyId = "clarify-batch",
+                    sessionId = sessionId,
+                    questions =
+                        listOf(
+                            WsEvent.ClarifyQuestion("q0", "First?"),
+                            WsEvent.ClarifyQuestion("q1", "Second?"),
+                            WsEvent.ClarifyQuestion("q2", "Third?"),
+                        ),
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 9,
+                ),
+            )
+            advanceUntilIdle()
+            val expected = viewModel.uiState.value.clarifyRequest!!
+            var sendCount = 0
+            every { HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any()) } answers {
+                sendCount++
+                sendCount != 2
+            }
+
+            viewModel.respondToClarifyBatch(
+                expected,
+                mapOf("q0" to "first answer", "q1" to "second answer", "q2" to "third answer"),
+            )
+            advanceUntilIdle()
+
+            assertEquals(listOf("q1", "q2"), viewModel.uiState.value.clarifyRequest?.questions?.map { it.qid })
+            assertEquals(2, sendCount)
+            verify(exactly = 1) {
+                HermesWsClient.respondToClarify(
+                    sessionId,
+                    "clarify-batch",
+                    "q0",
+                    "first answer",
+                    "profile-a",
+                    9,
+                )
+            }
+        }
+
+    @Test
+    fun testClarifyBatch_allSuccessfulSendsCompletePrompt() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = null,
+                    options = null,
+                    clarifyId = "clarify-success",
                     sessionId = sessionId,
                     questions =
                         listOf(
@@ -1550,19 +1598,13 @@ class ChatViewModelTest {
             advanceUntilIdle()
             val expected = viewModel.uiState.value.clarifyRequest!!
 
-            viewModel.respondToClarifyBatch(expected, mapOf("q0" to "first answer"))
+            viewModel.respondToClarifyBatch(expected, mapOf("q0" to "one", "q1" to "two"))
             advanceUntilIdle()
 
-            assertEquals(listOf("q1"), viewModel.uiState.value.clarifyRequest?.questions?.map { it.qid })
-            verify(exactly = 1) {
-                HermesWsClient.respondToClarify(
-                    sessionId,
-                    "clarify-batch",
-                    "q0",
-                    "first answer",
-                    "profile-a",
-                    9,
-                )
+            assertNull(viewModel.uiState.value.clarifyRequest)
+            assertEquals("one\ntwo", viewModel.uiState.value.messages.last().content)
+            verify(exactly = 2) {
+                HermesWsClient.respondToClarify(sessionId, "clarify-success", any(), any(), "profile-a", 9)
             }
         }
 
@@ -1638,6 +1680,47 @@ class ChatViewModelTest {
                     sourceConnectionGeneration = 11,
                 )
             }
+        }
+
+    @Test
+    fun testClarifyDismiss_midBatchFailureRetainsUnresolvedWithoutCompletionNote() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = null,
+                    options = null,
+                    clarifyId = "clarify-dismiss-batch",
+                    sessionId = sessionId,
+                    questions =
+                        listOf(
+                            WsEvent.ClarifyQuestion("q0", "First?"),
+                            WsEvent.ClarifyQuestion("q1", "Second?"),
+                            WsEvent.ClarifyQuestion("q2", "Third?"),
+                        ),
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 12,
+                ),
+            )
+            advanceUntilIdle()
+            val messageCount = viewModel.uiState.value.messages.size
+            var sendCount = 0
+            every { HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any()) } answers {
+                sendCount++
+                sendCount != 2
+            }
+
+            viewModel.dismissClarify()
+            advanceUntilIdle()
+
+            assertEquals(listOf("q1", "q2"), viewModel.uiState.value.clarifyRequest?.questions?.map { it.qid })
+            assertEquals(2, sendCount)
+            assertEquals(messageCount, viewModel.uiState.value.messages.size)
+            assertTrue(
+                viewModel.uiState.value.messages.none {
+                    it.content.contains("dismissed", ignoreCase = true)
+                },
+            )
         }
 
     // ── Attachments ──────────────────────────────────────────────────────────

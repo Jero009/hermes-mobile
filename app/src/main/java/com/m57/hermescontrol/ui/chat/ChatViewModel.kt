@@ -2831,22 +2831,29 @@ class ChatViewModel(
         val profileId = expected.sourceProfileId ?: return
         val generation = expected.connectionGeneration ?: return
         if (expected.sessionId != runtimeId) return
-        _uiState.update { current ->
-            if (current.clarifyRequest == expected) current.copy(clarifyRequest = null) else current
-        }
-
-        addSystemMessage("Clarify dismissed — no answer sent", persist = true)
-
         viewModelScope.launch(Dispatchers.IO) {
-            expected.resolvedQuestions.forEach { question ->
-                wsClient.respondToClarify(
-                    sessionId = runtimeId,
-                    clarifyRequestId = requestId,
-                    questionId = expected.wireQuestionId(question),
-                    answer = CLARIFY_DISMISS_RESPONSE,
-                    sourceProfileId = profileId,
-                    sourceConnectionGeneration = generation,
-                )
+            val dismissedIds = mutableSetOf<String>()
+            for (question in expected.resolvedQuestions) {
+                if (!clarifyRequestIsCurrent(expected, state.currentSessionId, runtimeId)) break
+                val sent =
+                    wsClient.respondToClarify(
+                        sessionId = runtimeId,
+                        clarifyRequestId = requestId,
+                        questionId = expected.wireQuestionId(question),
+                        answer = CLARIFY_DISMISS_RESPONSE,
+                        sourceProfileId = profileId,
+                        sourceConnectionGeneration = generation,
+                    )
+                if (!sent) break
+                dismissedIds += question.qid
+            }
+            if (dismissedIds.isEmpty()) return@launch
+
+            val remaining = expected.resolvedQuestions.filterNot { it.qid in dismissedIds }
+            val completedCurrentRequest =
+                replaceClarifyIfCurrent(expected, expected.withRemainingQuestions(remaining))
+            if (completedCurrentRequest && remaining.isEmpty()) {
+                addSystemMessage("Clarify dismissed — no answer sent", persist = true)
             }
         }
     }
@@ -2876,26 +2883,22 @@ class ChatViewModel(
         if (normalized.isEmpty() || normalized.keys.any { answerId -> questions.none { it.qid == answerId } }) return
         val requestId = expected.clarifyId ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            val answeredIds =
-                questions.mapNotNull { question ->
-                    val answer = normalized[question.qid] ?: return@mapNotNull null
-                    if (_uiState.value.clarifyRequest != expected ||
-                        _uiState.value.currentSessionId != sessionId ||
-                        runtimeSessionId != runtimeId
-                    ) {
-                        return@mapNotNull null
-                    }
-                    val sent =
-                        wsClient.respondToClarify(
-                            sessionId = runtimeId,
-                            clarifyRequestId = requestId,
-                            questionId = expected.wireQuestionId(question),
-                            answer = answer,
-                            sourceProfileId = profileId,
-                            sourceConnectionGeneration = generation,
-                        )
-                    question.qid.takeIf { sent }
-                }.toSet()
+            val answeredIds = mutableSetOf<String>()
+            for (question in questions) {
+                val answer = normalized[question.qid] ?: continue
+                if (!clarifyRequestIsCurrent(expected, sessionId, runtimeId)) break
+                val sent =
+                    wsClient.respondToClarify(
+                        sessionId = runtimeId,
+                        clarifyRequestId = requestId,
+                        questionId = expected.wireQuestionId(question),
+                        answer = answer,
+                        sourceProfileId = profileId,
+                        sourceConnectionGeneration = generation,
+                    )
+                if (!sent) break
+                answeredIds += question.qid
+            }
             if (answeredIds.isEmpty()) return@launch
 
             val remaining = questions.filterNot { it.qid in answeredIds }
@@ -2907,7 +2910,7 @@ class ChatViewModel(
             _uiState.update { current ->
                 if (current.clarifyRequest == expected) {
                     current.copy(
-                        clarifyRequest = expected.copy(questions = remaining),
+                        clarifyRequest = expected.withRemainingQuestions(remaining),
                         messages = current.messages + userMessage,
                         isAgentTyping = remaining.isEmpty(),
                     ).let { updated ->
@@ -2925,6 +2928,33 @@ class ChatViewModel(
 
     private fun ClarifyUi.wireQuestionId(question: ClarifyQuestionUi): String? =
         if (questions.isNotEmpty()) question.qid else questionId
+
+    private fun clarifyRequestIsCurrent(
+        expected: ClarifyUi,
+        sessionId: String,
+        runtimeId: String,
+    ): Boolean =
+        _uiState.value.clarifyRequest == expected &&
+            _uiState.value.currentSessionId == sessionId &&
+            runtimeSessionId == runtimeId
+
+    private fun replaceClarifyIfCurrent(
+        expected: ClarifyUi,
+        replacement: ClarifyUi?,
+    ): Boolean {
+        while (true) {
+            val current = _uiState.value
+            if (current.clarifyRequest != expected) return false
+            if (_uiState.compareAndSet(current, current.copy(clarifyRequest = replacement))) return true
+        }
+    }
+
+    private fun ClarifyUi.withRemainingQuestions(remaining: List<ClarifyQuestionUi>): ClarifyUi? =
+        when {
+            remaining.isEmpty() -> null
+            questions.isEmpty() -> this
+            else -> copy(questions = remaining)
+        }
 
     fun clearError() {
         _uiState.update { it.copy(errorMessage = null) }

@@ -375,8 +375,15 @@ fun ClarifyBubble(
     modifier: Modifier = Modifier,
 ) {
     val questions = clarifyRequest.resolvedQuestions
-    var selected by remember(clarifyRequest) { mutableStateOf<Map<String, Set<String>>>(emptyMap()) }
-    var typed by remember(clarifyRequest) { mutableStateOf<Map<String, String>>(emptyMap()) }
+    val draftBinding =
+        listOf(
+            clarifyRequest.clarifyId,
+            clarifyRequest.sessionId,
+            clarifyRequest.sourceProfileId,
+            clarifyRequest.connectionGeneration,
+        )
+    var selected by remember(draftBinding) { mutableStateOf<Map<String, Set<String>>>(emptyMap()) }
+    var typed by remember(draftBinding) { mutableStateOf<Map<String, String>>(emptyMap()) }
 
     Surface(
         modifier =
@@ -415,6 +422,7 @@ fun ClarifyBubble(
                             val values = selected[question.qid].orEmpty()
                             val isSelected = choice in values
                             FilterChip(
+                                modifier = Modifier.testTag("clarify_choice_${question.qid}_$choice"),
                                 selected = isSelected,
                                 onClick = {
                                     val next =
@@ -434,7 +442,7 @@ fun ClarifyBubble(
                     value = typed[question.qid].orEmpty(),
                     onValueChange = { typed = typed + (question.qid to it) },
                     label = { Text(if (question.choices.isEmpty()) "Your response" else "Other (optional)") },
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().testTag("clarify_text_${question.qid}"),
                     singleLine = true,
                 )
                 Spacer(Modifier.height(10.dp))
