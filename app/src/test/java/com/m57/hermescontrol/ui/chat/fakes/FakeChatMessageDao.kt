@@ -23,12 +23,20 @@ class FakeChatMessageDao : ChatMessageDao {
         messages[message.id] = message
     }
 
-    override suspend fun upsertAll(messageList: List<ChatMessageEntity>) {
+    override fun upsertAll(messageList: List<ChatMessageEntity>) {
         messageList.forEach { messages[it.id] = it }
     }
 
-    override suspend fun deleteMessagesForSession(sessionId: String) {
+    override fun deleteMessagesForSession(sessionId: String) {
         messages.values.removeAll { it.sessionId == sessionId }
+    }
+
+    override fun replaceMessagesForSession(
+        sessionId: String,
+        messageList: List<ChatMessageEntity>,
+    ) {
+        messages.values.removeAll { it.sessionId == sessionId }
+        messageList.forEach { messages[it.id] = it }
     }
 
     /** Direct access for test setup — bypasses the suspend modifier. */

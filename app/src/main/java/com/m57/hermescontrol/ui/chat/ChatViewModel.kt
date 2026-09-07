@@ -401,6 +401,7 @@ class ChatViewModel(
         viewModelScope.launch {
             wsClient.connectionStatus.collect { status ->
                 conversationGeneration++
+                repo.invalidateReplacementWrites()
                 if (status == ConnectionStatus.DISCONNECTED ||
                     status == ConnectionStatus.RECONNECTING ||
                     status == ConnectionStatus.NO_NETWORK ||
@@ -1373,6 +1374,7 @@ class ChatViewModel(
         val runtimeSessionId: String,
         val profileId: String,
         val generation: Long,
+        val persistenceGeneration: Long,
     )
 
     private fun handleUndoCommand(
@@ -1387,12 +1389,14 @@ class ChatViewModel(
                 runtimeSessionId = agentSessionId,
                 profileId = selectedProfileId(),
                 generation = conversationGeneration,
+                persistenceGeneration = repo.replacementGeneration(),
             )
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val result =
                     wsClient
-                        .request(
+                        .requestForConnection(
+                            fence.profileId,
                             WsMethods.COMMAND_DISPATCH,
                             mapOf("name" to "undo", "arg" to count, "session_id" to agentSessionId),
                         ).await()
@@ -1428,7 +1432,7 @@ class ChatViewModel(
         if (!isUndoFenceCurrent(fence)) return
         val feedback = ChatMessage(role = MessageRole.SYSTEM, content = notice)
         val reconciled = transcript + feedback
-        repo.replaceMessages(reconciled, fence.storageSessionId)
+        if (!repo.replaceMessagesIfCurrent(reconciled, fence.storageSessionId, fence.persistenceGeneration)) return
         if (!isUndoFenceCurrent(fence)) return
         loadedMessageOffset = 0
         latestPaging = true
@@ -1691,6 +1695,7 @@ class ChatViewModel(
         onDispatched: (() -> Unit)? = null,
     ) {
         conversationGeneration++
+        repo.invalidateReplacementWrites()
         val generation = ++sessionCreateCounter
         sessionCreateJob?.cancel()
         sessionCreateJob = null
@@ -2141,6 +2146,7 @@ class ChatViewModel(
         if (sessionId == _uiState.value.currentSessionId) return
 
         conversationGeneration++
+        repo.invalidateReplacementWrites()
         // A pending session.create belongs to the conversation the user just
         // left. Retiring the generation makes any late answer inert, and the
         // timer must go with it or it would retry a create into this session.

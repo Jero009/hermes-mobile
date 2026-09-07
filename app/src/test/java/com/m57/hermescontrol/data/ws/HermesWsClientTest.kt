@@ -302,6 +302,7 @@ class HermesWsClientTest {
         assertTrue(HermesWsClient.isConnected)
     }
 
+
     // ── Privileged sends (hermes-agent d90045be2 / a77692158) ────────────
     //
     // A privileged frame is never queued, never retried, and never replayed
@@ -559,6 +560,20 @@ class HermesWsClientTest {
         val secretExpire = received.filterIsInstance<WsEvent.SecretExpire>().first()
         assertEquals("profile-a", secretExpire.sourceProfileId)
         assertEquals(generation, secretExpire.connectionGeneration)
+
+    @Test
+    fun testConnectionBoundRequestRefusesWrongProfileBeforeSocketWrite() {
+        val socket = mockk<WebSocket>(relaxed = true)
+        every { socket.send(any<String>()) } returns true
+        installActiveListener(socket)
+
+        val result = HermesWsClient.requestForConnection("profile-b", "test.method")
+
+        assertTrue(result.isCompleted)
+        assertTrue(result.getCompletionExceptionOrNull() is HermesWsClient.HermesRpcException)
+        verify(exactly = 0) { socket.send(any<String>()) }
+        assertTrue(pendingCalls().isEmpty())
+
     }
 
     private fun outboundQueue(): java.util.Queue<*> {
@@ -600,6 +615,13 @@ class HermesWsClientTest {
         @Suppress("UNCHECKED_CAST")
         val status = statusField.get(HermesWsClient) as MutableStateFlow<ConnectionStatus>
         status.value = ConnectionStatus.CONNECTED
+
+        val profileField = HermesWsClient::class.java.getDeclaredField("activeConnectionProfileId")
+        profileField.isAccessible = true
+        profileField.set(HermesWsClient, "profile-a")
+        val generationField = HermesWsClient::class.java.getDeclaredField("activeConnectionGeneration")
+        generationField.isAccessible = true
+        generationField.setInt(HermesWsClient, connectionGeneration())
 
         val listenerClass =
             HermesWsClient::class.java.declaredClasses.first {
@@ -1306,6 +1328,13 @@ class HermesWsClientTest {
         @Suppress("UNCHECKED_CAST")
         val status = statusField.get(HermesWsClient) as MutableStateFlow<ConnectionStatus>
         status.value = ConnectionStatus.CONNECTED
+
+        val profileField = HermesWsClient::class.java.getDeclaredField("activeConnectionProfileId")
+        profileField.isAccessible = true
+        profileField.set(HermesWsClient, "profile-a")
+        val generationField = HermesWsClient::class.java.getDeclaredField("activeConnectionGeneration")
+        generationField.isAccessible = true
+        generationField.setInt(HermesWsClient, connectionGeneration())
 
         val listenerClass =
             HermesWsClient::class.java.declaredClasses.first {

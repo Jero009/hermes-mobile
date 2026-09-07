@@ -18,13 +18,13 @@ interface ChatMessageDao {
     suspend fun upsert(message: ChatMessageEntity)
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun upsertAll(messages: List<ChatMessageEntity>)
+    fun upsertAll(messages: List<ChatMessageEntity>)
 
     @Query("DELETE FROM chat_messages WHERE session_id = :sessionId")
-    suspend fun deleteMessagesForSession(sessionId: String)
+    fun deleteMessagesForSession(sessionId: String)
 
     @Transaction
-    suspend fun replaceMessagesForSession(
+    fun replaceMessagesForSession(
         sessionId: String,
         messages: List<ChatMessageEntity>,
     ) {

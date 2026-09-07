@@ -144,6 +144,10 @@ object HermesWsClient {
     @Volatile
     private var webSocket: WebSocket? = null
 
+    /** Identity of [webSocket], guarded by [connectionLock]. */
+    private var activeConnectionProfileId: String? = null
+    private var activeConnectionGeneration: Int = -1
+
     @Volatile
     private var currentBackoff = INITIAL_BACKOFF_MS
 
@@ -519,6 +523,8 @@ object HermesWsClient {
             rejectAllPending()
             webSocket?.close(1000, "Client closed")
             webSocket = null
+            activeConnectionProfileId = null
+            activeConnectionGeneration = -1
             connected.set(false)
             if (clearPendingMessages) {
                 messageQueue.clear()
@@ -586,6 +592,7 @@ object HermesWsClient {
             deferred
         }
 
+
     /**
      * Answer or cancel exactly one privileged gateway request.
      *
@@ -637,6 +644,26 @@ object HermesWsClient {
                     }
             }
             deferred
+
+    /** Atomically refuse requests captured for a superseded profile/socket. */
+    fun requestForConnection(
+        expectedProfileId: String,
+        method: String,
+        params: Map<String, Any> = emptyMap(),
+        timeoutMs: Long = REQUEST_TIMEOUT_MS,
+    ): CompletableDeferred<Any?> =
+        synchronized(connectionLock) {
+            if (!connected.get() ||
+                webSocket == null ||
+                activeConnectionProfileId != expectedProfileId ||
+                activeConnectionGeneration != connectionGeneration.get()
+            ) {
+                return@synchronized CompletableDeferred<Any?>().also {
+                    it.completeExceptionally(HermesRpcException("WebSocket connection changed — request cancelled"))
+                }
+            }
+            request(method, params, timeoutMs)
+
         }
 
     /** Complete (or fail) a single pending call and cancel its timer. */
@@ -970,6 +997,8 @@ object HermesWsClient {
                             request,
                             WsListenerImpl(profileId, generation),
                         )
+                    activeConnectionProfileId = profileId
+                    activeConnectionGeneration = generation
                 }
             }
         }
@@ -1065,6 +1094,8 @@ object HermesWsClient {
                 return@synchronized false
             }
             webSocket = null
+            activeConnectionProfileId = null
+            activeConnectionGeneration = -1
             connected.set(false)
             stopHealthTracking()
             rejectAllPending()

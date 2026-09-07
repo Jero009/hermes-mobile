@@ -13,6 +13,15 @@ import com.m57.hermescontrol.data.local.toUiModel
 open class ChatPersistenceRepository(
     private val dao: ChatMessageDao,
 ) {
+    private val replacementLock = Any()
+    private var replacementGeneration = 0L
+
+    fun replacementGeneration(): Long = synchronized(replacementLock) { replacementGeneration }
+
+    fun invalidateReplacementWrites() {
+        synchronized(replacementLock) { replacementGeneration++ }
+    }
+
     /** Persist a single message for the given session. */
     suspend fun persistMessage(
         message: ChatMessage,
@@ -34,10 +43,14 @@ open class ChatPersistenceRepository(
     suspend fun loadMessages(sessionId: String): List<ChatMessage> =
         dao.getMessagesForSession(sessionId).map { it.toUiModel() }
 
-    suspend fun replaceMessages(
+    suspend fun replaceMessagesIfCurrent(
         messages: List<ChatMessage>,
         sessionId: String,
-    ) {
-        dao.replaceMessagesForSession(sessionId, messages.map { it.toEntity(sessionId) })
-    }
+        expectedGeneration: Long,
+    ): Boolean =
+        synchronized(replacementLock) {
+            if (replacementGeneration != expectedGeneration) return@synchronized false
+            dao.replaceMessagesForSession(sessionId, messages.map { it.toEntity(sessionId) })
+            true
+        }
 }

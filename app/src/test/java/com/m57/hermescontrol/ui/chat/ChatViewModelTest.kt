@@ -141,6 +141,8 @@ class ChatViewModelTest {
         every { HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any()) } returns true
         every { HermesWsClient.request(WsMethods.CONFIG_SET, any(), any()) } returns
             CompletableDeferred<Any?>(mapOf("ok" to true))
+        every { HermesWsClient.requestForConnection(any(), any(), any(), any()) } returns
+            CompletableDeferred<Any?>(mapOf("ok" to true))
 
         // Default: the gateway acknowledges. Tests that care about the ack
         // boundary re-stub this via capturePrivileged().
@@ -233,7 +235,8 @@ class ChatViewModelTest {
             viewModel.addAttachment("content://safe", "safe.txt", "text/plain", 4)
             val undoResult = CompletableDeferred<Any?>()
             every {
-                HermesWsClient.request(
+                HermesWsClient.requestForConnection(
+                    "profile-a",
                     WsMethods.COMMAND_DISPATCH,
                     mapOf("name" to "undo", "arg" to "2", "session_id" to sessionId),
                     any(),
@@ -295,7 +298,9 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
             val undoResult = CompletableDeferred<Any?>()
-            every { HermesWsClient.request(WsMethods.COMMAND_DISPATCH, any(), any()) } returns undoResult
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
 
             viewModel.sendMessage("/undo")
             runCurrent()
@@ -314,7 +319,9 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
             val undoResult = CompletableDeferred<Any?>()
-            every { HermesWsClient.request(WsMethods.COMMAND_DISPATCH, any(), any()) } returns undoResult
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
 
             viewModel.sendMessage("/undo")
             runCurrent()
