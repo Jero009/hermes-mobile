@@ -1070,6 +1070,102 @@ class ChatViewModelTest {
         }
 
     @Test
+    fun branchResult_clearsParentSudoAndSecretPromptsWhenChildBecomesActive() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            mockEventsFlow.emit(sudoRequest())
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+            assertNotNull(viewModel.uiState.value.sudoPrompt)
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+
+            every {
+                HermesWsClient.send(WsMethods.SESSION_BRANCH, any(), any())
+            } answers {
+                arg<((String) -> Unit)?>(2)?.invoke("branch-prompts")
+                "branch-prompts"
+            }
+            viewModel.sendMessage("/fork child")
+            advanceUntilIdle()
+
+            mockEventsFlow.emit(
+                WsEvent.RpcResult(
+                    id = "branch-prompts",
+                    result = mapOf("session_id" to "child-runtime"),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals("child-runtime", viewModel.uiState.value.currentSessionId)
+            assertNull(viewModel.uiState.value.sudoPrompt)
+            assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun failedBranch_preservesExactParentSudoAndSecretPrompts() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            mockEventsFlow.emit(sudoRequest())
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+            val sudoPrompt = viewModel.uiState.value.sudoPrompt
+            val secretPrompt = viewModel.uiState.value.secretPrompt
+
+            every {
+                HermesWsClient.send(WsMethods.SESSION_BRANCH, any(), any())
+            } answers {
+                arg<((String) -> Unit)?>(2)?.invoke("failed-branch")
+                "failed-branch"
+            }
+            viewModel.sendMessage("/fork child")
+            advanceUntilIdle()
+            mockEventsFlow.emit(
+                WsEvent.RpcError(
+                    "failed-branch",
+                    JsonRpcError(code = -32603, message = "branch failed"),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(sudoPrompt, viewModel.uiState.value.sudoPrompt)
+            assertEquals(secretPrompt, viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun staleBranchResult_doesNotClearNewerSessionsSudoAndSecretPrompts() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            every {
+                HermesWsClient.send(WsMethods.SESSION_BRANCH, any(), any())
+            } answers {
+                arg<((String) -> Unit)?>(2)?.invoke("stale-branch-prompts")
+                "stale-branch-prompts"
+            }
+            viewModel.sendMessage("/fork child")
+            advanceUntilIdle()
+
+            viewModel.switchSession("other-session")
+            advanceUntilIdle()
+            mockEventsFlow.emit(sudoRequest(sessionId = "other-session"))
+            mockEventsFlow.emit(secretRequest(sessionId = "other-session"))
+            advanceUntilIdle()
+            val sudoPrompt = viewModel.uiState.value.sudoPrompt
+            val secretPrompt = viewModel.uiState.value.secretPrompt
+
+            mockEventsFlow.emit(
+                WsEvent.RpcResult(
+                    id = "stale-branch-prompts",
+                    result = mapOf("session_id" to "stale-child"),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals("other-session", viewModel.uiState.value.currentSessionId)
+            assertEquals(sudoPrompt, viewModel.uiState.value.sudoPrompt)
+            assertEquals(secretPrompt, viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
     fun testStaleBranchResult_doesNotReplaceSelectedSession() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()

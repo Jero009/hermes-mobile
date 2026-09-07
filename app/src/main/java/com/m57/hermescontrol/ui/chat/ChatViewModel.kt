@@ -856,6 +856,7 @@ class ChatViewModel(
                 val provider = (info?.get("provider") as? String)?.trim().orEmpty()
                 val reasoningEffort = (info?.get("reasoning_effort") as? String)?.trim()
                 val terminalBackend = (info?.get("terminal_backend") as? String)?.trim()
+                clearPrivilegedControls()
                 runtimeSessionId = newId
                 _uiState.update {
                     it.copy(
