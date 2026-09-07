@@ -16,10 +16,13 @@ import io.mockk.mockkStatic
 import io.mockk.unmockkAll
 import io.mockk.verify
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeout
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
@@ -567,14 +570,38 @@ class HermesWsClientTest {
         every { socket.send(any<String>()) } returns true
         installActiveListener(socket)
 
-        val result = HermesWsClient.requestForConnection("profile-b", "test.method")
-
-        assertTrue(result.isCompleted)
-        assertTrue(result.getCompletionExceptionOrNull() is HermesWsClient.HermesRpcException)
+        assertEquals(null, HermesWsClient.connectionBinding("profile-b"))
         verify(exactly = 0) { socket.send(any<String>()) }
         assertTrue(pendingCalls().isEmpty())
 
     }
+
+    @Test
+    fun testConnectionBoundRequestRefusesReplacementSocketBeforeCoroutineWrite() =
+        runBlocking {
+            supervisorScope {
+                val originalSocket = mockk<WebSocket>(relaxed = true)
+                every { originalSocket.send(any<String>()) } returns true
+                installActiveListener(originalSocket)
+                val binding = requireNotNull(HermesWsClient.connectionBinding("profile-a"))
+                val request =
+                    async(start = CoroutineStart.LAZY) {
+                        HermesWsClient.requestForConnection(binding, "test.method").await()
+                    }
+
+                incrementConnectionGeneration()
+                val replacementSocket = mockk<WebSocket>(relaxed = true)
+                every { replacementSocket.send(any<String>()) } returns true
+                installActiveListener(replacementSocket)
+
+                val failure = runCatching { request.await() }.exceptionOrNull()
+
+                assertTrue(failure is HermesWsClient.HermesRpcException)
+                verify(exactly = 0) { originalSocket.send(any<String>()) }
+                verify(exactly = 0) { replacementSocket.send(any<String>()) }
+                assertTrue(pendingCalls().isEmpty())
+            }
+        }
 
     private fun outboundQueue(): java.util.Queue<*> {
         val queueField = HermesWsClient::class.java.getDeclaredField("messageQueue")
@@ -599,6 +626,12 @@ class HermesWsClientTest {
         val field = HermesWsClient::class.java.getDeclaredField("connectionGeneration")
         field.isAccessible = true
         return (field.get(HermesWsClient) as AtomicInteger).get()
+    }
+
+    private fun incrementConnectionGeneration() {
+        val field = HermesWsClient::class.java.getDeclaredField("connectionGeneration")
+        field.isAccessible = true
+        (field.get(HermesWsClient) as AtomicInteger).incrementAndGet()
     }
 
     private fun installActiveListener(socket: WebSocket): WebSocketListener {

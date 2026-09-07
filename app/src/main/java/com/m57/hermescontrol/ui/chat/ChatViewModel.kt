@@ -31,6 +31,7 @@ import com.m57.hermescontrol.data.remote.safeApiCall
 import com.m57.hermescontrol.data.session.ActiveSessionHolder
 import com.m57.hermescontrol.data.ws.CommandBlocklist
 import com.m57.hermescontrol.data.ws.CommandCatalog
+import com.m57.hermescontrol.data.ws.ConnectionBinding
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.JsonRpcError
@@ -1373,6 +1374,7 @@ class ChatViewModel(
         val storageSessionId: String,
         val runtimeSessionId: String,
         val profileId: String,
+        val connectionBinding: ConnectionBinding,
         val generation: Long,
         val persistenceGeneration: Long,
     )
@@ -1383,11 +1385,14 @@ class ChatViewModel(
     ) {
         val storageSessionId = _uiState.value.currentSessionId ?: return
         val agentSessionId = runtimeSessionId ?: return
+        val profileId = selectedProfileId()
+        val connectionBinding = wsClient.connectionBinding(profileId) ?: return
         val fence =
             UndoFence(
                 storageSessionId = storageSessionId,
                 runtimeSessionId = agentSessionId,
-                profileId = selectedProfileId(),
+                profileId = profileId,
+                connectionBinding = connectionBinding,
                 generation = conversationGeneration,
                 persistenceGeneration = repo.replacementGeneration(),
             )
@@ -1396,7 +1401,7 @@ class ChatViewModel(
                 val result =
                     wsClient
                         .requestForConnection(
-                            fence.profileId,
+                            fence.connectionBinding,
                             WsMethods.COMMAND_DISPATCH,
                             mapOf("name" to "undo", "arg" to count, "session_id" to agentSessionId),
                         ).await()

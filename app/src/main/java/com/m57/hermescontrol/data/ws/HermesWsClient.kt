@@ -59,11 +59,19 @@ internal data class SourcedWsEvent(
     val storedSessionId: String? = null,
 )
 
+
 data class PrivilegedRequestBinding(
     val requestId: String,
     val runtimeSessionId: String,
     val profileId: String,
     val connectionGeneration: Int,
+
+/** Immutable identity of one live WebSocket connection. */
+class ConnectionBinding internal constructor(
+    val profileId: String,
+    val generation: Int,
+    internal val socket: WebSocket,
+
 )
 
 /**
@@ -593,6 +601,7 @@ object HermesWsClient {
         }
 
 
+
     /**
      * Answer or cancel exactly one privileged gateway request.
      *
@@ -645,18 +654,35 @@ object HermesWsClient {
             }
             deferred
 
+    /** Capture the exact live profile/socket identity for a later bound request. */
+    fun connectionBinding(expectedProfileId: String): ConnectionBinding? =
+        synchronized(connectionLock) {
+            val socket = webSocket
+            if (!connected.get() ||
+                socket == null ||
+                activeConnectionProfileId != expectedProfileId ||
+                activeConnectionGeneration != connectionGeneration.get()
+            ) {
+                null
+            } else {
+                ConnectionBinding(expectedProfileId, activeConnectionGeneration, socket)
+            }
+        }
+
+
     /** Atomically refuse requests captured for a superseded profile/socket. */
     fun requestForConnection(
-        expectedProfileId: String,
+        binding: ConnectionBinding,
         method: String,
         params: Map<String, Any> = emptyMap(),
         timeoutMs: Long = REQUEST_TIMEOUT_MS,
     ): CompletableDeferred<Any?> =
         synchronized(connectionLock) {
             if (!connected.get() ||
-                webSocket == null ||
-                activeConnectionProfileId != expectedProfileId ||
-                activeConnectionGeneration != connectionGeneration.get()
+                webSocket !== binding.socket ||
+                activeConnectionProfileId != binding.profileId ||
+                activeConnectionGeneration != binding.generation ||
+                binding.generation != connectionGeneration.get()
             ) {
                 return@synchronized CompletableDeferred<Any?>().also {
                     it.completeExceptionally(HermesRpcException("WebSocket connection changed — request cancelled"))

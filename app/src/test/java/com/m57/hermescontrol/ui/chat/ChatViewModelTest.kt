@@ -141,6 +141,7 @@ class ChatViewModelTest {
         every { HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any()) } returns true
         every { HermesWsClient.request(WsMethods.CONFIG_SET, any(), any()) } returns
             CompletableDeferred<Any?>(mapOf("ok" to true))
+        every { HermesWsClient.connectionBinding("profile-a") } returns mockk()
         every { HermesWsClient.requestForConnection(any(), any(), any(), any()) } returns
             CompletableDeferred<Any?>(mapOf("ok" to true))
 
@@ -236,7 +237,7 @@ class ChatViewModelTest {
             val undoResult = CompletableDeferred<Any?>()
             every {
                 HermesWsClient.requestForConnection(
-                    "profile-a",
+                    any(),
                     WsMethods.COMMAND_DISPATCH,
                     mapOf("name" to "undo", "arg" to "2", "session_id" to sessionId),
                     any(),
