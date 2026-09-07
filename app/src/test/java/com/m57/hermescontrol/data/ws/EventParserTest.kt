@@ -787,6 +787,38 @@ class EventParserPrivilegedTest {
     }
 
     @Test
+    fun privilegedFramesWithoutAnExactRuntimeSessionAreRejected() {
+        listOf("approval.request", "sudo.request", "sudo.expire", "secret.request", "secret.expire").forEach { type ->
+            val payload =
+                if (type == "approval.request") {
+                    mapOf("request_id" to "req-1", "timeout_seconds" to 300)
+                } else {
+                    mapOf("request_id" to "req-1")
+                }
+            listOf(null, "", "   ").forEach { sessionId ->
+                assertTrue(
+                    "$type with session_id=$sessionId must reject",
+                    EventParser.parse(privilegedEvent(type, payload, sessionId)) is
+                        WsEvent.PrivilegedRequestRejected,
+                )
+            }
+        }
+    }
+
+    @Test
+    fun privilegedFramesWithConflictingRuntimeSessionsAreRejected() {
+        val event =
+            EventParser.parse(
+                privilegedEvent(
+                    "sudo.request",
+                    mapOf("request_id" to "req-1", "session_id" to "different-session"),
+                ),
+            )
+
+        assertTrue(event is WsEvent.PrivilegedRequestRejected)
+    }
+
+    @Test
     fun approvalRequestWithoutARequestIdIsRejected() {
         val event =
             EventParser.parse(

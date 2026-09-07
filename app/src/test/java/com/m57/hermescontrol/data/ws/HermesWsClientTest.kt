@@ -250,6 +250,7 @@ class HermesWsClientTest {
                 HermesWsClient.connectionStatus.first { it == ConnectionStatus.CONNECTED }
             }
         }
+        val eventSocketGeneration = activeConnectionGeneration()
         ActiveSessionHolder.set("runtime-session", "stored-session")
         HermesWsClient.sendMessage("runtime-session", "hello")
         HermesWsClient.setAppForeground(false)
@@ -281,7 +282,7 @@ class HermesWsClientTest {
         }
         assertEquals("profile-a", completion.profileId)
         assertEquals("stored-session", completion.storedSessionId)
-        assertEquals(connectionGeneration() - 1, completion.connectionGeneration)
+        assertEquals(eventSocketGeneration, completion.connectionGeneration)
     }
 
     @Test
@@ -315,7 +316,7 @@ class HermesWsClientTest {
         requestId: String = "req-1",
         sessionId: String = "session-a",
         profileId: String = "profile-a",
-        generation: Int = connectionGeneration(),
+        generation: Int = activeConnectionGeneration(),
     ) = PrivilegedRequestBinding(requestId, sessionId, profileId, generation)
 
     /** Connect and return a queue of every frame the server received. */
@@ -522,7 +523,7 @@ class HermesWsClientTest {
         every { AuthManager.getSelectedProfileId() } returns "profile-a"
         val socket = mockk<WebSocket>(relaxed = true)
         val listener = installActiveListener(socket)
-        val generation = connectionGeneration()
+        val generation = activeConnectionGeneration()
 
         val payloads =
             listOf(
@@ -562,6 +563,44 @@ class HermesWsClientTest {
         val secretExpire = received.filterIsInstance<WsEvent.SecretExpire>().first()
         assertEquals("profile-a", secretExpire.sourceProfileId)
         assertEquals(generation, secretExpire.connectionGeneration)
+    }
+
+    @Test
+    fun privilegedRequestFromAReplacedSocketIsRefusedWithinTheSameReconnectGeneration() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val originalSocket = mockk<WebSocket>(relaxed = true)
+        val originalListener = installActiveListener(originalSocket)
+        val received =
+            runBlocking {
+                withTimeout(5000) {
+                    launch {
+                        originalListener.onMessage(
+                            originalSocket,
+                            """{"jsonrpc":"2.0","method":"event","params":{"type":"sudo.request",""" +
+                                """"session_id":"session-a","payload":{"request_id":"req-1"}}}""",
+                        )
+                    }
+                    HermesWsClient.events.first { it is WsEvent.SudoRequest } as WsEvent.SudoRequest
+                }
+            }
+
+        val replacementSocket = mockk<WebSocket>(relaxed = true)
+        every { replacementSocket.send(any<String>()) } returns true
+        installActiveListener(replacementSocket)
+        val deferred =
+            HermesWsClient.privilegedRequest(
+                WsMethods.SUDO_RESPOND,
+                PrivilegedRequestBinding(
+                    received.requestId,
+                    requireNotNull(received.sessionId),
+                    requireNotNull(received.sourceProfileId),
+                    requireNotNull(received.connectionGeneration),
+                ),
+                mapOf("password" to "hunter2"),
+            )
+
+        assertNotNull(deferred.getCompletionExceptionOrNull())
+        verify(exactly = 0) { replacementSocket.send(any<String>()) }
     }
 
     @Test
@@ -633,7 +672,17 @@ class HermesWsClientTest {
         (field.get(HermesWsClient) as AtomicInteger).incrementAndGet()
     }
 
+    private fun activeConnectionGeneration(): Int {
+        val field = HermesWsClient::class.java.getDeclaredField("activeConnectionGeneration")
+        field.isAccessible = true
+        return field.getInt(HermesWsClient)
+    }
+
     private fun installActiveListener(socket: WebSocket): WebSocketListener {
+        val socketGenerationField = HermesWsClient::class.java.getDeclaredField("socketGeneration")
+        socketGenerationField.isAccessible = true
+        val eventSocketGeneration = (socketGenerationField.get(HermesWsClient) as AtomicInteger).incrementAndGet()
+
         val socketField = HermesWsClient::class.java.getDeclaredField("webSocket")
         socketField.isAccessible = true
         socketField.set(HermesWsClient, socket)
@@ -653,7 +702,7 @@ class HermesWsClientTest {
         profileField.set(HermesWsClient, "profile-a")
         val generationField = HermesWsClient::class.java.getDeclaredField("activeConnectionGeneration")
         generationField.isAccessible = true
-        generationField.setInt(HermesWsClient, connectionGeneration())
+        generationField.setInt(HermesWsClient, eventSocketGeneration)
 
         val listenerClass =
             HermesWsClient::class.java.declaredClasses.first {
@@ -663,12 +712,53 @@ class HermesWsClientTest {
             listenerClass.getDeclaredConstructor(
                 String::class.java,
                 Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
             )
         constructor.isAccessible = true
         return constructor.newInstance(
             "profile-a",
             connectionGeneration(),
+            eventSocketGeneration,
         ) as WebSocketListener
+    }
+
+    @Test
+    fun clarifyResponseFromAReplacedSocketIsRefusedWithinTheSameReconnectGeneration() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val originalSocket = mockk<WebSocket>(relaxed = true)
+        val originalListener = installActiveListener(originalSocket)
+        val logicalGeneration = connectionGeneration()
+        val received =
+            runBlocking {
+                withTimeout(5000) {
+                    launch {
+                        originalListener.onMessage(
+                            originalSocket,
+                            """{"jsonrpc":"2.0","method":"event","params":{"type":"clarify.request",""" +
+                                """"session_id":"runtime-session","payload":{"request_id":"clarify-1",""" +
+                                """"prompt":"Question?"}}}""",
+                        )
+                    }
+                    HermesWsClient.events.first { it is WsEvent.ClarifyRequest } as WsEvent.ClarifyRequest
+                }
+            }
+
+        val replacementSocket = mockk<WebSocket>(relaxed = true)
+        every { replacementSocket.send(any<String>()) } returns true
+        installActiveListener(replacementSocket)
+
+        assertEquals(logicalGeneration, connectionGeneration())
+        assertFalse(
+            HermesWsClient.respondToClarify(
+                sessionId = requireNotNull(received.sessionId),
+                clarifyRequestId = requireNotNull(received.clarifyId),
+                questionId = received.questionId,
+                answer = "stale",
+                sourceProfileId = requireNotNull(received.sourceProfileId),
+                sourceConnectionGeneration = requireNotNull(received.connectionGeneration),
+            ),
+        )
+        verify(exactly = 0) { replacementSocket.send(any<String>()) }
     }
 
     @Test
@@ -681,7 +771,7 @@ class HermesWsClientTest {
         }
         every { AuthManager.getSelectedProfileId() } returns "profile-a"
         installActiveListener(socket)
-        val generation = connectionGeneration()
+        val generation = activeConnectionGeneration()
 
         assertTrue(
             HermesWsClient.respondToClarify(
@@ -1366,7 +1456,7 @@ class HermesWsClientTest {
         profileField.set(HermesWsClient, "profile-a")
         val generationField = HermesWsClient::class.java.getDeclaredField("activeConnectionGeneration")
         generationField.isAccessible = true
-        generationField.setInt(HermesWsClient, connectionGeneration())
+        generationField.setInt(HermesWsClient, activeConnectionGeneration())
 
         val listenerClass =
             HermesWsClient::class.java.declaredClasses.first {
@@ -1376,12 +1466,14 @@ class HermesWsClientTest {
             listenerClass.getDeclaredConstructor(
                 String::class.java,
                 Int::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType,
             )
         constructor.isAccessible = true
         val staleListener =
             constructor.newInstance(
                 "profile-a",
                 connectionGeneration(),
+                activeConnectionGeneration(),
             ) as WebSocketListener
 
         staleListener.onClosed(staleSocket, 4401, "auth: ticket_invalid")

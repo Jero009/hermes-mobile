@@ -111,6 +111,7 @@ object HermesWsClient {
 
     private val requestId = AtomicInteger(0)
     private val connectionGeneration = AtomicInteger(0)
+    private val socketGeneration = AtomicInteger(0)
     private val connected = AtomicBoolean(false)
     private val intentionalClose = AtomicBoolean(false)
     private val ticketAuthRetryUsed = AtomicBoolean(false)
@@ -621,7 +622,8 @@ object HermesWsClient {
             val deferred = CompletableDeferred<Any?>()
             val ws = webSocket
             if (!appInForeground.get() || !connected.get() || ws == null ||
-                binding.connectionGeneration != connectionGeneration.get() ||
+                binding.connectionGeneration != activeConnectionGeneration ||
+                binding.profileId != activeConnectionProfileId ||
                 binding.profileId != AuthManager.getSelectedProfileId()
             ) {
                 deferred.completeExceptionally(HermesRpcException("Privileged request is no longer active"))
@@ -659,7 +661,7 @@ object HermesWsClient {
             if (!connected.get() ||
                 socket == null ||
                 activeConnectionProfileId != expectedProfileId ||
-                activeConnectionGeneration != connectionGeneration.get()
+                activeConnectionGeneration < 0
             ) {
                 null
             } else {
@@ -673,8 +675,7 @@ object HermesWsClient {
             connected.get() &&
                 webSocket === binding.socket &&
                 activeConnectionProfileId == binding.profileId &&
-                activeConnectionGeneration == binding.generation &&
-                binding.generation == connectionGeneration.get()
+                activeConnectionGeneration == binding.generation
         }
 
     /** Atomically refuse requests captured for a superseded profile/socket. */
@@ -688,8 +689,7 @@ object HermesWsClient {
             if (!connected.get() ||
                 webSocket !== binding.socket ||
                 activeConnectionProfileId != binding.profileId ||
-                activeConnectionGeneration != binding.generation ||
-                binding.generation != connectionGeneration.get()
+                activeConnectionGeneration != binding.generation
             ) {
                 return@synchronized CompletableDeferred<Any?>().also {
                     it.completeExceptionally(HermesRpcException("WebSocket connection changed — request cancelled"))
@@ -814,7 +814,8 @@ object HermesWsClient {
     ): Boolean =
         synchronized(connectionLock) {
             if (!connected.get() ||
-                sourceConnectionGeneration != connectionGeneration.get() ||
+                sourceConnectionGeneration != activeConnectionGeneration ||
+                sourceProfileId != activeConnectionProfileId ||
                 sourceProfileId != AuthManager.getSelectedProfileId()
             ) {
                 return@synchronized false
@@ -1024,13 +1025,14 @@ object HermesWsClient {
                     restartForProfileChange = true
                 }
                 else -> {
+                    val eventSocketGeneration = socketGeneration.incrementAndGet()
                     webSocket =
                         OkHttpProvider.websocket.newWebSocket(
                             request,
-                            WsListenerImpl(profileId, generation),
+                            WsListenerImpl(profileId, generation, eventSocketGeneration),
                         )
                     activeConnectionProfileId = profileId
-                    activeConnectionGeneration = generation
+                    activeConnectionGeneration = eventSocketGeneration
                 }
             }
         }
@@ -1139,6 +1141,7 @@ object HermesWsClient {
     private class WsListenerImpl(
         private val profileId: String?,
         private val generation: Int,
+        private val eventSocketGeneration: Int,
     ) : WebSocketListener() {
         override fun onOpen(
             webSocket: WebSocket,
@@ -1194,15 +1197,15 @@ object HermesWsClient {
             val event =
                 when (parsedEvent) {
                     is WsEvent.ApprovalRequest ->
-                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
                     is WsEvent.SudoRequest ->
-                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
                     is WsEvent.SudoExpire ->
-                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
                     is WsEvent.SecretRequest ->
-                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
                     is WsEvent.SecretExpire ->
-                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = generation)
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
                     else -> parsedEvent
                 }
             synchronized(connectionLock) {
@@ -1245,13 +1248,13 @@ object HermesWsClient {
                                 if (event is WsEvent.ClarifyRequest) {
                                     event.copy(
                                         sourceProfileId = profileId,
-                                        connectionGeneration = generation,
+                                        connectionGeneration = eventSocketGeneration,
                                     )
                                 } else {
                                     event
                                 },
                             profileId = profileId,
-                            connectionGeneration = generation,
+                            connectionGeneration = eventSocketGeneration,
                             storedSessionId =
                                 (event as? WsEvent.MessageComplete)?.sessionId?.let(
                                     ActiveSessionHolder::resolveStoredSessionId,

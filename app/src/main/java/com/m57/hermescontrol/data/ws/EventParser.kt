@@ -40,6 +40,7 @@ object EventParser {
 
         // B7 (Jun 21 2026, kanban t_240): extract session_id from params first, fallback to payload
         val sessionId = params["session_id"] as? String ?: payload?.get("session_id") as? String
+        val privilegedSessionId = exactPrivilegedSessionId(params, payload)
 
         return when (eventType) {
             "gateway.ready" -> {
@@ -199,7 +200,7 @@ object EventParser {
             "approval.request" -> {
                 val requestId = privilegedRequestId(payload)
                 val timeoutSeconds = approvalTimeoutSeconds(payload)
-                if (requestId == null || timeoutSeconds == null) {
+                if (requestId == null || timeoutSeconds == null || privilegedSessionId == null) {
                     reject(eventType, sessionId)
                 } else {
                     val command = payload?.get("command") as? String
@@ -211,7 +212,7 @@ object EventParser {
                         command = command,
                         description = description,
                         patternKeys = patternKeys,
-                        sessionId = sessionId,
+                        sessionId = privilegedSessionId,
                         requestId = requestId,
                         timeoutSeconds = timeoutSeconds,
                     )
@@ -220,39 +221,39 @@ object EventParser {
 
             "sudo.request" -> {
                 val requestId = privilegedRequestId(payload)
-                if (requestId == null) {
+                if (requestId == null || privilegedSessionId == null) {
                     reject(eventType, sessionId)
                 } else {
-                    WsEvent.SudoRequest(requestId, sessionId)
+                    WsEvent.SudoRequest(requestId, privilegedSessionId)
                 }
             }
 
             "sudo.expire" -> {
                 val requestId = privilegedRequestId(payload)
-                if (requestId == null) {
+                if (requestId == null || privilegedSessionId == null) {
                     reject(eventType, sessionId)
                 } else {
-                    WsEvent.SudoExpire(requestId, sessionId)
+                    WsEvent.SudoExpire(requestId, privilegedSessionId)
                 }
             }
 
             "secret.request" -> {
                 val requestId = privilegedRequestId(payload)
-                if (requestId == null) {
+                if (requestId == null || privilegedSessionId == null) {
                     reject(eventType, sessionId)
                 } else {
                     val envVar = payload?.get("env_var") as? String
                     val prompt = payload?.get("prompt") as? String
-                    WsEvent.SecretRequest(requestId, sessionId, envVar, prompt)
+                    WsEvent.SecretRequest(requestId, privilegedSessionId, envVar, prompt)
                 }
             }
 
             "secret.expire" -> {
                 val requestId = privilegedRequestId(payload)
-                if (requestId == null) {
+                if (requestId == null || privilegedSessionId == null) {
                     reject(eventType, sessionId)
                 } else {
-                    WsEvent.SecretExpire(requestId, sessionId)
+                    WsEvent.SecretExpire(requestId, privilegedSessionId)
                 }
             }
 
@@ -270,6 +271,16 @@ object EventParser {
      */
     private fun privilegedRequestId(payload: Map<String, Any?>?): String? =
         (payload?.get("request_id") as? String)?.takeIf { it.isNotBlank() }
+
+    /** Require one non-blank runtime session, with no conflicting payload alias. */
+    private fun exactPrivilegedSessionId(
+        params: Map<String, Any?>,
+        payload: Map<String, Any?>?,
+    ): String? {
+        val outer = (params["session_id"] as? String)?.takeIf { it.isNotBlank() } ?: return null
+        val inner = payload?.get("session_id") ?: return outer
+        return (inner as? String)?.takeIf { it == outer && it.isNotBlank() }
+    }
 
     /**
      * The exact relative approval lifetime the gateway's waiting thread uses.
