@@ -2823,28 +2823,31 @@ class ChatViewModel(
      * visible in the transcript.
      */
     fun dismissClarify() {
-        val sessionId = _uiState.value.currentSessionId ?: return
-        val clarifyId = _uiState.value.clarifyRequest?.clarifyId
-        _uiState.update { it.copy(clarifyRequest = null) }
+        val state = _uiState.value
+        if (state.currentSessionId == null) return
+        val runtimeId = runtimeSessionId ?: return
+        val expected = state.clarifyRequest ?: return
+        val requestId = expected.clarifyId ?: return
+        val profileId = expected.sourceProfileId ?: return
+        val generation = expected.connectionGeneration ?: return
+        if (expected.sessionId != runtimeId) return
+        _uiState.update { current ->
+            if (current.clarifyRequest == expected) current.copy(clarifyRequest = null) else current
+        }
 
         addSystemMessage("Clarify dismissed — no answer sent", persist = true)
 
         viewModelScope.launch(Dispatchers.IO) {
-            val params =
-                mutableMapOf<String, Any>(
-                    "session_id" to sessionId,
-                    "response" to CLARIFY_DISMISS_RESPONSE,
-                    "answer" to CLARIFY_DISMISS_RESPONSE,
+            expected.resolvedQuestions.forEach { question ->
+                wsClient.respondToClarify(
+                    sessionId = runtimeId,
+                    clarifyRequestId = requestId,
+                    questionId = expected.wireQuestionId(question),
+                    answer = CLARIFY_DISMISS_RESPONSE,
+                    sourceProfileId = profileId,
+                    sourceConnectionGeneration = generation,
                 )
-            if (clarifyId != null) {
-                params["clarify_id"] = clarifyId
-                params["request_id"] = clarifyId
             }
-            wsClient.send(
-                method = WsMethods.CLARIFY_RESPOND,
-                params = params,
-                onSent = { id -> trackRequest(id, WsMethods.CLARIFY_RESPOND) },
-            )
         }
     }
 
@@ -2876,11 +2879,17 @@ class ChatViewModel(
             val answeredIds =
                 questions.mapNotNull { question ->
                     val answer = normalized[question.qid] ?: return@mapNotNull null
+                    if (_uiState.value.clarifyRequest != expected ||
+                        _uiState.value.currentSessionId != sessionId ||
+                        runtimeSessionId != runtimeId
+                    ) {
+                        return@mapNotNull null
+                    }
                     val sent =
                         wsClient.respondToClarify(
                             sessionId = runtimeId,
                             clarifyRequestId = requestId,
-                            questionId = question.qid,
+                            questionId = expected.wireQuestionId(question),
                             answer = answer,
                             sourceProfileId = profileId,
                             sourceConnectionGeneration = generation,
@@ -2908,9 +2917,14 @@ class ChatViewModel(
                     current
                 }
             }
-            repo.persistMessage(userMessage, sessionId)
+            if (_uiState.value.messages.any { it.id == userMessage.id }) {
+                repo.persistMessage(userMessage, sessionId)
+            }
         }
     }
+
+    private fun ClarifyUi.wireQuestionId(question: ClarifyQuestionUi): String? =
+        if (questions.isNotEmpty()) question.qid else questionId
 
     fun clearError() {
         _uiState.update { it.copy(errorMessage = null) }

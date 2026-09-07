@@ -357,6 +357,47 @@ class HermesWsClientTest {
         ) as WebSocketListener
     }
 
+    @Test
+    fun testClarifyResponsePreservesAliasesAndRejectsStaleGeneration() {
+        val socket = mockk<WebSocket>(relaxed = true)
+        var sentPayload = ""
+        every { socket.send(any<String>()) } answers {
+            sentPayload = firstArg()
+            true
+        }
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        installActiveListener(socket)
+        val generation = connectionGeneration()
+
+        assertTrue(
+            HermesWsClient.respondToClarify(
+                sessionId = "runtime-session",
+                clarifyRequestId = "clarify-1",
+                questionId = null,
+                answer = "answer",
+                sourceProfileId = "profile-a",
+                sourceConnectionGeneration = generation,
+            ),
+        )
+        assertTrue(sentPayload.contains("\"clarify_id\":\"clarify-1\""))
+        assertTrue(sentPayload.contains("\"request_id\":\"clarify-1\""))
+        assertTrue(sentPayload.contains("\"response\":\"answer\""))
+        assertTrue(sentPayload.contains("\"answer\":\"answer\""))
+        assertFalse(sentPayload.contains("question_id"))
+
+        assertFalse(
+            HermesWsClient.respondToClarify(
+                sessionId = "runtime-session",
+                clarifyRequestId = "clarify-1",
+                questionId = "q0",
+                answer = "stale",
+                sourceProfileId = "profile-a",
+                sourceConnectionGeneration = generation - 1,
+            ),
+        )
+        verify(exactly = 1) { socket.send(any<String>()) }
+    }
+
     private fun awaitOutboundQueueEmpty(timeoutMs: Long = 1_000): Boolean {
         val queue = outboundQueue()
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)

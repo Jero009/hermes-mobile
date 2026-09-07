@@ -703,7 +703,9 @@ object HermesWsClient {
             val params =
                 buildMap<String, Any> {
                     put("session_id", sessionId)
+                    put("clarify_id", clarifyRequestId)
                     put("request_id", clarifyRequestId)
+                    put("response", answer)
                     put("answer", answer)
                     questionId?.let { put("question_id", it) }
                 }

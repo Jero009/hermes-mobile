@@ -1464,7 +1464,7 @@ class ChatViewModelTest {
                 HermesWsClient.respondToClarify(
                     sessionId = sessionId,
                     clarifyRequestId = "clarify-123",
-                    questionId = "q0",
+                    questionId = null,
                     answer = "Yes",
                     sourceProfileId = "profile-a",
                     sourceConnectionGeneration = 7,
@@ -1520,7 +1520,7 @@ class ChatViewModelTest {
                 HermesWsClient.respondToClarify(
                     sessionId = sessionId,
                     clarifyRequestId = "clarify-456",
-                    questionId = "q0",
+                    questionId = null,
                     answer = "This is my custom response text",
                     sourceProfileId = "profile-a",
                     sourceConnectionGeneration = 8,
@@ -1600,9 +1600,12 @@ class ChatViewModelTest {
 
             mockEventsFlow.emit(
                 WsEvent.ClarifyRequest(
-                    "Please choose:",
-                    listOf("Yes", "No"),
-                    "clarify-789",
+                    text = "Please choose:",
+                    options = listOf("Yes", "No"),
+                    clarifyId = "clarify-789",
+                    sessionId = sessionId,
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 11,
                 ),
             )
             advanceUntilIdle()
@@ -1626,17 +1629,13 @@ class ChatViewModelTest {
             assertTrue(messages[1].content.contains("dismissed", ignoreCase = true))
 
             verify {
-                HermesWsClient.send(
-                    WsMethods.CLARIFY_RESPOND,
-                    params =
-                        mapOf(
-                            "session_id" to sessionId,
-                            "response" to "The user cancelled — no answer provided.",
-                            "answer" to "The user cancelled — no answer provided.",
-                            "clarify_id" to "clarify-789",
-                            "request_id" to "clarify-789",
-                        ),
-                    onSent = any(),
+                HermesWsClient.respondToClarify(
+                    sessionId = sessionId,
+                    clarifyRequestId = "clarify-789",
+                    questionId = null,
+                    answer = "The user cancelled — no answer provided.",
+                    sourceProfileId = "profile-a",
+                    sourceConnectionGeneration = 11,
                 )
             }
         }
