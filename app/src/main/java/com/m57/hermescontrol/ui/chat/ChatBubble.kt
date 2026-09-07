@@ -47,7 +47,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -64,6 +66,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
@@ -74,6 +77,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -81,6 +85,7 @@ import androidx.compose.ui.unit.sp
 import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.model.Attachment
 import com.m57.hermescontrol.data.remote.OkHttpProvider
+import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import com.m57.hermescontrol.theme.ChatFontScale
 import com.m57.hermescontrol.theme.DarkOnSurface
 import com.m57.hermescontrol.theme.HermesStatusColors
@@ -90,6 +95,7 @@ import com.m57.hermescontrol.theme.onColorFor
 import com.m57.hermescontrol.ui.chat.components.DiffViewCard
 import com.m57.hermescontrol.ui.chat.components.ReasoningCard
 import com.m57.hermescontrol.ui.chat.components.SystemTimelineMarker
+import com.m57.hermescontrol.util.BidiUtils
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonArray
@@ -110,7 +116,8 @@ fun ChatBubble(
     isDarkTheme: Boolean,
     searchQuery: String = "",
     isCurrentMatch: Boolean = false,
-    onRespondApproval: (String) -> Unit = {},
+    onRespondApproval: (String, PrivilegedRequestBinding, String) -> Unit = { _, _, _ -> },
+    onCancelApproval: (String, PrivilegedRequestBinding) -> Unit = { _, _ -> },
     onOpenAttachment: (Attachment) -> Unit = {},
     openingAttachmentPath: String? = null,
     onImageClick: (ImageViewerModel) -> Unit = {},
@@ -158,6 +165,7 @@ fun ChatBubble(
                     SystemBubble(
                         message = message,
                         onRespondApproval = onRespondApproval,
+                        onCancelApproval = onCancelApproval,
                         modifier = modifier,
                     )
                 }
@@ -264,12 +272,20 @@ private fun UserBubble(
             ) {
                 Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
                     ChatFontScale {
-                        SelectionContainer {
-                            Text(
-                                text = highlightedText,
-                                color = userBubbleTextColor,
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
+                        val isRtl = remember(message.content) { BidiUtils.isRtlText(message.content) }
+                        val textDirection =
+                            if (isRtl) androidx.compose.ui.unit.LayoutDirection.Rtl else LocalLayoutDirection.current
+                        CompositionLocalProvider(LocalLayoutDirection provides textDirection) {
+                            SelectionContainer {
+                                Text(
+                                    text = highlightedText,
+                                    color = userBubbleTextColor,
+                                    style =
+                                        MaterialTheme.typography.bodyMedium.copy(
+                                            textDirection = if (isRtl) TextDirection.Rtl else TextDirection.Ltr,
+                                        ),
+                                )
+                            }
                         }
                     }
                     // Render inline attachments
@@ -551,7 +567,8 @@ private fun SelfImprovementReviewCard(
 @Composable
 private fun SystemBubble(
     message: ChatMessage,
-    onRespondApproval: (String) -> Unit = {},
+    onRespondApproval: (String, PrivilegedRequestBinding, String) -> Unit = { _, _, _ -> },
+    onCancelApproval: (String, PrivilegedRequestBinding) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     if (message.content.contains("Self-improvement review:", ignoreCase = true)) {
@@ -575,14 +592,18 @@ private fun SystemBubble(
                 ),
         )
 
-        // Approval action buttons
-        if (message.approvalInfo != null) {
+        // Approval action buttons. Approve is a single-use "once" — there is
+        // deliberately no session-wide or permanent allow, because nothing on
+        // this screen shows what a standing allow would later authorize.
+        val approvalInfo = message.approvalInfo
+        if (approvalInfo != null) {
             Spacer(Modifier.height(8.dp))
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 FilledTonalButton(
-                    onClick = { onRespondApproval("approve") },
+                    onClick = { onRespondApproval(message.id, approvalInfo.privilegedBinding, "approve") },
+                    enabled = !approvalInfo.isSubmitting,
                     modifier =
                         Modifier
                             .height(36.dp)
@@ -602,7 +623,8 @@ private fun SystemBubble(
                 }
 
                 FilledTonalButton(
-                    onClick = { onRespondApproval("deny") },
+                    onClick = { onRespondApproval(message.id, approvalInfo.privilegedBinding, "deny") },
+                    enabled = !approvalInfo.isSubmitting,
                     modifier =
                         Modifier
                             .height(36.dp)
@@ -619,6 +641,19 @@ private fun SystemBubble(
                     )
                     Spacer(Modifier.width(4.dp))
                     Text("Deny")
+                }
+
+                // Withdraw the request entirely (typed `approval.cancel`).
+                // Distinct from Deny, which is an answer the agent can adapt to.
+                TextButton(
+                    onClick = { onCancelApproval(message.id, approvalInfo.privilegedBinding) },
+                    enabled = !approvalInfo.isSubmitting,
+                    modifier =
+                        Modifier
+                            .height(36.dp)
+                            .testTag("cancel_approval_button"),
+                ) {
+                    Text(stringResource(R.string.chat_privileged_cancel))
                 }
             }
         }

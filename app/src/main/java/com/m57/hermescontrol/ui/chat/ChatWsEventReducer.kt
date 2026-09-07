@@ -25,6 +25,16 @@ object ChatWsEventReducer {
         event: WsEvent,
         currentSessionId: String? = null,
     ): ReducerResult {
+        if (event is WsEvent.ClarifyRequest &&
+            (
+                event.clarifyId.isNullOrBlank() ||
+                    event.sessionId.isNullOrBlank() ||
+                    event.sourceProfileId.isNullOrBlank() ||
+                    event.connectionGeneration == null
+            )
+        ) {
+            return ReducerResult(state = state, streamingState = streamingState)
+        }
         val eventSessionId =
             when (event) {
                 is WsEvent.MessageStart -> event.sessionId
@@ -37,6 +47,7 @@ object ChatWsEventReducer {
                 is WsEvent.ToolComplete -> event.sessionId
                 is WsEvent.ToolOutputRisk -> event.sessionId
                 is WsEvent.ClarifyRequest -> event.sessionId
+                is WsEvent.ClarifyExpire -> event.sessionId
                 is WsEvent.ToolProgress -> event.sessionId
                 is WsEvent.ToolGenerating -> event.sessionId
                 is WsEvent.SubagentEvent -> event.sessionId
@@ -87,6 +98,23 @@ object ChatWsEventReducer {
 
             is WsEvent.ClarifyRequest -> onClarifyRequest(state, streamingState, event)
 
+            is WsEvent.ClarifyExpire ->
+                ReducerResult(
+                    state =
+                        if (state.clarifyRequest?.let { clarify ->
+                                clarify.clarifyId == event.clarifyId &&
+                                    clarify.sessionId == event.sessionId &&
+                                    clarify.sourceProfileId == event.sourceProfileId &&
+                                    clarify.connectionGeneration == event.connectionGeneration
+                            } == true
+                        ) {
+                            state.copy(clarifyRequest = null)
+                        } else {
+                            state
+                        },
+                    streamingState = streamingState,
+                )
+
             is WsEvent.ReviewSummary -> onReviewSummary(state, streamingState, event)
 
             is WsEvent.RpcError -> onRpcError(state, streamingState, event)
@@ -117,7 +145,14 @@ object ChatWsEventReducer {
             // SudoRequest / SecretRequest are handled by the ViewModel (issue #524)
             is WsEvent.SudoRequest -> ReducerResult(state = state, streamingState = streamingState)
 
+            is WsEvent.SudoExpire -> ReducerResult(state = state, streamingState = streamingState)
+
             is WsEvent.SecretRequest -> ReducerResult(state = state, streamingState = streamingState)
+
+            is WsEvent.SecretExpire -> ReducerResult(state = state, streamingState = streamingState)
+
+            // A privileged frame the parser refused to bind. Never surfaced.
+            is WsEvent.PrivilegedRequestRejected -> ReducerResult(state = state, streamingState = streamingState)
 
             // ReactionEvent is handled by the ViewModel — purely cosmetic animation
             is WsEvent.ReactionEvent -> ReducerResult(state = state, streamingState = streamingState)
@@ -523,6 +558,15 @@ object ChatWsEventReducer {
                             text = event.text.orEmpty(),
                             options = event.options.orEmpty(),
                             clarifyId = event.clarifyId,
+                            questionId = event.questionId,
+                            multiSelect = event.multiSelect,
+                            questions =
+                                event.questions.map {
+                                    ClarifyQuestionUi(it.qid, it.question, it.choices, it.multiSelect)
+                                },
+                            sessionId = event.sessionId,
+                            sourceProfileId = event.sourceProfileId,
+                            connectionGeneration = event.connectionGeneration,
                         ),
                     isAgentTyping = false,
                 ),

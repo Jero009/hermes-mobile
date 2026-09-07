@@ -10,6 +10,7 @@ import android.util.Log
 import androidx.core.content.FileProvider
 import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.local.AuthManager
+import com.m57.hermescontrol.data.local.ChatMessageEntity
 import com.m57.hermescontrol.data.local.HermesDatabase
 import com.m57.hermescontrol.data.model.Attachment
 import com.m57.hermescontrol.data.model.AttachmentSource
@@ -21,8 +22,10 @@ import com.m57.hermescontrol.data.session.ActiveSessionHolder
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.JsonRpcError
+import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
+import com.m57.hermescontrol.ui.chat.fakes.FakeChatMessageDao
 import com.m57.hermescontrol.ui.chat.fakes.FakeChatPersistenceRepository
 import com.m57.hermescontrol.ui.chat.fakes.FakeSlashUsageStore
 import io.mockk.coEvery
@@ -38,6 +41,7 @@ import io.mockk.verify
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -48,6 +52,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -56,6 +61,12 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+/** Fixed, value-free text the VM shows when a secret-bearing verb is not acknowledged. */
+private const val PRIVILEGED_FAILURE_TEXT = "Hermes did not acknowledge that. The request is still waiting."
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ChatViewModelTest {
@@ -97,6 +108,7 @@ class ChatViewModelTest {
             val formatArgs = arg<Array<out Any>>(1)
             "Failed to switch model: ${formatArgs.first()}"
         }
+        every { app.getString(R.string.chat_privileged_not_acknowledged) } returns PRIVILEGED_FAILURE_TEXT
         fakeRepo = FakeChatPersistenceRepository()
         fakeSlashUsageStore = FakeSlashUsageStore()
         every { AuthManager.getSelectedProfileId() } returns "profile-a"
@@ -133,8 +145,18 @@ class ChatViewModelTest {
             arg<((String) -> Unit)?>(2)?.invoke(id)
             id
         }
+        every { HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any()) } returns true
         every { HermesWsClient.request(WsMethods.CONFIG_SET, any(), any()) } returns
             CompletableDeferred<Any?>(mapOf("ok" to true))
+        every { HermesWsClient.connectionBinding("profile-a") } returns mockk()
+        every { HermesWsClient.isConnectionBindingCurrent(any()) } returns true
+        every { HermesWsClient.requestForConnection(any(), any(), any(), any()) } returns
+            CompletableDeferred<Any?>(mapOf("ok" to true))
+
+        // Default: the gateway acknowledges. Tests that care about the ack
+        // boundary re-stub this via capturePrivileged().
+        every { HermesWsClient.privilegedRequest(any(), any(), any()) } returns
+            CompletableDeferred<Any?>(mapOf("status" to "ok"))
 
         // Stub model-options so preloadModelOptions() (fired at GatewayReady) is safe.
         mockApi = mockk(relaxed = true)
@@ -177,6 +199,40 @@ class ChatViewModelTest {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    private fun cachedEntity(
+        sessionId: String,
+        content: String,
+        id: String = "cache-$content",
+    ) = ChatMessageEntity(
+        id = id,
+        sessionId = sessionId,
+        role = "assistant",
+        content = content,
+        timestamp = 1L,
+    )
+
+    private fun serverMessages(content: String) =
+        retrofit2.Response.success(
+            com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                messages =
+                    listOf(
+                        com.m57.hermescontrol.data.model.SessionMessage(
+                            id = 1,
+                            role = "assistant",
+                            content = content,
+                        ),
+                    ),
+                pagination =
+                    com.m57.hermescontrol.data.model.SessionMessagePagination(
+                        limit = 150,
+                        offset = 0,
+                        order = "latest",
+                        returned = 1,
+                        total = 1,
+                    ),
+            ),
+        )
+
     /** Create a ViewModel with the fake repo injected directly. */
     private fun createViewModel(startCleanup: Boolean = false): ChatViewModel =
         ChatViewModel(app, startCleanup, fakeRepo, fakeSlashUsageStore, testDispatcher)
@@ -213,7 +269,354 @@ class ChatViewModelTest {
         return Pair(viewModel, "session-123")
     }
 
+    private suspend fun TestScope.createPaginatedViewModel(): ChatViewModel {
+        val (viewModel, _) = createViewModelWithSession()
+        coEvery { mockApi.getSessions(any(), any(), any()) } returns
+            retrofit2.Response.success(
+                com.m57.hermescontrol.data.model.SessionListResponse(
+                    sessions = listOf(com.m57.hermescontrol.data.model.SessionInfo(id = "paged", message_count = 300)),
+                ),
+            )
+        coEvery { mockApi.getSessionMessages("paged", 150, 0, true, "latest") } returns
+            retrofit2.Response.success(
+                com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                    messages =
+                        listOf(
+                            com.m57.hermescontrol.data.model.SessionMessage(
+                                id = 200,
+                                role = "assistant",
+                                content = "recent",
+                            ),
+                        ),
+                    pagination =
+                        com.m57.hermescontrol.data.model.SessionMessagePagination(
+                            limit = 150,
+                            offset = 0,
+                            order = "latest",
+                            returned = 150,
+                            total = 300,
+                        ),
+                ),
+            )
+        viewModel.switchSession("paged")
+        advanceUntilIdle()
+        check(viewModel.uiState.value.hasOlderMessages)
+        return viewModel
+    }
+
     // ── Slash command tests ──────────────────────────────────────────────────
+
+    @Test
+    fun testUndoCommand_replacesCompleteTranscriptCacheAndPrefillsComposer() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            viewModel.addAttachment("content://safe", "safe.txt", "text/plain", 4)
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(
+                    any(),
+                    WsMethods.COMMAND_DISPATCH,
+                    mapOf("name" to "undo", "arg" to "2", "session_id" to sessionId),
+                    any(),
+                )
+            } returns undoResult
+            val pageOffsets = mutableListOf<Int>()
+            coEvery { mockApi.getSessionMessages(sessionId, any(), any(), true, "latest") } answers {
+                val offset = arg<Int>(2)
+                pageOffsets += offset
+                val content = if (offset == 0) "kept recent" else "kept archived"
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = if (offset == 0) 20 else 10,
+                                    role = "assistant",
+                                    content = content,
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                limit = 150,
+                                offset = offset,
+                                order = "latest",
+                                returned = if (offset == 0) 150 else 1,
+                                total = 151,
+                            ),
+                    ),
+                )
+            }
+
+            viewModel.sendMessage("/undo 2")
+            runCurrent()
+            undoResult.complete(
+                mapOf(
+                    "type" to "prefill",
+                    "message" to "undone prompt",
+                    "notice" to "Undid 2 turns",
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(listOf(0, 150), pageOffsets)
+            assertEquals(
+                listOf("kept archived", "kept recent", "Undid 2 turns"),
+                viewModel.uiState.value.messages.map { it.content },
+            )
+            assertEquals("undone prompt", viewModel.uiState.value.pendingPrefillText)
+            assertEquals(
+                setOf("kept archived", "kept recent", "Undid 2 turns"),
+                fakeRepo.loadMessages(sessionId).map { it.content }.toSet(),
+            )
+            assertEquals(1, viewModel.uiState.value.pendingAttachments.size)
+        }
+
+    @Test
+    fun fullRefreshDoesNotRetireAcceptedUndoReconciliation() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+            var historyCalls = 0
+            coEvery { mockApi.getSessionMessages(sessionId, any(), any(), true, "latest") } answers {
+                val content = if (++historyCalls == 1) "refresh superseded" else "undo authoritative"
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = historyCalls,
+                                    role = "assistant",
+                                    content = content,
+                                ),
+                            ),
+                    ),
+                )
+            }
+
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            viewModel.refreshCurrentSession()
+            runCurrent()
+
+            assertEquals(1, historyCalls)
+            undoResult.complete(mapOf("type" to "prefill", "message" to "restored", "notice" to "Undone"))
+            advanceUntilIdle()
+
+            assertEquals(2, historyCalls)
+            assertEquals(
+                listOf("undo authoritative", "Undone"),
+                viewModel.uiState.value.messages.map { it.content },
+            )
+            assertEquals(
+                setOf("undo authoritative", "Undone"),
+                fakeRepo.loadMessages(sessionId).map { it.content }.toSet(),
+            )
+            assertEquals("restored", viewModel.uiState.value.pendingPrefillText)
+        }
+
+    @Test
+    fun testUndoCommand_lateResultAfterSessionSwitchIsInert() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            viewModel.switchSession("other-session")
+            undoResult.complete(mapOf("type" to "prefill", "message" to "stale", "notice" to "stale"))
+            advanceUntilIdle()
+
+            assertEquals("other-session", viewModel.uiState.value.currentSessionId)
+            assertNull(viewModel.uiState.value.pendingPrefillText)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale" })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "/undo" })
+        }
+
+    @Test
+    fun testUndoCommand_lateResultAfterProfileSwitchIsInert() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            every { AuthManager.getSelectedProfileId() } returns "profile-b"
+            undoResult.complete(mapOf("type" to "prefill", "message" to "stale", "notice" to "stale"))
+            advanceUntilIdle()
+
+            assertNull(viewModel.uiState.value.pendingPrefillText)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale" })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "/undo" })
+        }
+
+    @Test
+    fun testUndoCommand_socketGenerationChangeBeforeResultIsInertWithoutStatusUpdate() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+            var messagePageCalls = 0
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), any(), any()) } answers {
+                messagePageCalls++
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(messages = emptyList()),
+                )
+            }
+
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            every { HermesWsClient.isConnectionBindingCurrent(any()) } returns false
+            undoResult.complete(mapOf("type" to "prefill", "message" to "stale", "notice" to "stale"))
+            advanceUntilIdle()
+
+            assertEquals(ConnectionStatus.CONNECTED, mockConnectionStatus.value)
+            assertNull(viewModel.uiState.value.pendingPrefillText)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale" })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "/undo" })
+            assertEquals(0, messagePageCalls)
+        }
+
+    @Test
+    fun testUndoCommand_socketGenerationChangeDuringPaginationStopsBeforeReplacement() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+            var messagePageCalls = 0
+            coEvery { mockApi.getSessionMessages(sessionId, any(), any(), true, "latest") } answers {
+                messagePageCalls++
+                every { HermesWsClient.isConnectionBindingCurrent(any()) } returns false
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 20,
+                                    role = "assistant",
+                                    content = "stale page",
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                limit = 150,
+                                offset = 0,
+                                order = "latest",
+                                returned = 150,
+                                total = 300,
+                            ),
+                    ),
+                )
+            }
+
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            undoResult.complete(mapOf("type" to "prefill", "message" to "stale", "notice" to "stale"))
+            advanceUntilIdle()
+
+            assertEquals(ConnectionStatus.CONNECTED, mockConnectionStatus.value)
+            assertEquals(1, messagePageCalls)
+            assertNull(viewModel.uiState.value.pendingPrefillText)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale page" || it.content == "stale" })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "/undo" })
+        }
+
+    @Test
+    fun undoFencesSuspendedRefreshAndOlderPageButAllowsPostUndoRefresh() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val staleRefresh = CompletableDeferred<Unit>()
+            val staleOlder = CompletableDeferred<Unit>()
+            var offsetZeroCalls = 0
+
+            fun page(
+                content: String,
+                offset: Int,
+                returned: Int = 1,
+                total: Int = 1,
+            ) = com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                messages =
+                    listOf(
+                        com.m57.hermescontrol.data.model.SessionMessage(
+                            id = content.hashCode(),
+                            role = "assistant",
+                            content = content,
+                        ),
+                    ),
+                pagination =
+                    com.m57.hermescontrol.data.model.SessionMessagePagination(
+                        limit = 150,
+                        offset = offset,
+                        order = "latest",
+                        returned = returned,
+                        total = total,
+                    ),
+            )
+
+            coEvery { mockApi.getSessionMessages(sessionId, any(), any(), true, "latest") } coAnswers {
+                val offset = arg<Int>(2)
+                val response =
+                    if (offset == 150) {
+                        withContext(NonCancellable) { staleOlder.await() }
+                        page("stale older", offset)
+                    } else {
+                        offsetZeroCalls++
+                        when (offsetZeroCalls) {
+                            1 -> page("initial", 0, returned = 150, total = 300)
+                            2 -> {
+                                withContext(NonCancellable) { staleRefresh.await() }
+                                page("stale refresh", 0)
+                            }
+                            3 -> page("authoritative", 0)
+                            else -> page("post undo", 0)
+                        }
+                    }
+                retrofit2.Response.success(response)
+            }
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+
+            viewModel.refreshCurrentSession()
+            advanceUntilIdle()
+            assertTrue(viewModel.uiState.value.hasOlderMessages)
+
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            viewModel.loadOlderMessages()
+            runCurrent()
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            undoResult.complete(mapOf("type" to "prefill", "message" to "rewound", "notice" to "undone"))
+            runCurrent()
+
+            assertEquals(listOf("authoritative", "undone"), viewModel.uiState.value.messages.map { it.content })
+            assertEquals(setOf("authoritative", "undone"), fakeRepo.loadMessages(sessionId).map { it.content }.toSet())
+
+            staleRefresh.complete(Unit)
+            staleOlder.complete(Unit)
+            advanceUntilIdle()
+            assertEquals(listOf("authoritative", "undone"), viewModel.uiState.value.messages.map { it.content })
+            assertEquals(setOf("authoritative", "undone"), fakeRepo.loadMessages(sessionId).map { it.content }.toSet())
+
+            viewModel.refreshCurrentSession()
+            advanceUntilIdle()
+            assertEquals(listOf("post undo"), viewModel.uiState.value.messages.map { it.content })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "post undo" })
+        }
 
     @Test
     fun testSlashCommand_help_addsHelpMessage() =
@@ -874,6 +1277,102 @@ class ChatViewModelTest {
         }
 
     @Test
+    fun branchResult_clearsParentSudoAndSecretPromptsWhenChildBecomesActive() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            mockEventsFlow.emit(sudoRequest())
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+            assertNotNull(viewModel.uiState.value.sudoPrompt)
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+
+            every {
+                HermesWsClient.send(WsMethods.SESSION_BRANCH, any(), any())
+            } answers {
+                arg<((String) -> Unit)?>(2)?.invoke("branch-prompts")
+                "branch-prompts"
+            }
+            viewModel.sendMessage("/fork child")
+            advanceUntilIdle()
+
+            mockEventsFlow.emit(
+                WsEvent.RpcResult(
+                    id = "branch-prompts",
+                    result = mapOf("session_id" to "child-runtime"),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals("child-runtime", viewModel.uiState.value.currentSessionId)
+            assertNull(viewModel.uiState.value.sudoPrompt)
+            assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun failedBranch_preservesExactParentSudoAndSecretPrompts() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            mockEventsFlow.emit(sudoRequest())
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+            val sudoPrompt = viewModel.uiState.value.sudoPrompt
+            val secretPrompt = viewModel.uiState.value.secretPrompt
+
+            every {
+                HermesWsClient.send(WsMethods.SESSION_BRANCH, any(), any())
+            } answers {
+                arg<((String) -> Unit)?>(2)?.invoke("failed-branch")
+                "failed-branch"
+            }
+            viewModel.sendMessage("/fork child")
+            advanceUntilIdle()
+            mockEventsFlow.emit(
+                WsEvent.RpcError(
+                    "failed-branch",
+                    JsonRpcError(code = -32603, message = "branch failed"),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(sudoPrompt, viewModel.uiState.value.sudoPrompt)
+            assertEquals(secretPrompt, viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun staleBranchResult_doesNotClearNewerSessionsSudoAndSecretPrompts() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            every {
+                HermesWsClient.send(WsMethods.SESSION_BRANCH, any(), any())
+            } answers {
+                arg<((String) -> Unit)?>(2)?.invoke("stale-branch-prompts")
+                "stale-branch-prompts"
+            }
+            viewModel.sendMessage("/fork child")
+            advanceUntilIdle()
+
+            viewModel.switchSession("other-session")
+            advanceUntilIdle()
+            mockEventsFlow.emit(sudoRequest(sessionId = "other-session"))
+            mockEventsFlow.emit(secretRequest(sessionId = "other-session"))
+            advanceUntilIdle()
+            val sudoPrompt = viewModel.uiState.value.sudoPrompt
+            val secretPrompt = viewModel.uiState.value.secretPrompt
+
+            mockEventsFlow.emit(
+                WsEvent.RpcResult(
+                    id = "stale-branch-prompts",
+                    result = mapOf("session_id" to "stale-child"),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals("other-session", viewModel.uiState.value.currentSessionId)
+            assertEquals(sudoPrompt, viewModel.uiState.value.sudoPrompt)
+            assertEquals(secretPrompt, viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
     fun testStaleBranchResult_doesNotReplaceSelectedSession() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
@@ -1425,7 +1924,16 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
 
-            mockEventsFlow.emit(WsEvent.ClarifyRequest("Please choose:", listOf("Yes", "No"), "clarify-123"))
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = "Please choose:",
+                    options = listOf("Yes", "No"),
+                    clarifyId = "clarify-123",
+                    sessionId = sessionId,
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 7,
+                ),
+            )
             advanceUntilIdle()
 
             assertEquals(
@@ -1451,17 +1959,13 @@ class ChatViewModelTest {
             assertEquals(2, viewModel.uiState.value.messages.size)
 
             verify {
-                HermesWsClient.send(
-                    method = WsMethods.CLARIFY_RESPOND,
-                    params =
-                        mapOf(
-                            "session_id" to sessionId,
-                            "response" to "Yes",
-                            "answer" to "Yes",
-                            "clarify_id" to "clarify-123",
-                            "request_id" to "clarify-123",
-                        ),
-                    onSent = any(),
+                HermesWsClient.respondToClarify(
+                    sessionId = sessionId,
+                    clarifyRequestId = "clarify-123",
+                    questionId = null,
+                    answer = "Yes",
+                    sourceProfileId = "profile-a",
+                    sourceConnectionGeneration = 7,
                 )
             }
         }
@@ -1471,7 +1975,16 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
 
-            mockEventsFlow.emit(WsEvent.ClarifyRequest("Please explain:", emptyList(), "clarify-456"))
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = "Please explain:",
+                    options = emptyList(),
+                    clarifyId = "clarify-456",
+                    sessionId = sessionId,
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 8,
+                ),
+            )
             advanceUntilIdle()
 
             assertEquals(
@@ -1502,18 +2015,123 @@ class ChatViewModelTest {
             )
 
             verify {
-                HermesWsClient.send(
-                    WsMethods.CLARIFY_RESPOND,
-                    params =
-                        mapOf(
-                            "session_id" to sessionId,
-                            "response" to "This is my custom response text",
-                            "answer" to "This is my custom response text",
-                            "clarify_id" to "clarify-456",
-                            "request_id" to "clarify-456",
-                        ),
-                    onSent = any(),
+                HermesWsClient.respondToClarify(
+                    sessionId = sessionId,
+                    clarifyRequestId = "clarify-456",
+                    questionId = null,
+                    answer = "This is my custom response text",
+                    sourceProfileId = "profile-a",
+                    sourceConnectionGeneration = 8,
                 )
+            }
+        }
+
+    @Test
+    fun testClarifyBatch_midBatchFailureRetainsFailedAndUnsentQuestions() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = null,
+                    options = null,
+                    clarifyId = "clarify-batch",
+                    sessionId = sessionId,
+                    questions =
+                        listOf(
+                            WsEvent.ClarifyQuestion("q0", "First?"),
+                            WsEvent.ClarifyQuestion("q1", "Second?"),
+                            WsEvent.ClarifyQuestion("q2", "Third?"),
+                        ),
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 9,
+                ),
+            )
+            advanceUntilIdle()
+            val expected = viewModel.uiState.value.clarifyRequest!!
+            var sendCount = 0
+            every { HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any()) } answers {
+                sendCount++
+                sendCount != 2
+            }
+
+            viewModel.respondToClarifyBatch(
+                expected,
+                mapOf("q0" to "first answer", "q1" to "second answer", "q2" to "third answer"),
+            )
+            advanceUntilIdle()
+
+            assertEquals(listOf("q1", "q2"), viewModel.uiState.value.clarifyRequest?.questions?.map { it.qid })
+            assertEquals(2, sendCount)
+            verify(exactly = 1) {
+                HermesWsClient.respondToClarify(
+                    sessionId,
+                    "clarify-batch",
+                    "q0",
+                    "first answer",
+                    "profile-a",
+                    9,
+                )
+            }
+        }
+
+    @Test
+    fun testClarifyBatch_allSuccessfulSendsCompletePrompt() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = null,
+                    options = null,
+                    clarifyId = "clarify-success",
+                    sessionId = sessionId,
+                    questions =
+                        listOf(
+                            WsEvent.ClarifyQuestion("q0", "First?"),
+                            WsEvent.ClarifyQuestion("q1", "Second?"),
+                        ),
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 9,
+                ),
+            )
+            advanceUntilIdle()
+            val expected = viewModel.uiState.value.clarifyRequest!!
+
+            viewModel.respondToClarifyBatch(expected, mapOf("q0" to "one", "q1" to "two"))
+            advanceUntilIdle()
+
+            assertNull(viewModel.uiState.value.clarifyRequest)
+            assertEquals("one\ntwo", viewModel.uiState.value.messages.last().content)
+            verify(exactly = 2) {
+                HermesWsClient.respondToClarify(sessionId, "clarify-success", any(), any(), "profile-a", 9)
+            }
+        }
+
+    @Test
+    fun testExpiredClarify_cannotRespondFromCapturedPrompt() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = "Question?",
+                    options = emptyList(),
+                    clarifyId = "clarify-expired",
+                    sessionId = sessionId,
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 10,
+                ),
+            )
+            advanceUntilIdle()
+            val expired = viewModel.uiState.value.clarifyRequest!!
+            mockEventsFlow.emit(
+                WsEvent.ClarifyExpire("clarify-expired", sessionId, "profile-a", 10),
+            )
+            advanceUntilIdle()
+
+            viewModel.respondToClarifyBatch(expired, mapOf("q0" to "too late"))
+            advanceUntilIdle()
+
+            verify(exactly = 0) {
+                HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any())
             }
         }
 
@@ -1524,9 +2142,12 @@ class ChatViewModelTest {
 
             mockEventsFlow.emit(
                 WsEvent.ClarifyRequest(
-                    "Please choose:",
-                    listOf("Yes", "No"),
-                    "clarify-789",
+                    text = "Please choose:",
+                    options = listOf("Yes", "No"),
+                    clarifyId = "clarify-789",
+                    sessionId = sessionId,
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 11,
                 ),
             )
             advanceUntilIdle()
@@ -1550,19 +2171,56 @@ class ChatViewModelTest {
             assertTrue(messages[1].content.contains("dismissed", ignoreCase = true))
 
             verify {
-                HermesWsClient.send(
-                    WsMethods.CLARIFY_RESPOND,
-                    params =
-                        mapOf(
-                            "session_id" to sessionId,
-                            "response" to "The user cancelled — no answer provided.",
-                            "answer" to "The user cancelled — no answer provided.",
-                            "clarify_id" to "clarify-789",
-                            "request_id" to "clarify-789",
-                        ),
-                    onSent = any(),
+                HermesWsClient.respondToClarify(
+                    sessionId = sessionId,
+                    clarifyRequestId = "clarify-789",
+                    questionId = null,
+                    answer = "The user cancelled — no answer provided.",
+                    sourceProfileId = "profile-a",
+                    sourceConnectionGeneration = 11,
                 )
             }
+        }
+
+    @Test
+    fun testClarifyDismiss_midBatchFailureRetainsUnresolvedWithoutCompletionNote() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(
+                WsEvent.ClarifyRequest(
+                    text = null,
+                    options = null,
+                    clarifyId = "clarify-dismiss-batch",
+                    sessionId = sessionId,
+                    questions =
+                        listOf(
+                            WsEvent.ClarifyQuestion("q0", "First?"),
+                            WsEvent.ClarifyQuestion("q1", "Second?"),
+                            WsEvent.ClarifyQuestion("q2", "Third?"),
+                        ),
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 12,
+                ),
+            )
+            advanceUntilIdle()
+            val messageCount = viewModel.uiState.value.messages.size
+            var sendCount = 0
+            every { HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any()) } answers {
+                sendCount++
+                sendCount != 2
+            }
+
+            viewModel.dismissClarify()
+            advanceUntilIdle()
+
+            assertEquals(listOf("q1", "q2"), viewModel.uiState.value.clarifyRequest?.questions?.map { it.qid })
+            assertEquals(2, sendCount)
+            assertEquals(messageCount, viewModel.uiState.value.messages.size)
+            assertTrue(
+                viewModel.uiState.value.messages.none {
+                    it.content.contains("dismissed", ignoreCase = true)
+                },
+            )
         }
 
     // ── Attachments ──────────────────────────────────────────────────────────
@@ -1857,6 +2515,294 @@ class ChatViewModelTest {
             assertNotNull(viewModel.uiState.value.errorMessage)
         }
 
+    @Test
+    fun testLoadOlderMessages_missingBindingNeverClaimsLoading() =
+        runTest {
+            val viewModel = createPaginatedViewModel()
+            var olderCalls = 0
+            coEvery { mockApi.getSessionMessages("paged", 150, 150, true, "latest") } answers {
+                olderCalls++
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(messages = emptyList()),
+                )
+            }
+            every { HermesWsClient.connectionBinding("profile-a") } returns null
+
+            viewModel.loadOlderMessages()
+            advanceUntilIdle()
+
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+            assertEquals(0, olderCalls)
+        }
+
+    @Test
+    fun testLoadOlderMessages_persistenceRejectionReleasesLoadingOwner() =
+        runTest {
+            var rejectWrites = false
+            lateinit var rejectingRepo: FakeChatPersistenceRepository
+            rejectingRepo =
+                FakeChatPersistenceRepository(
+                    operationRegistrationHook = { sessionId ->
+                        if (rejectWrites) rejectingRepo.invalidateReplacementWrites(sessionId)
+                    },
+                )
+            fakeRepo = rejectingRepo
+            val viewModel = createPaginatedViewModel()
+            coEvery { mockApi.getSessionMessages("paged", 150, 150, true, "latest") } returns
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 50,
+                                    role = "assistant",
+                                    content = "rejected older",
+                                ),
+                            ),
+                    ),
+                )
+            rejectWrites = true
+
+            viewModel.loadOlderMessages()
+            advanceUntilIdle()
+
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "rejected older" })
+            assertFalse(fakeRepo.loadMessages("paged").any { it.content == "rejected older" })
+        }
+
+    @Test
+    fun testLoadOlderMessages_successAndFailureReleaseLoadingOwner() =
+        runTest {
+            val viewModel = createPaginatedViewModel()
+            coEvery { mockApi.getSessionMessages("paged", 150, 150, true, "latest") } returns
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 50,
+                                    role = "assistant",
+                                    content = "older",
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                limit = 150,
+                                offset = 150,
+                                order = "latest",
+                                returned = 150,
+                                total = 300,
+                            ),
+                    ),
+                )
+            viewModel.loadOlderMessages()
+            advanceUntilIdle()
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+            assertTrue(viewModel.uiState.value.messages.any { it.content == "older" })
+
+            coEvery { mockApi.getSessionMessages("paged", 150, 300, true, "latest") } throws
+                java.io.IOException("network failed")
+            viewModel.loadOlderMessages()
+            advanceUntilIdle()
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+        }
+
+    @Test
+    fun fullRefreshRetiresSuspendedOlderFetchWithoutRoomOrUiPrependAndAllowsNextPage() =
+        runTest {
+            val viewModel = createPaginatedViewModel()
+            val olderFetchStarted = CompletableDeferred<Unit>()
+            val releaseOlderFetch = CompletableDeferred<Unit>()
+            val freshFetchStarted = CompletableDeferred<Unit>()
+            val releaseFreshFetch = CompletableDeferred<Unit>()
+            var olderCalls = 0
+            coEvery { mockApi.getSessionMessages("paged", 150, any(), true, "latest") } coAnswers {
+                val call = ++olderCalls
+                if (call == 1) {
+                    olderFetchStarted.complete(Unit)
+                    withContext(NonCancellable) { releaseOlderFetch.await() }
+                } else {
+                    freshFetchStarted.complete(Unit)
+                    releaseFreshFetch.await()
+                }
+                val content = if (call == 1) "stale older" else "fresh older"
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = call,
+                                    role = "assistant",
+                                    content = content,
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                limit = 150,
+                                offset = 150,
+                                order = "latest",
+                                returned = if (call == 1) 1 else 150,
+                                total = 300,
+                            ),
+                    ),
+                )
+            }
+            coEvery { mockApi.getSessionMessages("paged", 150, 0, true, "latest") } returns
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 200,
+                                    role = "assistant",
+                                    content = "refreshed recent",
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(150, 0, "latest", 150, 300),
+                    ),
+                )
+
+            viewModel.loadOlderMessages()
+            olderFetchStarted.await()
+            viewModel.refreshCurrentSession()
+            runCurrent()
+
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+            assertEquals(listOf("refreshed recent"), viewModel.uiState.value.messages.map { it.content })
+
+            viewModel.loadOlderMessages()
+            freshFetchStarted.await()
+            assertTrue(viewModel.uiState.value.isLoadingOlder)
+            releaseOlderFetch.complete(Unit)
+            runCurrent()
+            assertEquals(listOf("refreshed recent"), viewModel.uiState.value.messages.map { it.content })
+            assertFalse(fakeRepo.loadMessages("paged").any { it.content == "stale older" })
+            assertTrue(viewModel.uiState.value.isLoadingOlder)
+
+            releaseFreshFetch.complete(Unit)
+            advanceUntilIdle()
+            assertTrue(viewModel.uiState.value.messages.any { it.content == "fresh older" })
+            assertTrue(fakeRepo.loadMessages("paged").any { it.content == "fresh older" })
+        }
+
+    @Test
+    fun fullRefreshAtomicallyRejectsOlderPageWaitingInPersistenceFifo() =
+        runTest {
+            val olderPersistenceRegistered = CompletableDeferred<Unit>()
+            val releaseOlderPersistence = CompletableDeferred<Unit>()
+            var suspendNextRegistration = false
+            fakeRepo =
+                FakeChatPersistenceRepository(
+                    operationRegistrationHook = {
+                        if (suspendNextRegistration) {
+                            suspendNextRegistration = false
+                            olderPersistenceRegistered.complete(Unit)
+                            withContext(NonCancellable) { releaseOlderPersistence.await() }
+                        }
+                    },
+                )
+            val viewModel = createPaginatedViewModel()
+            coEvery { mockApi.getSessionMessages("paged", 150, 150, true, "latest") } returns
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 50,
+                                    role = "assistant",
+                                    content = "stale persisted older",
+                                ),
+                            ),
+                    ),
+                )
+            suspendNextRegistration = true
+            viewModel.loadOlderMessages()
+            olderPersistenceRegistered.await()
+
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+            releaseOlderPersistence.complete(Unit)
+            advanceUntilIdle()
+
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale persisted older" })
+            assertFalse(fakeRepo.loadMessages("paged").any { it.content == "stale persisted older" })
+            assertEquals(listOf("recent"), viewModel.uiState.value.messages.map { it.content })
+        }
+
+    @Test
+    fun fullRefreshWaitsForOlderDaoBoundaryBeforeCapturingRevision() =
+        runTest {
+            val olderDaoEntered = CountDownLatch(1)
+            val releaseOlderDao = CountDownLatch(1)
+            val refreshDaoPersisted = CountDownLatch(1)
+            val dao =
+                object : FakeChatMessageDao() {
+                    override fun upsertAll(messageList: List<ChatMessageEntity>) {
+                        if (messageList.any { it.content == "stale inside dao" }) {
+                            olderDaoEntered.countDown()
+                            check(releaseOlderDao.await(5, TimeUnit.SECONDS))
+                        }
+                        super.upsertAll(messageList)
+                        if (messageList.any { it.content == "atomic refresh" }) refreshDaoPersisted.countDown()
+                    }
+                }
+            fakeRepo = FakeChatPersistenceRepository(dao)
+            val viewModel = createPaginatedViewModel()
+            var refreshFetches = 0
+            coEvery { mockApi.getSessionMessages("paged", 150, 0, true, "latest") } answers {
+                refreshFetches++
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 200,
+                                    role = "assistant",
+                                    content = "atomic refresh",
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(150, 0, "latest", 150, 300),
+                    ),
+                )
+            }
+            val staleRevision = fakeRepo.replacementGeneration("paged")
+            val executor = Executors.newSingleThreadExecutor()
+            try {
+                val olderWrite =
+                    executor.submit<Boolean> {
+                        kotlinx.coroutines.runBlocking {
+                            fakeRepo.persistMessagesIfCurrent(
+                                listOf(ChatMessage(role = MessageRole.ASSISTANT, content = "stale inside dao")),
+                                "paged",
+                                staleRevision,
+                            )
+                        }
+                    }
+                assertTrue(olderDaoEntered.await(5, TimeUnit.SECONDS))
+                viewModel.refreshCurrentSession()
+                runCurrent()
+
+                assertEquals(0, refreshFetches)
+                assertTrue(viewModel.uiState.value.isLoading)
+                releaseOlderDao.countDown()
+                assertTrue(olderWrite.get(5, TimeUnit.SECONDS))
+                runCurrent()
+                assertTrue(refreshDaoPersisted.await(5, TimeUnit.SECONDS))
+                runCurrent()
+
+                assertEquals(1, refreshFetches)
+                assertEquals(listOf("atomic refresh"), viewModel.uiState.value.messages.map { it.content })
+                assertTrue(fakeRepo.loadMessages("paged").any { it.content == "atomic refresh" })
+            } finally {
+                releaseOlderDao.countDown()
+                executor.shutdownNow()
+            }
+        }
+
     // ── Session switch ───────────────────────────────────────────────────────
 
     @Test
@@ -2023,6 +2969,95 @@ class ChatViewModelTest {
         }
 
     @Test
+    fun testSessionResumeResultAfterUndo_isFullyIgnored() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val resumeId = "resume-before-undo"
+            every { HermesWsClient.send(WsMethods.SESSION_RESUME, any(), any()) } answers {
+                arg<((String) -> Unit)?>(2)?.invoke(resumeId)
+                resumeId
+            }
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+
+            viewModel.switchSession(sessionId)
+            advanceUntilIdle()
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            undoResult.complete(mapOf("type" to "prefill", "message" to "kept", "notice" to "rewound"))
+            advanceUntilIdle()
+            val before = viewModel.uiState.value
+            val persistedBefore = fakeRepo.loadMessages(sessionId)
+
+            mockEventsFlow.emit(
+                WsEvent.RpcResult(
+                    resumeId,
+                    mapOf(
+                        "session_id" to "stale-runtime",
+                        "resumed" to "stale-storage",
+                        "messages" to listOf(mapOf("role" to "assistant", "text" to "stale resume")),
+                    ),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertEquals(before, viewModel.uiState.value)
+            assertEquals(persistedBefore, fakeRepo.loadMessages(sessionId))
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale resume" })
+        }
+
+    @Test
+    fun testStaleSessionResumeError_isFullyIgnored() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val sessionId = "storage-root"
+            val resumeId = "resume-before-reconnect"
+            every { HermesWsClient.send(WsMethods.SESSION_RESUME, any(), any()) } answers {
+                arg<((String) -> Unit)?>(2)?.invoke(resumeId)
+                resumeId
+            }
+            viewModel.switchSession(sessionId)
+            advanceUntilIdle()
+            mockConnectionStatus.value = ConnectionStatus.RECONNECTING
+            advanceUntilIdle()
+            val before = viewModel.uiState.value
+            val persistedBefore = fakeRepo.loadMessages(sessionId)
+
+            mockEventsFlow.emit(WsEvent.RpcError(resumeId, JsonRpcError(5000, "stale resume error")))
+            advanceUntilIdle()
+
+            assertEquals(before, viewModel.uiState.value)
+            assertEquals(persistedBefore, fakeRepo.loadMessages(sessionId))
+            assertFalse(viewModel.uiState.value.messages.any { it.content.contains("stale resume error") })
+        }
+
+    @Test
+    fun testValidSessionResumeTransitionsRuntimeIdentityOnce() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val resumeId = "valid-resume"
+            every { HermesWsClient.send(WsMethods.SESSION_RESUME, any(), any()) } answers {
+                arg<((String) -> Unit)?>(2)?.invoke(resumeId)
+                resumeId
+            }
+            viewModel.switchSession("storage-root")
+            advanceUntilIdle()
+            val result = mapOf("session_id" to "runtime-tip", "resumed" to "storage-tip")
+
+            mockEventsFlow.emit(WsEvent.RpcResult(resumeId, result))
+            advanceUntilIdle()
+            assertEquals("storage-tip", viewModel.uiState.value.currentSessionId)
+            assertEquals("runtime-tip", ActiveSessionHolder.activeSessionId.value)
+            assertEquals(1, viewModel.uiState.value.messages.count { it.content == "Session resumed" })
+
+            mockEventsFlow.emit(WsEvent.RpcResult(resumeId, result))
+            advanceUntilIdle()
+            assertEquals(1, viewModel.uiState.value.messages.count { it.content == "Session resumed" })
+        }
+
+    @Test
     fun testResumePayload_doesNotBreakRestPagination() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
@@ -2122,6 +3157,367 @@ class ChatViewModelTest {
                     .first { it.content == "REST answer" }
                     .reasoningText,
             )
+        }
+
+    @Test
+    fun concurrentFullRefresh_newestOwnerWinsAllHistoryState() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val releaseOlder = CompletableDeferred<Unit>()
+            var initialCalls = 0
+            val requests = mutableListOf<Pair<Int, String?>>()
+            coEvery { mockApi.getSessionMessages(sessionId, any(), any(), true, any()) } coAnswers {
+                val offset = arg<Int>(2)
+                val order = arg<String?>(4)
+                requests += offset to order
+                initialCalls++
+                val response =
+                    when (initialCalls) {
+                        1 -> {
+                            withContext(NonCancellable) { releaseOlder.await() }
+                            retrofit2.Response.success(
+                                com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                                    messages =
+                                        listOf(
+                                            com.m57.hermescontrol.data.model.SessionMessage(
+                                                role = "assistant",
+                                                content = "stale",
+                                            ),
+                                        ),
+                                    pagination =
+                                        com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                            150,
+                                            250,
+                                            null,
+                                            1,
+                                            400,
+                                        ),
+                                ),
+                            )
+                        }
+                        2 ->
+                            retrofit2.Response.success(
+                                com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                                    messages =
+                                        listOf(
+                                            com.m57.hermescontrol.data.model.SessionMessage(
+                                                id = 9,
+                                                role = "assistant",
+                                                content = "newest",
+                                            ),
+                                        ),
+                                    pagination =
+                                        com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                            150,
+                                            0,
+                                            "latest",
+                                            150,
+                                            400,
+                                        ),
+                                ),
+                            )
+                        else ->
+                            retrofit2.Response.success(
+                                com.m57.hermescontrol.data.model.SessionMessagesResponse(messages = emptyList()),
+                            )
+                    }
+                response
+            }
+
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            assertEquals("newest", viewModel.uiState.value.messages.last().content)
+            assertFalse(viewModel.uiState.value.isLoading)
+            assertNull(viewModel.uiState.value.errorMessage)
+
+            releaseOlder.complete(Unit)
+            advanceUntilIdle()
+            viewModel.loadOlderMessages()
+            advanceUntilIdle()
+
+            assertEquals("newest", viewModel.uiState.value.messages.last().content)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale" })
+            assertFalse(fakeRepo.loadMessages(sessionId).any { it.content == "stale" })
+            assertTrue(requests.contains(150 to "latest"))
+            assertFalse(viewModel.uiState.value.isLoading)
+            assertNull(viewModel.uiState.value.errorMessage)
+        }
+
+    @Test
+    fun concurrentFullRefresh_staleFailureCannotMutateNewestOwner() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val releaseFailure = CompletableDeferred<Unit>()
+            var calls = 0
+            coEvery { mockApi.getSessionMessages(sessionId, 150, 0, true, "latest") } coAnswers {
+                calls++
+                if (calls == 1) {
+                    withContext(NonCancellable) { releaseFailure.await() }
+                    retrofit2.Response.error(500, okhttp3.ResponseBody.create(null, "stale failure"))
+                } else {
+                    retrofit2.Response.success(
+                        com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                            messages =
+                                listOf(
+                                    com.m57.hermescontrol.data.model.SessionMessage(
+                                        id = 2,
+                                        role = "assistant",
+                                        content = "current",
+                                    ),
+                                ),
+                            pagination =
+                                com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                    150,
+                                    0,
+                                    "latest",
+                                    1,
+                                    1,
+                                ),
+                        ),
+                    )
+                }
+            }
+
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            releaseFailure.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals("current", viewModel.uiState.value.messages.last().content)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale failure" })
+            assertFalse(fakeRepo.loadMessages(sessionId).any { it.content == "stale failure" })
+            assertFalse(viewModel.uiState.value.isLoading)
+            assertNull(viewModel.uiState.value.errorMessage)
+        }
+
+    @Test
+    fun fullRefreshRetiresSyncAndStaleCleanupCannotReleaseNewSyncOwner() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val releaseStaleSync = CompletableDeferred<Unit>()
+            val releaseRefresh = CompletableDeferred<Unit>()
+            val releaseNewSync = CompletableDeferred<Unit>()
+            var calls = 0
+            coEvery { mockApi.getSessionMessages(sessionId, 150, any(), true, any()) } coAnswers {
+                calls++
+                val content =
+                    when (calls) {
+                        1 -> {
+                            withContext(NonCancellable) { releaseStaleSync.await() }
+                            "stale sync"
+                        }
+                        2 -> {
+                            releaseRefresh.await()
+                            "full refresh"
+                        }
+                        3 -> {
+                            releaseNewSync.await()
+                            "new sync"
+                        }
+                        else -> "post-refresh sync"
+                    }
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = calls,
+                                    role = "assistant",
+                                    content = content,
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                150,
+                                0,
+                                "latest",
+                                1,
+                                1,
+                            ),
+                    ),
+                )
+            }
+
+            viewModel.syncCurrentSession()
+            runCurrent()
+            viewModel.refreshCurrentSession()
+            runCurrent()
+
+            // isLoading fences incremental sync while the replacement is active.
+            viewModel.syncCurrentSession()
+            runCurrent()
+            assertEquals(2, calls)
+
+            releaseRefresh.complete(Unit)
+            runCurrent()
+            assertEquals(listOf("full refresh"), viewModel.uiState.value.messages.map { it.content })
+
+            viewModel.syncCurrentSession()
+            runCurrent()
+            assertEquals(3, calls)
+            releaseStaleSync.complete(Unit)
+            runCurrent()
+
+            // The retired sync's finally block must not clear the newer owner.
+            viewModel.syncCurrentSession()
+            runCurrent()
+            assertEquals(3, calls)
+            assertFalse(fakeRepo.loadMessages(sessionId).any { it.content == "stale sync" })
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale sync" })
+
+            releaseNewSync.complete(Unit)
+            advanceUntilIdle()
+            viewModel.syncCurrentSession()
+            advanceUntilIdle()
+
+            assertEquals(4, calls)
+            assertTrue(viewModel.uiState.value.messages.any { it.content == "post-refresh sync" })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "post-refresh sync" })
+        }
+
+    @Test
+    fun cachedHistorySurvivesViewModelRecreationWhenRefreshIsOffline() =
+        runTest {
+            fakeRepo.dao.addMessageDirect(cachedEntity("offline-session", "cached history"))
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), true, any()) } throws
+                java.io.IOException("offline")
+
+            val recreated = createViewModel()
+            recreated.switchSession("offline-session")
+            advanceUntilIdle()
+
+            assertEquals(listOf("cached history"), recreated.uiState.value.messages.map { it.content })
+            assertFalse(recreated.uiState.value.isLoading)
+            assertTrue(recreated.uiState.value.errorMessage?.contains("Failed to load messages") == true)
+        }
+
+    @Test
+    fun lateCacheCannotReplaceSuccessfulRefresh() =
+        runTest {
+            val releaseCache = CompletableDeferred<Unit>()
+            val delayedRepo =
+                object : FakeChatPersistenceRepository() {
+                    override suspend fun loadMessages(sessionId: String): List<ChatMessage> {
+                        withContext(NonCancellable) { releaseCache.await() }
+                        return listOf(ChatMessage(id = "cached", role = MessageRole.ASSISTANT, content = "stale cache"))
+                    }
+                }
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), true, any()) } returns serverMessages("server")
+            val viewModel = ChatViewModel(app, false, delayedRepo, fakeSlashUsageStore, testDispatcher)
+
+            viewModel.switchSession("session-a")
+            runCurrent()
+            assertEquals(listOf("server"), viewModel.uiState.value.messages.map { it.content })
+            releaseCache.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals(listOf("server"), viewModel.uiState.value.messages.map { it.content })
+        }
+
+    @Test
+    fun lateCacheFromOldSessionAndProfileIsRejected() =
+        runTest {
+            val releaseCache = CompletableDeferred<Unit>()
+            val selectedProfile = MutableStateFlow("profile-a")
+            val delayedRepo =
+                object : FakeChatPersistenceRepository() {
+                    override suspend fun loadMessages(sessionId: String): List<ChatMessage> {
+                        if (sessionId != "session-a") return emptyList()
+                        withContext(NonCancellable) { releaseCache.await() }
+                        return listOf(
+                            ChatMessage(
+                                id = sessionId,
+                                role = MessageRole.ASSISTANT,
+                                content = "stale-$sessionId",
+                            ),
+                        )
+                    }
+                }
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), true, any()) } throws
+                java.io.IOException("offline")
+            val viewModel =
+                ChatViewModel(
+                    app,
+                    false,
+                    delayedRepo,
+                    fakeSlashUsageStore,
+                    testDispatcher,
+                    selectedProfileId = { selectedProfile.value },
+                    selectedProfileIds = selectedProfile,
+                )
+
+            viewModel.switchSession("session-a")
+            runCurrent()
+            viewModel.switchSession("session-b")
+            selectedProfile.value = "profile-b"
+            releaseCache.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals("session-b", viewModel.uiState.value.currentSessionId)
+            assertFalse(viewModel.uiState.value.messages.any { it.content.startsWith("stale-") })
+        }
+
+    @Test
+    fun successfulRefreshSupersedesCacheWithoutLosingNewerLiveMessage() =
+        runTest {
+            val releaseRefresh = CompletableDeferred<Unit>()
+            fakeRepo.dao.addMessageDirect(cachedEntity("session-a", "cached history"))
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), true, any()) } coAnswers {
+                releaseRefresh.await()
+                serverMessages("server").body()!!
+                    .let { retrofit2.Response.success(it) }
+            }
+            val viewModel = createViewModel()
+
+            viewModel.switchSession("session-a")
+            runCurrent()
+            assertEquals(listOf("cached history"), viewModel.uiState.value.messages.map { it.content })
+            mockEventsFlow.emit(WsEvent.MessageComplete("live", sessionId = "session-a"))
+            runCurrent()
+            releaseRefresh.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals(listOf("server", "live"), viewModel.uiState.value.messages.map { it.content })
+        }
+
+    @Test
+    fun staleMessageCountResponseCannotMutateSessionsOrDriveHistoryRequest() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val releaseCount = CompletableDeferred<Unit>()
+            val requests = mutableListOf<Pair<String, Int>>()
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), true, "latest") } answers {
+                requests += arg<String>(0) to arg<Int>(2)
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(messages = emptyList()),
+                )
+            }
+            coEvery { mockApi.getSessions(any(), any(), any()) } coAnswers {
+                withContext(NonCancellable) { releaseCount.await() }
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionListResponse(
+                        sessions =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionInfo(id = sessionId, message_count = 400),
+                            ),
+                    ),
+                )
+            }
+
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            viewModel.switchSession("replacement")
+            runCurrent()
+            releaseCount.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals("replacement", viewModel.uiState.value.currentSessionId)
+            assertFalse(viewModel.uiState.value.sessions.any { it.id == sessionId && it.messageCount == 400 })
+            assertFalse(requests.contains(sessionId to 250))
         }
 
     @Test
@@ -2405,80 +3801,365 @@ class ChatViewModelTest {
             )
         }
 
+    // ── Privileged request binding (hermes-agent d90045be2 / a77692158) ──────
+    //
+    // Every privileged frame is answered on the exact request, runtime session,
+    // profile, and socket generation that dispatched it. Anything else is
+    // dropped rather than surfaced with controls that would resolve some other
+    // request.
+
+    private data class PrivilegedCall(
+        val method: String,
+        val binding: PrivilegedRequestBinding,
+        val params: Map<String, String>,
+    )
+
+    /** Route [HermesWsClient.privilegedRequest] into a recording list. */
+    private fun capturePrivileged(
+        result: CompletableDeferred<Any?> = CompletableDeferred<Any?>(mapOf("status" to "ok")),
+    ): MutableList<PrivilegedCall> {
+        val calls = mutableListOf<PrivilegedCall>()
+        every { HermesWsClient.privilegedRequest(any(), any(), any()) } answers {
+            calls += PrivilegedCall(arg(0), arg(1), arg(2))
+            result
+        }
+        return calls
+    }
+
+    private fun approvalRequest(
+        requestId: String = "approval-1",
+        sessionId: String? = "session-123",
+        profileId: String? = "profile-a",
+        generation: Int? = 7,
+        timeoutSeconds: Double = 300.0,
+    ) = WsEvent.ApprovalRequest(
+        command = "rm -rf /data",
+        description = "The agent wants to execute: rm -rf /data",
+        patternKeys = listOf("shell:rm"),
+        sessionId = sessionId,
+        requestId = requestId,
+        timeoutSeconds = timeoutSeconds,
+        sourceProfileId = profileId,
+        connectionGeneration = generation,
+    )
+
+    private fun sudoRequest(
+        requestId: String = "sudo-1",
+        sessionId: String? = "session-123",
+        profileId: String? = "profile-a",
+        generation: Int? = 7,
+    ) = WsEvent.SudoRequest(
+        requestId = requestId,
+        sessionId = sessionId,
+        sourceProfileId = profileId,
+        connectionGeneration = generation,
+    )
+
+    private fun secretRequest(
+        requestId: String = "secret-1",
+        sessionId: String? = "session-123",
+        profileId: String? = "profile-a",
+        generation: Int? = 7,
+    ) = WsEvent.SecretRequest(
+        requestId = requestId,
+        sessionId = sessionId,
+        envVar = "GITHUB_TOKEN",
+        prompt = "Token for github.com",
+        sourceProfileId = profileId,
+        connectionGeneration = generation,
+    )
+
+    private fun ChatViewModel.approvalMessage(): ChatMessage? =
+        uiState.value.messages.lastOrNull { it.approvalInfo != null }
+
+    private fun ChatViewModel.respondToApproval(action: String) {
+        val message = requireNotNull(approvalMessage())
+        respondToApproval(message.id, requireNotNull(message.approvalInfo).privilegedBinding, action)
+    }
+
+    private fun ChatViewModel.cancelApproval() {
+        val message = requireNotNull(approvalMessage())
+        cancelApproval(message.id, requireNotNull(message.approvalInfo).privilegedBinding)
+    }
+
     // ── Approval flow ────────────────────────────────────────────────────────
 
     @Test
-    fun testApprovalRequest_addsSystemMessage() =
+    fun approvalRequest_bindsToDispatchingProfileSessionAndGeneration() =
         runTest {
-            val viewModel = createViewModel()
-            advanceUntilIdle()
+            val (viewModel, sessionId) = createViewModelWithSession()
 
-            mockEventsFlow.emit(
-                WsEvent.ApprovalRequest(
-                    command = "rm -rf /data",
-                    description = "The agent wants to execute: rm -rf /data",
-                    patternKeys = listOf("shell:rm"),
-                    sessionId = null,
-                ),
-            )
-            advanceUntilIdle()
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
 
-            val msg =
-                viewModel.uiState.value.messages
-                    .first { it.content.contains("Approval Required") }
-            assertNotNull(msg.approvalInfo)
+            val msg = viewModel.approvalMessage()
+            assertNotNull(msg)
+            assertTrue(msg!!.content.contains("Approval Required"))
             assertEquals("rm -rf /data", msg.approvalInfo?.command)
+            assertEquals(
+                PrivilegedRequestBinding(
+                    requestId = "approval-1",
+                    runtimeSessionId = sessionId,
+                    profileId = "profile-a",
+                    connectionGeneration = 7,
+                ),
+                msg.approvalInfo?.privilegedBinding,
+            )
         }
 
     @Test
-    fun testRespondToApproval_sendsRpc() =
+    fun approvalRequest_fromAnotherProfileIsDropped() =
         runTest {
-            val (viewModel, sessionId) = createViewModelWithSession()
+            val (viewModel, _) = createViewModelWithSession()
 
-            mockEventsFlow.emit(
-                WsEvent.ApprovalRequest(
-                    command = "rm",
-                    description = "Dangerous command",
-                    patternKeys = null,
-                    sessionId = null,
-                ),
-            )
-            advanceUntilIdle()
+            mockEventsFlow.emit(approvalRequest(profileId = "profile-b"))
+            runCurrent()
 
-            viewModel.respondToApproval("approve")
-            advanceUntilIdle()
-
-            verify { HermesWsClient.send(WsMethods.APPROVAL_RESPOND, any(), any()) }
+            assertNull(viewModel.approvalMessage())
         }
 
     @Test
-    fun testRespondToApproval_clearsButtons() =
+    fun approvalRequest_withoutSocketGenerationIsDropped() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            mockEventsFlow.emit(approvalRequest(generation = null))
+            runCurrent()
+
+            assertNull(viewModel.approvalMessage())
+        }
+
+    @Test
+    fun approvalRequest_forAnotherRuntimeSessionIsDropped() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            mockEventsFlow.emit(approvalRequest(sessionId = "session-other"))
+            runCurrent()
+
+            assertNull(viewModel.approvalMessage())
+        }
+
+    @Test
+    fun respondToApproval_approveSendsOnceOnTheBoundRequest() =
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
+            val calls = capturePrivileged()
 
-            mockEventsFlow.emit(
-                WsEvent.ApprovalRequest(
-                    command = "rm",
-                    description = "Dangerous",
-                    patternKeys = null,
-                    sessionId = null,
-                ),
-            )
-            advanceUntilIdle()
-
-            val approvalMsg =
-                viewModel.uiState.value.messages
-                    .firstOrNull { it.approvalInfo != null }
-            assertNotNull(approvalMsg)
-
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
             viewModel.respondToApproval("approve")
-            advanceUntilIdle()
+            runCurrent()
 
-            val msgAfter =
-                viewModel.uiState.value.messages
-                    .firstOrNull { it.id == approvalMsg!!.id }
-            assertNotNull(msgAfter)
-            assertNull(msgAfter!!.approvalInfo)
+            assertEquals(1, calls.size)
+            assertEquals(WsMethods.APPROVAL_RESPOND, calls[0].method)
+            assertEquals(mapOf("choice" to "once"), calls[0].params)
+            assertEquals("approval-1", calls[0].binding.requestId)
+            assertEquals(sessionId, calls[0].binding.runtimeSessionId)
+            assertEquals("profile-a", calls[0].binding.profileId)
+            assertEquals(7, calls[0].binding.connectionGeneration)
+        }
+
+    @Test
+    fun respondToApproval_denySendsDeny() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
+            viewModel.respondToApproval("deny")
+            runCurrent()
+
+            assertEquals(listOf(mapOf("choice" to "deny")), calls.map { it.params })
+        }
+
+    /** A phone cannot show what a standing allow would later authorize. */
+    @Test
+    fun respondToApproval_refusesSessionAndAlwaysChoices() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
+            viewModel.respondToApproval("session")
+            viewModel.respondToApproval("always")
+            viewModel.respondToApproval("once")
+            runCurrent()
+
+            assertTrue("no standing allow may reach the gateway", calls.isEmpty())
+            assertNotNull("controls stay live", viewModel.approvalMessage())
+        }
+
+    @Test
+    fun respondToApproval_clearsControlsOnlyAfterTheGatewayAck() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            capturePrivileged(ack)
+
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
+            viewModel.respondToApproval("approve")
+            runCurrent()
+
+            assertNotNull("controls survive an unacknowledged send", viewModel.approvalMessage())
+
+            ack.complete(mapOf("status" to "ok"))
+            runCurrent()
+
+            assertNull(viewModel.approvalMessage())
+        }
+
+    @Test
+    fun respondToApproval_keepsControlsLiveWhenTheSendFails() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val rejected = CompletableDeferred<Any?>()
+            rejected.completeExceptionally(IllegalStateException("no longer active"))
+            capturePrivileged(rejected)
+
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
+            viewModel.respondToApproval("approve")
+            runCurrent()
+
+            assertNotNull(
+                "an unsent approval must remain answerable",
+                viewModel.approvalMessage(),
+            )
+            assertEquals("no longer active", viewModel.uiState.value.errorMessage)
+        }
+
+    @Test
+    fun cancelApproval_sendsTypedCancelNotAChoice() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
+            viewModel.cancelApproval()
+            runCurrent()
+
+            assertEquals(1, calls.size)
+            assertEquals(WsMethods.APPROVAL_CANCEL, calls[0].method)
+            assertTrue("cancel carries no choice", calls[0].params.isEmpty())
+            assertEquals("approval-1", calls[0].binding.requestId)
+            assertNull(viewModel.approvalMessage())
+        }
+
+    @Test
+    fun approvalControls_retireAtTheGatewayPublishedTimeout() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            mockEventsFlow.emit(approvalRequest(timeoutSeconds = 30.0))
+            runCurrent()
+            assertNotNull(viewModel.approvalMessage())
+
+            advanceTimeBy(29_000)
+            runCurrent()
+            assertNotNull("controls live until the server's own deadline", viewModel.approvalMessage())
+
+            advanceTimeBy(2_000)
+            runCurrent()
+            assertNull("controls retire once the request is gone", viewModel.approvalMessage())
+        }
+
+    @Test
+    fun approvalExpiry_neverRetiresALaterRequestsControls() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-1", timeoutSeconds = 10.0))
+            runCurrent()
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-2", timeoutSeconds = 600.0))
+            runCurrent()
+            assertEquals(2, viewModel.uiState.value.messages.count { it.approvalInfo != null })
+
+            advanceTimeBy(11_000)
+            runCurrent()
+
+            val live = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            assertEquals(1, live.size)
+            assertEquals("approval-2", live[0].approvalInfo?.privilegedBinding?.requestId)
+        }
+
+    @Test
+    fun reusedApprovalId_keepsIndependentCardTimersAndStaleAckCannotCancelTheNewTimer() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            capturePrivileged(ack)
+            mockEventsFlow.emit(approvalRequest(requestId = "reused", timeoutSeconds = 10.0))
+            runCurrent()
+            val old = requireNotNull(viewModel.approvalMessage())
+            viewModel.respondToApproval(old.id, old.approvalInfo!!.privilegedBinding, "approve")
+            runCurrent()
+            mockEventsFlow.emit(approvalRequest(requestId = "reused", timeoutSeconds = 20.0))
+            runCurrent()
+            ack.complete(mapOf("status" to "ok"))
+            runCurrent()
+
+            assertEquals(1, viewModel.uiState.value.messages.count { it.approvalInfo != null })
+            advanceTimeBy(21_000)
+            runCurrent()
+            assertEquals(0, viewModel.uiState.value.messages.count { it.approvalInfo != null })
+        }
+
+    @Test
+    fun olderApprovalCardClickTargetsThatExactRequestAndDisablesOnlyThatCard() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            val calls = capturePrivileged(ack)
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-old"))
+            runCurrent()
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-new"))
+            runCurrent()
+            val cards = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            val older = cards.first()
+            val olderBinding = requireNotNull(older.approvalInfo).privilegedBinding
+
+            viewModel.respondToApproval(older.id, olderBinding, "approve")
+            viewModel.respondToApproval(older.id, olderBinding, "deny")
+            runCurrent()
+
+            assertEquals(listOf("approval-old"), calls.map { it.binding.requestId })
+            val pending = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            assertTrue(requireNotNull(pending.first { it.id == older.id }.approvalInfo).isSubmitting)
+            assertFalse(requireNotNull(pending.first { it.id != older.id }.approvalInfo).isSubmitting)
+
+            ack.complete(mapOf("status" to "ok"))
+            runCurrent()
+            val live = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            assertEquals(listOf("approval-new"), live.map { it.approvalInfo!!.privilegedBinding.requestId })
+        }
+
+    @Test
+    fun failedOlderApprovalRestoresOnlyThatExactCard() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val rejected = CompletableDeferred<Any?>()
+            val calls = capturePrivileged(rejected)
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-old"))
+            runCurrent()
+            mockEventsFlow.emit(approvalRequest(requestId = "approval-new"))
+            runCurrent()
+            val older = viewModel.uiState.value.messages.first { it.approvalInfo != null }
+            val binding = older.approvalInfo!!.privilegedBinding
+
+            viewModel.cancelApproval(older.id, binding)
+            runCurrent()
+            rejected.completeExceptionally(IllegalStateException("not acknowledged"))
+            runCurrent()
+
+            assertEquals(listOf("approval-old"), calls.map { it.binding.requestId })
+            val cards = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            assertFalse(cards.any { it.approvalInfo!!.isSubmitting })
+            assertEquals("not acknowledged", viewModel.uiState.value.errorMessage)
         }
 
     // ── Sudo / secret prompt flow (issue #524) ───────────────────────────
@@ -2486,55 +4167,56 @@ class ChatViewModelTest {
     @Test
     fun testSudoRequest_setsPromptState() =
         runTest {
-            val (viewModel, _) = createViewModelWithSession()
-            advanceUntilIdle()
+            val (viewModel, sessionId) = createViewModelWithSession()
 
-            mockEventsFlow.emit(
-                WsEvent.SudoRequest(requestId = "sudo-1", sessionId = null),
-            )
+            mockEventsFlow.emit(sudoRequest())
             advanceUntilIdle()
 
             val prompt = viewModel.uiState.value.sudoPrompt
             assertNotNull(prompt)
             assertEquals("sudo-1", prompt?.requestId)
+            assertEquals(sessionId, prompt?.binding?.runtimeSessionId)
+            assertEquals("profile-a", prompt?.binding?.profileId)
+            assertEquals(7, prompt?.binding?.connectionGeneration)
+        }
+
+    @Test
+    fun sudoRequest_fromAnotherProfileIsDropped() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            mockEventsFlow.emit(sudoRequest(profileId = "profile-b"))
+            advanceUntilIdle()
+
+            assertNull(viewModel.uiState.value.sudoPrompt)
         }
 
     @Test
     fun testRespondToSudo_sendsRpc() =
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
-            advanceUntilIdle()
+            val calls = capturePrivileged()
 
-            mockEventsFlow.emit(
-                WsEvent.SudoRequest(requestId = "sudo-1", sessionId = null),
-            )
+            mockEventsFlow.emit(sudoRequest())
             advanceUntilIdle()
-
             viewModel.respondToSudo("hunter2")
             advanceUntilIdle()
 
-            verify {
-                HermesWsClient.send(
-                    WsMethods.SUDO_RESPOND,
-                    withArg { params ->
-                        assertEquals(sessionId, params["session_id"])
-                        assertEquals("hunter2", params["password"])
-                        assertEquals("sudo-1", params["request_id"])
-                    },
-                    any(),
-                )
-            }
+            assertEquals(1, calls.size)
+            assertEquals(WsMethods.SUDO_RESPOND, calls[0].method)
+            assertEquals(mapOf("password" to "hunter2"), calls[0].params)
+            assertEquals("sudo-1", calls[0].binding.requestId)
+            assertEquals(sessionId, calls[0].binding.runtimeSessionId)
+            assertEquals(7, calls[0].binding.connectionGeneration)
         }
 
     @Test
     fun testRespondToSudo_clearsPrompt() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
-            advanceUntilIdle()
+            capturePrivileged()
 
-            mockEventsFlow.emit(
-                WsEvent.SudoRequest(requestId = "sudo-1", sessionId = null),
-            )
+            mockEventsFlow.emit(sudoRequest())
             advanceUntilIdle()
             assertNotNull(viewModel.uiState.value.sudoPrompt)
 
@@ -2545,57 +4227,205 @@ class ChatViewModelTest {
         }
 
     @Test
-    fun testSecretRequest_setsPromptState() =
+    fun respondToSudo_keepsPromptUntilTheGatewayAcks() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            capturePrivileged(ack)
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+            viewModel.respondToSudo("hunter2")
             advanceUntilIdle()
 
-            mockEventsFlow.emit(
-                WsEvent.SecretRequest(requestId = "secret-1", sessionId = null),
+            assertNotNull("prompt survives an unacknowledged send", viewModel.uiState.value.sudoPrompt)
+
+            ack.complete(mapOf("status" to "ok"))
+            advanceUntilIdle()
+
+            assertNull(viewModel.uiState.value.sudoPrompt)
+        }
+
+    @Test
+    fun sudoSubmission_doubleSendAndCancelDispatchExactlyOnce() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            val calls = capturePrivileged(ack)
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+
+            viewModel.respondToSudo("hunter2")
+            viewModel.respondToSudo("hunter2")
+            viewModel.cancelSudo()
+            runCurrent()
+
+            assertEquals(listOf(WsMethods.SUDO_RESPOND), calls.map { it.method })
+            assertTrue(viewModel.uiState.value.sudoPrompt!!.isSubmitting)
+        }
+
+    /** A gateway error string could echo the submitted value; `errorMessage` is durable UI state. */
+    @Test
+    fun respondToSudo_failureNeverSurfacesTheGatewayString() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val rejected = CompletableDeferred<Any?>()
+            rejected.completeExceptionally(IllegalStateException("rejected value hunter2"))
+            capturePrivileged(rejected)
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+            viewModel.respondToSudo("hunter2")
+            advanceUntilIdle()
+
+            assertEquals(PRIVILEGED_FAILURE_TEXT, viewModel.uiState.value.errorMessage)
+            assertFalse(
+                viewModel.uiState.value.errorMessage
+                    .orEmpty()
+                    .contains("hunter2"),
             )
+            assertNotNull(viewModel.uiState.value.sudoPrompt)
+            assertFalse(viewModel.uiState.value.sudoPrompt!!.isSubmitting)
+        }
+
+    @Test
+    fun respondToSudo_ignoresABlankPassword() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+            viewModel.respondToSudo("   ")
+            advanceUntilIdle()
+
+            assertTrue(calls.isEmpty())
+            assertNotNull(viewModel.uiState.value.sudoPrompt)
+        }
+
+    @Test
+    fun cancelSudo_sendsTypedCancel() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+            viewModel.cancelSudo()
+            advanceUntilIdle()
+
+            assertEquals(listOf(WsMethods.SUDO_CANCEL), calls.map { it.method })
+            assertTrue(calls[0].params.isEmpty())
+            assertEquals("sudo-1", calls[0].binding.requestId)
+            assertNull(viewModel.uiState.value.sudoPrompt)
+        }
+
+    /** A back gesture is neither an answer nor a cancellation. */
+    @Test
+    fun dismissSudo_isANoOp() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+            viewModel.dismissSudo()
+            advanceUntilIdle()
+
+            assertTrue(calls.isEmpty())
+            assertNotNull(viewModel.uiState.value.sudoPrompt)
+        }
+
+    @Test
+    fun sudoExpire_clearsOnlyTheExactBoundRequest() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+
+            mockEventsFlow.emit(sudoRequest())
+            advanceUntilIdle()
+
+            val mismatches =
+                listOf(
+                    WsEvent.SudoExpire("sudo-1", null, "profile-a", 7),
+                    WsEvent.SudoExpire("sudo-1", "   ", "profile-a", 7),
+                    WsEvent.SudoExpire("sudo-2", sessionId, "profile-a", 7),
+                    WsEvent.SudoExpire("sudo-1", sessionId, "profile-b", 7),
+                    WsEvent.SudoExpire("sudo-1", sessionId, "profile-a", 8),
+                    WsEvent.SudoExpire("sudo-1", "session-other", "profile-a", 7),
+                )
+            mismatches.forEach {
+                mockEventsFlow.emit(it)
+                advanceUntilIdle()
+                assertNotNull(
+                    "a non-matching expiry must not clear the prompt: $it",
+                    viewModel.uiState.value.sudoPrompt,
+                )
+            }
+
+            mockEventsFlow.emit(WsEvent.SudoExpire("sudo-1", sessionId, "profile-a", 7))
+            advanceUntilIdle()
+
+            assertNull(viewModel.uiState.value.sudoPrompt)
+        }
+
+    @Test
+    fun testSecretRequest_setsPromptState() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+
+            mockEventsFlow.emit(secretRequest())
             advanceUntilIdle()
 
             val prompt = viewModel.uiState.value.secretPrompt
             assertNotNull(prompt)
             assertEquals("secret-1", prompt?.requestId)
+            assertEquals("GITHUB_TOKEN", prompt?.envVar)
+            assertEquals(sessionId, prompt?.binding?.runtimeSessionId)
+            assertEquals(7, prompt?.binding?.connectionGeneration)
+        }
+
+    @Test
+    fun privilegedRequestsWithoutExactRuntimeSessionAreIgnored() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+
+            listOf<String?>(null, "   ").forEach { missingSession ->
+                mockEventsFlow.emit(approvalRequest(sessionId = missingSession))
+                mockEventsFlow.emit(sudoRequest(sessionId = missingSession))
+                mockEventsFlow.emit(secretRequest(sessionId = missingSession))
+                advanceUntilIdle()
+            }
+
+            assertFalse(viewModel.uiState.value.messages.any { it.approvalInfo != null })
+            assertNull(viewModel.uiState.value.sudoPrompt)
+            assertNull(viewModel.uiState.value.secretPrompt)
         }
 
     @Test
     fun testRespondToSecret_sendsRpc() =
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
-            advanceUntilIdle()
+            val calls = capturePrivileged()
 
-            mockEventsFlow.emit(
-                WsEvent.SecretRequest(requestId = "secret-1", sessionId = null),
-            )
+            mockEventsFlow.emit(secretRequest())
             advanceUntilIdle()
-
             viewModel.respondToSecret("super-secret-token")
             advanceUntilIdle()
 
-            verify {
-                HermesWsClient.send(
-                    WsMethods.SECRET_RESPOND,
-                    withArg { params ->
-                        assertEquals(sessionId, params["session_id"])
-                        assertEquals("super-secret-token", params["value"])
-                        assertEquals("secret-1", params["request_id"])
-                    },
-                    any(),
-                )
-            }
+            assertEquals(1, calls.size)
+            assertEquals(WsMethods.SECRET_RESPOND, calls[0].method)
+            assertEquals(mapOf("value" to "super-secret-token"), calls[0].params)
+            assertEquals("secret-1", calls[0].binding.requestId)
+            assertEquals(sessionId, calls[0].binding.runtimeSessionId)
         }
 
     @Test
     fun testRespondToSecret_clearsPrompt() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
-            advanceUntilIdle()
+            capturePrivileged()
 
-            mockEventsFlow.emit(
-                WsEvent.SecretRequest(requestId = "secret-1", sessionId = null),
-            )
+            mockEventsFlow.emit(secretRequest())
             advanceUntilIdle()
             assertNotNull(viewModel.uiState.value.secretPrompt)
 
@@ -2603,6 +4433,127 @@ class ChatViewModelTest {
             advanceUntilIdle()
 
             assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun secretSubmission_doubleSendAndCancelDispatchExactlyOnceThenAckClears() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val ack = CompletableDeferred<Any?>()
+            val calls = capturePrivileged(ack)
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+
+            viewModel.respondToSecret("super-secret-token")
+            viewModel.cancelSecret()
+            viewModel.respondToSecret("other")
+            runCurrent()
+
+            assertEquals(listOf(WsMethods.SECRET_RESPOND), calls.map { it.method })
+            assertTrue(viewModel.uiState.value.secretPrompt!!.isSubmitting)
+            ack.complete(mapOf("status" to "ok"))
+            runCurrent()
+            assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun respondToSecret_failureNeverSurfacesTheGatewayString() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val rejected = CompletableDeferred<Any?>()
+            rejected.completeExceptionally(IllegalStateException("rejected super-secret-token"))
+            capturePrivileged(rejected)
+
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+            viewModel.respondToSecret("super-secret-token")
+            advanceUntilIdle()
+
+            assertEquals(PRIVILEGED_FAILURE_TEXT, viewModel.uiState.value.errorMessage)
+            assertFalse(
+                viewModel.uiState.value.errorMessage
+                    .orEmpty()
+                    .contains("super-secret-token"),
+            )
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+            assertFalse(viewModel.uiState.value.secretPrompt!!.isSubmitting)
+        }
+
+    @Test
+    fun cancelSecret_sendsTypedCancel() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+            viewModel.cancelSecret()
+            advanceUntilIdle()
+
+            assertEquals(listOf(WsMethods.SECRET_CANCEL), calls.map { it.method })
+            assertTrue(calls[0].params.isEmpty())
+            assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun dismissSecret_isANoOp() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val calls = capturePrivileged()
+
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+            viewModel.dismissSecret()
+            advanceUntilIdle()
+
+            assertTrue(calls.isEmpty())
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun secretExpire_clearsOnlyTheExactBoundRequest() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+
+            mockEventsFlow.emit(secretRequest())
+            advanceUntilIdle()
+
+            mockEventsFlow.emit(WsEvent.SecretExpire("secret-1", null, "profile-a", 7))
+            advanceUntilIdle()
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+
+            mockEventsFlow.emit(WsEvent.SecretExpire("secret-1", "session-other", "profile-a", 7))
+            advanceUntilIdle()
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+
+            mockEventsFlow.emit(WsEvent.SecretExpire("secret-1", sessionId, "profile-b", 7))
+            advanceUntilIdle()
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+
+            mockEventsFlow.emit(WsEvent.SecretExpire("secret-1", sessionId, "profile-a", 9))
+            advanceUntilIdle()
+            assertNotNull(viewModel.uiState.value.secretPrompt)
+
+            mockEventsFlow.emit(WsEvent.SecretExpire("secret-1", sessionId, "profile-a", 7))
+            advanceUntilIdle()
+            assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    /** A frame the parser refused to bind reaches the VM as an inert event. */
+    @Test
+    fun privilegedRequestRejected_changesNothing() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val before = viewModel.uiState.value
+
+            mockEventsFlow.emit(WsEvent.PrivilegedRequestRejected("approval.request", "session-123"))
+            mockEventsFlow.emit(WsEvent.PrivilegedRequestRejected("sudo.request", "session-123"))
+            advanceUntilIdle()
+
+            assertEquals(before.messages, viewModel.uiState.value.messages)
+            assertNull(viewModel.uiState.value.sudoPrompt)
+            assertNull(viewModel.uiState.value.secretPrompt)
+            assertNull(viewModel.uiState.value.errorMessage)
         }
 
     // ── Settings ─────────────────────────────────────────────────────────────
@@ -2779,17 +4730,11 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, _) = createViewModelWithSession()
 
-            mockEventsFlow.emit(
-                WsEvent.ApprovalRequest(
-                    command = "rm",
-                    description = "Dangerous",
-                    patternKeys = null,
-                    sessionId = null,
-                ),
-            )
-            advanceUntilIdle()
+            capturePrivileged()
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
             viewModel.respondToApproval("approve")
-            advanceUntilIdle()
+            runCurrent()
 
             // Simulate socket drop → reconnecting (triggers rejectAllPending).
             mockConnectionStatus.value = ConnectionStatus.RECONNECTING
@@ -2809,17 +4754,11 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, _) = createViewModelWithSession()
 
-            mockEventsFlow.emit(
-                WsEvent.ApprovalRequest(
-                    command = "rm",
-                    description = "Dangerous",
-                    patternKeys = null,
-                    sessionId = null,
-                ),
-            )
-            advanceUntilIdle()
+            capturePrivileged()
+            mockEventsFlow.emit(approvalRequest())
+            runCurrent()
             viewModel.respondToApproval("approve")
-            advanceUntilIdle()
+            runCurrent()
 
             // User-initiated reconnect must not throw / hang.
             viewModel.reconnect()

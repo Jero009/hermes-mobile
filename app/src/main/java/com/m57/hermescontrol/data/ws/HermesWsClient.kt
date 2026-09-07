@@ -59,6 +59,20 @@ internal data class SourcedWsEvent(
     val storedSessionId: String? = null,
 )
 
+data class PrivilegedRequestBinding(
+    val requestId: String,
+    val runtimeSessionId: String,
+    val profileId: String,
+    val connectionGeneration: Int,
+)
+
+/** Immutable identity of one live WebSocket connection. */
+class ConnectionBinding internal constructor(
+    val profileId: String,
+    val generation: Int,
+    internal val socket: WebSocket,
+)
+
 /**
  * WebSocket client for the Hermes Dashboard JSON-RPC 2.0 interface.
  *
@@ -97,6 +111,7 @@ object HermesWsClient {
 
     private val requestId = AtomicInteger(0)
     private val connectionGeneration = AtomicInteger(0)
+    private val socketGeneration = AtomicInteger(0)
     private val connected = AtomicBoolean(false)
     private val intentionalClose = AtomicBoolean(false)
     private val ticketAuthRetryUsed = AtomicBoolean(false)
@@ -136,6 +151,10 @@ object HermesWsClient {
 
     @Volatile
     private var webSocket: WebSocket? = null
+
+    /** Identity of [webSocket], guarded by [connectionLock]. */
+    private var activeConnectionProfileId: String? = null
+    private var activeConnectionGeneration: Int = -1
 
     @Volatile
     private var currentBackoff = INITIAL_BACKOFF_MS
@@ -512,6 +531,8 @@ object HermesWsClient {
             rejectAllPending()
             webSocket?.close(1000, "Client closed")
             webSocket = null
+            activeConnectionProfileId = null
+            activeConnectionGeneration = -1
             connected.set(false)
             if (clearPendingMessages) {
                 messageQueue.clear()
@@ -576,6 +597,139 @@ object HermesWsClient {
                     delay(timeoutMs)
                     resolvePending(id, null, JsonRpcError(-1, "Request timed out: $method"))
                 }
+            deferred
+        }
+
+    /**
+     * Answer or cancel exactly one privileged gateway request.
+     *
+     * Unlike [send] this has no queue, no reconnect retry, and no fallback: the
+     * frame either goes out on the very socket generation that dispatched the
+     * request, under the same profile, or the call fails. A privileged frame
+     * replayed onto a replacement connection would authorize a request the user
+     * never saw, so a stale [binding] must never reach the wire.
+     *
+     * The returned deferred completes only on the gateway's own acknowledgement
+     * (or its error / the request timeout), so callers can gate destructive UI
+     * transitions on a real ack.
+     */
+    fun privilegedRequest(
+        method: String,
+        binding: PrivilegedRequestBinding,
+        params: Map<String, String> = emptyMap(),
+    ): CompletableDeferred<Any?> =
+        synchronized(connectionLock) {
+            val deferred = CompletableDeferred<Any?>()
+            val ws = webSocket
+            if (!appInForeground.get() || !connected.get() || ws == null ||
+                binding.runtimeSessionId.isBlank() ||
+                binding.connectionGeneration != activeConnectionGeneration ||
+                binding.profileId != activeConnectionProfileId ||
+                binding.profileId != AuthManager.getSelectedProfileId() ||
+                ActiveSessionHolder.activeSessionId.value != binding.runtimeSessionId
+            ) {
+                deferred.completeExceptionally(HermesRpcException("Privileged request is no longer active"))
+                return@synchronized deferred
+            }
+            val id = requestId.incrementAndGet().toString()
+            val allParams =
+                params +
+                    mapOf(
+                        "session_id" to binding.runtimeSessionId,
+                        "request_id" to binding.requestId,
+                    )
+            val request =
+                JsonRpcRequest(id = id, method = method, params = allParams.mapValues { it.value.toJsonElement() })
+            val json = OkHttpProvider.json.encodeToString(request)
+            val pending = PendingCall(method, deferred)
+            pendingCalls[id] = pending
+            if (!ws.send(json)) {
+                pendingCalls.remove(id)
+                deferred.completeExceptionally(HermesRpcException("Privileged request was not sent"))
+            } else {
+                pending.timeoutJob =
+                    wsScope.launch {
+                        delay(REQUEST_TIMEOUT_MS)
+                        resolvePending(id, null, JsonRpcError(-1, "Request timed out: $method"))
+                    }
+            }
+            deferred
+        }
+
+    /** Capture the exact live profile/socket identity for a later bound request. */
+    fun connectionBinding(expectedProfileId: String): ConnectionBinding? =
+        synchronized(connectionLock) {
+            val socket = webSocket
+            if (!connected.get() ||
+                socket == null ||
+                activeConnectionProfileId != expectedProfileId ||
+                activeConnectionGeneration < 0
+            ) {
+                null
+            } else {
+                ConnectionBinding(expectedProfileId, activeConnectionGeneration, socket)
+            }
+        }
+
+    /** Synchronously validate that [binding] still identifies the exact live socket. */
+    fun isConnectionBindingCurrent(binding: ConnectionBinding): Boolean =
+        synchronized(connectionLock) {
+            connected.get() &&
+                webSocket === binding.socket &&
+                activeConnectionProfileId == binding.profileId &&
+                activeConnectionGeneration == binding.generation
+        }
+
+    /**
+     * Atomically send an awaited request on an exact live foreground socket.
+     *
+     * This bound path is intentionally separate from [request]/[send]: a control
+     * request must fail closed rather than enter [messageQueue] or trigger a
+     * reconnect when its captured profile, runtime session, or socket changes.
+     */
+    fun requestForConnection(
+        binding: ConnectionBinding,
+        method: String,
+        params: Map<String, Any> = emptyMap(),
+        timeoutMs: Long = REQUEST_TIMEOUT_MS,
+    ): CompletableDeferred<Any?> =
+        synchronized(connectionLock) {
+            val deferred = CompletableDeferred<Any?>()
+            val runtimeSessionId = params["session_id"] as? String
+            if (!appInForeground.get() ||
+                !connected.get() ||
+                webSocket !== binding.socket ||
+                activeConnectionProfileId != binding.profileId ||
+                activeConnectionGeneration != binding.generation ||
+                AuthManager.getSelectedProfileId() != binding.profileId ||
+                runtimeSessionId == null ||
+                ActiveSessionHolder.activeSessionId.value != runtimeSessionId
+            ) {
+                deferred.completeExceptionally(
+                    HermesRpcException("WebSocket binding changed — request cancelled"),
+                )
+                return@synchronized deferred
+            }
+
+            val id = requestId.incrementAndGet().toString()
+            val request =
+                JsonRpcRequest(
+                    id = id,
+                    method = method,
+                    params = params.mapValues { it.value.toJsonElement() },
+                )
+            val pending = PendingCall(method, deferred)
+            pendingCalls[id] = pending
+            if (!binding.socket.send(OkHttpProvider.json.encodeToString(request))) {
+                pendingCalls.remove(id)
+                deferred.completeExceptionally(HermesRpcException("Bound request was not sent"))
+            } else {
+                pending.timeoutJob =
+                    wsScope.launch {
+                        delay(timeoutMs)
+                        resolvePending(id, null, JsonRpcError(-1, "Request timed out: $method"))
+                    }
+            }
             deferred
         }
 
@@ -680,6 +834,51 @@ object HermesWsClient {
         }
         return id
     }
+
+    /**
+     * Sends a clarification answer only on the exact socket that delivered the
+     * prompt. Control replies are never queued across reconnect/profile changes.
+     */
+    fun respondToClarify(
+        sessionId: String,
+        clarifyRequestId: String,
+        questionId: String?,
+        answer: String,
+        sourceProfileId: String,
+        sourceConnectionGeneration: Int,
+    ): Boolean =
+        synchronized(connectionLock) {
+            val ws = webSocket
+            if (!appInForeground.get() ||
+                !connected.get() ||
+                ws == null ||
+                sessionId.isBlank() ||
+                clarifyRequestId.isBlank() ||
+                sourceConnectionGeneration != activeConnectionGeneration ||
+                sourceProfileId != activeConnectionProfileId ||
+                sourceProfileId != AuthManager.getSelectedProfileId() ||
+                ActiveSessionHolder.activeSessionId.value != sessionId
+            ) {
+                return@synchronized false
+            }
+            val params =
+                buildMap<String, Any> {
+                    put("session_id", sessionId)
+                    put("clarify_id", clarifyRequestId)
+                    put("request_id", clarifyRequestId)
+                    put("response", answer)
+                    put("answer", answer)
+                    questionId?.let { put("question_id", it) }
+                }
+            val id = requestId.incrementAndGet().toString()
+            val request =
+                JsonRpcRequest(
+                    id = id,
+                    method = WsMethods.CLARIFY_RESPOND,
+                    params = params.mapValues { it.value.toJsonElement() },
+                )
+            ws.send(OkHttpProvider.json.encodeToString(request))
+        }
 
     /** Start an idle-close recovery without reopening a credential boundary. */
     private fun startConnectionLocked() {
@@ -867,11 +1066,14 @@ object HermesWsClient {
                     restartForProfileChange = true
                 }
                 else -> {
+                    val eventSocketGeneration = socketGeneration.incrementAndGet()
                     webSocket =
                         OkHttpProvider.websocket.newWebSocket(
                             request,
-                            WsListenerImpl(profileId, generation),
+                            WsListenerImpl(profileId, generation, eventSocketGeneration),
                         )
+                    activeConnectionProfileId = profileId
+                    activeConnectionGeneration = eventSocketGeneration
                 }
             }
         }
@@ -967,6 +1169,8 @@ object HermesWsClient {
                 return@synchronized false
             }
             webSocket = null
+            activeConnectionProfileId = null
+            activeConnectionGeneration = -1
             connected.set(false)
             stopHealthTracking()
             rejectAllPending()
@@ -978,6 +1182,7 @@ object HermesWsClient {
     private class WsListenerImpl(
         private val profileId: String?,
         private val generation: Int,
+        private val eventSocketGeneration: Int,
     ) : WebSocketListener() {
         override fun onOpen(
             webSocket: WebSocket,
@@ -1014,7 +1219,7 @@ object HermesWsClient {
             }
             // Resolve any in-flight `request()` awaiting this RPC result/error
             // (issue #526) before fanning the parsed event out to collectors.
-            val event =
+            val parsedEvent =
                 try {
                     val rpc = OkHttpProvider.json.decodeFromString<JsonRpcResponse>(text)
                     EventParser.parse(rpc, text)
@@ -1024,6 +1229,27 @@ object HermesWsClient {
                         "Failed to parse WebSocket message (${e.javaClass.simpleName})",
                     )
                     WsEvent.Unknown(text)
+                }
+            // Stamp the dispatching profile and socket generation onto every
+            // privileged frame — request *and* expiry. Provenance has to come
+            // from the connection that delivered the frame; re-deriving it when
+            // the user acts would let a profile switch or reconnect rebind a
+            // live request (or let a stale expiry clear a fresh dialog).
+            val event =
+                when (parsedEvent) {
+                    is WsEvent.ApprovalRequest ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
+                    is WsEvent.SudoRequest ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
+                    is WsEvent.SudoExpire ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
+                    is WsEvent.SecretRequest ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
+                    is WsEvent.SecretExpire ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
+                    is WsEvent.ClarifyExpire ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
+                    else -> parsedEvent
                 }
             synchronized(connectionLock) {
                 if (generation != connectionGeneration.get() ||
@@ -1061,9 +1287,17 @@ object HermesWsClient {
                 val emitted =
                     parsedEvents.tryEmit(
                         SourcedWsEvent(
-                            event = event,
+                            event =
+                                if (event is WsEvent.ClarifyRequest) {
+                                    event.copy(
+                                        sourceProfileId = profileId,
+                                        connectionGeneration = eventSocketGeneration,
+                                    )
+                                } else {
+                                    event
+                                },
                             profileId = profileId,
-                            connectionGeneration = generation,
+                            connectionGeneration = eventSocketGeneration,
                             storedSessionId =
                                 (event as? WsEvent.MessageComplete)?.sessionId?.let(
                                     ActiveSessionHolder::resolveStoredSessionId,

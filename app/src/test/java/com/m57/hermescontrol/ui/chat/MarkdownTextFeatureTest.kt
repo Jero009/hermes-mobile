@@ -1,6 +1,7 @@
 package com.m57.hermescontrol.ui.chat
 
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.LayoutDirection
 import com.m57.hermescontrol.theme.HermesStatusColors
 import com.m57.hermescontrol.theme.StatusBlue
 import com.m57.hermescontrol.theme.StatusBlueContainer
@@ -11,6 +12,7 @@ import com.m57.hermescontrol.theme.StatusRedContainer
 import com.m57.hermescontrol.theme.StatusYellow
 import com.m57.hermescontrol.theme.StatusYellowContainer
 import com.m57.hermescontrol.theme.searchHighlightColors
+import com.m57.hermescontrol.util.BidiUtils
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -599,5 +601,117 @@ class MarkdownTextFeatureTest {
 
         assertTrue(block.code.contains("````"))
         assertTrue(block.code.contains("still inner"))
+    }
+
+    // 25. ARABIC BIDI MIXED TEXT (issue #1044)
+    @Test
+    fun testArabicMixedWithInlineCode_wrapsWithLtrIsolate() {
+        val input = "تم اختبار كود `val x = 1` بنجاح"
+        val parsed = parseInline(input, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+        val expected = "تم اختبار كود ${BidiUtils.LRI}val x = 1${BidiUtils.PDI} بنجاح"
+        assertEquals(expected, parsed.toString())
+    }
+
+    @Test
+    fun testArabicMixedWithNeutralInlineCode_wrapsWithLtrIsolate() {
+        listOf("123", "--", "/").forEach { code ->
+            val parsed = parseInline("شغّل `$code` الآن", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+
+            assertEquals("شغّل ${BidiUtils.LRI}$code${BidiUtils.PDI} الآن", parsed.toString())
+        }
+    }
+
+    @Test
+    fun testArabicMixedWithBoldEnglish_wrapsWithLtrIsolate() {
+        val input = "هذا النص يحتوي على **Android** داخل فقرة"
+        val parsed = parseInline(input, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+        val expected = "هذا النص يحتوي على ${BidiUtils.LRI}Android${BidiUtils.PDI} داخل فقرة"
+        assertEquals(expected, parsed.toString())
+    }
+
+    @Test
+    fun testEnglishWithInlineCode_doesNotWrapWithIsolate() {
+        val input = "Run `val x = 1` here"
+        val parsed = parseInline(input, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+        assertEquals("Run val x = 1 here", parsed.toString())
+    }
+
+    @Test
+    fun testArabicStartingWithEnglishWord_wrapsEnglishInLtrIsolate() {
+        val input = "Okay سكرت كلشي وصار كامل عربي"
+        val parsed = parseInline(input, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+        val expected = "${BidiUtils.LRI}Okay${BidiUtils.PDI} سكرت كلشي وصار كامل عربي"
+        assertEquals(expected, parsed.toString())
+    }
+
+    @Test
+    fun testArabicWithBareUrl_wrapsUrlInLtrIsolate() {
+        val input = "راجع https://example.com/path ثم تابع"
+        val parsed = parseInline(input, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+        val expected = "راجع ${BidiUtils.LRI}https://example.com/path${BidiUtils.PDI} ثم تابع"
+        assertEquals(expected, parsed.toString())
+    }
+
+    @Test
+    fun testParagraphFinalBareUrl_doesNotIncludePresentationRlmInLinkTarget() {
+        val parsed =
+            parseInline("راجع https://example.com/path", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+        val anchored = anchorTrailingRtlPresentation(parsed, isRtl = true)
+        val urlStart = anchored.indexOf("https://")
+        val links = anchored.getLinkAnnotations(urlStart, anchored.length)
+
+        assertEquals(
+            "راجع ${BidiUtils.LRI}https://example.com/path${BidiUtils.PDI}${BidiUtils.RLM}",
+            anchored.toString(),
+        )
+        assertEquals(1, links.size)
+        assertEquals(
+            "https://example.com/path",
+            (links.single().item as androidx.compose.ui.text.LinkAnnotation.Url).url,
+        )
+        assertEquals(anchored.length - 1, links.single().end)
+    }
+
+    @Test
+    fun testEnglishSearchInArabicParagraph_preservesIsolationAndHighlightStyle() {
+        val parsed =
+            parseInline(
+                "ابحث عن Android الآن",
+                Color.Black,
+                "Android",
+                false,
+                Color.Blue,
+                DEFAULT_HIGHLIGHTS,
+            )
+        val highlightedText = "${BidiUtils.LRI}Android${BidiUtils.PDI}"
+        val highlightStart = parsed.indexOf(highlightedText)
+        val highlightEnd = highlightStart + highlightedText.length
+
+        assertTrue("English query should remain LTR-isolated", highlightStart >= 0)
+        assertTrue(
+            "isolated English query should retain its search highlight",
+            parsed.spanStyles.any { style ->
+                style.start == highlightStart &&
+                    style.end == highlightEnd &&
+                    style.item.background == DEFAULT_HIGHLIGHTS.searchBackground &&
+                    style.item.color == DEFAULT_HIGHLIGHTS.searchForeground
+            },
+        )
+    }
+
+    @Test
+    fun testTableWithOneRtlCell_keepsAmbientColumnDirection() {
+        val markdown =
+            """
+            | Name | Status |
+            |------|--------|
+            | Alice | جاهز |
+            """.trimIndent()
+        val table = parseBlocks(markdown).single() as MdBlock.Table
+
+        assertTrue(BidiUtils.isRtlText(table.rows.single()[1]))
+        assertEquals(LayoutDirection.Ltr, tableStructureDirection(LayoutDirection.Ltr))
+        assertEquals(listOf("Name", "Status"), table.header)
+        assertEquals(listOf("Alice", "جاهز"), table.rows.single())
     }
 }

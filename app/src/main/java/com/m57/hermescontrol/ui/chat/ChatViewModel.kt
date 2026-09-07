@@ -31,9 +31,11 @@ import com.m57.hermescontrol.data.remote.safeApiCall
 import com.m57.hermescontrol.data.session.ActiveSessionHolder
 import com.m57.hermescontrol.data.ws.CommandBlocklist
 import com.m57.hermescontrol.data.ws.CommandCatalog
+import com.m57.hermescontrol.data.ws.ConnectionBinding
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.JsonRpcError
+import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
 import com.m57.hermescontrol.data.ws.toJsonElement
@@ -83,10 +85,12 @@ private const val SESSION_CREATE_MAX_ATTEMPTS = 3
  * (hermes-agent `tui_gateway/server.py`, `session.redirect` handler).
  */
 private const val REDIRECT_UNSUPPORTED_CODE = 4010
+private const val MAX_RETIRED_RESUME_REQUESTS = 64
 
 private data class PendingRpcRequest(
     val method: String,
     val resumeSessionId: String? = null,
+    val resumeFence: ResumeFence? = null,
     /** Runtime session that initiated a branch, used to fence late responses. */
     val branchSessionId: String? = null,
     /** Session/text captured for a session.redirect so a 4010 rejection can resend. */
@@ -94,6 +98,15 @@ private data class PendingRpcRequest(
     val redirectText: String? = null,
     /** Attempt generation for a session.create, used to fence retried answers. */
     val createGeneration: Long? = null,
+)
+
+private data class ResumeFence(
+    val storageSessionId: String,
+    val runtimeSessionId: String?,
+    val profileId: String,
+    val connectionBinding: ConnectionBinding,
+    val generation: Long,
+    val transcriptRevision: Long,
 )
 
 data class ChatUiState(
@@ -174,6 +187,8 @@ data class ChatUiState(
     val showContextDetail: Boolean = false,
     /** Agent todo / plan items (issue #736). */
     val todos: List<TodoItem> = emptyList(),
+    /** One-shot composer restoration produced by a successful `/undo`. */
+    val pendingPrefillText: String? = null,
 ) {
     /** Convenience — derived from [connectionStatus]. */
     val isConnected: Boolean get() = connectionStatus == ConnectionStatus.CONNECTED
@@ -191,6 +206,32 @@ data class ClarifyUi(
     val text: String,
     val options: List<String>,
     val clarifyId: String? = null,
+    val questionId: String? = null,
+    val multiSelect: Boolean = false,
+    val questions: List<ClarifyQuestionUi> = emptyList(),
+    val sessionId: String? = null,
+    val sourceProfileId: String? = null,
+    val connectionGeneration: Int? = null,
+) {
+    val resolvedQuestions: List<ClarifyQuestionUi>
+        get() =
+            questions.ifEmpty {
+                listOf(
+                    ClarifyQuestionUi(
+                        qid = questionId ?: "q0",
+                        question = text,
+                        choices = options,
+                        multiSelect = multiSelect,
+                    ),
+                )
+            }
+}
+
+data class ClarifyQuestionUi(
+    val qid: String,
+    val question: String,
+    val choices: List<String> = emptyList(),
+    val multiSelect: Boolean = false,
 )
 
 /**
@@ -204,17 +245,33 @@ data class ClarifyUi(
  */
 private const val CLARIFY_DISMISS_RESPONSE = "The user cancelled — no answer provided."
 
-/** Transient — not persisted. Holds a pending sudo.password request. */
+/**
+ * Transient — not persisted. Holds a pending sudo.password request.
+ *
+ * Carries only the routing binding, never the password: the entered value lives
+ * in the dialog's own composition and in the single transient RPC call.
+ */
 data class SudoPromptUi(
-    val requestId: String?,
-    val sessionId: String?,
-)
+    val binding: PrivilegedRequestBinding,
+    val isSubmitting: Boolean = false,
+) {
+    val requestId: String get() = binding.requestId
+}
 
-/** Transient — not persisted. Holds a pending secret (token/password) request. */
+/**
+ * Transient — not persisted. Holds a pending secret (token/password) request.
+ *
+ * Like [SudoPromptUi], this holds no secret value — only the request's routing
+ * binding and the gateway's own non-secret prompt labels.
+ */
 data class SecretPromptUi(
-    val requestId: String?,
-    val sessionId: String?,
-)
+    val binding: PrivilegedRequestBinding,
+    val envVar: String? = null,
+    val prompt: String? = null,
+    val isSubmitting: Boolean = false,
+) {
+    val requestId: String get() = binding.requestId
+}
 
 /** Expensive-model confirmation returned by the gateway's config.set RPC. */
 data class ModelSwitchConfirmation(
@@ -256,16 +313,48 @@ class ChatViewModel(
 
     /** Maps an in-flight RPC id to the context needed to handle its result. */
     private val pendingRequests = ConcurrentHashMap<String, PendingRpcRequest>()
+    private val resumeRequestLock = Any()
+    private val retiredResumeRequests = LinkedHashSet<String>()
 
     /** Runtime TUI session returned by session.resume; Desktop storage keeps the original ID. */
     private var runtimeSessionId: String? = null
     private var loadedMessageOffset = 0
     private var latestPaging = false
     private var isSyncingMessages = false
+    private var syncCounter = 0L
+
+    @Volatile private var activeSyncOwner: Long? = null
+    private var syncJob: Job? = null
+    private var conversationGeneration = 0L
+    private val historyLoadJobs = mutableSetOf<Job>()
+    private var historyRefreshCounter = 0L
+
+    @Volatile private var activeHistoryRefreshOwner: Long? = null
+    private var historyRefreshJob: Job? = null
+    private var cacheLoadCounter = 0L
+
+    @Volatile private var activeCacheLoadOwner: Long? = null
+    private var cacheLoadJob: Job? = null
+    private var activeCacheMessageIds: Set<String> = emptySet()
+    private var olderLoadCounter = 0L
+
+    @Volatile private var activeOlderLoadOwner: Long? = null
+    private var olderLoadJob: Job? = null
     val streamingState: StateFlow<StreamingState> = _streamingState.asStateFlow()
 
     /** Tracks the auto-clear coroutine for reaction animations. */
     private var reactionClearJob: Job? = null
+
+    /**
+     * Local expiry timers for live approval cards. Request ids can be reused,
+     * so timer ownership includes the message and complete transport binding.
+     */
+    private data class ApprovalTimerKey(
+        val messageId: String,
+        val binding: PrivilegedRequestBinding,
+    )
+
+    private val approvalExpiryJobs = ConcurrentHashMap<ApprovalTimerKey, Job>()
 
     private val wsClient = HermesWsClient
 
@@ -354,6 +443,11 @@ class ChatViewModel(
                     status == ConnectionStatus.NO_NETWORK ||
                     status == ConnectionStatus.AUTH_EXPIRED
                 ) {
+                    retireSync()
+                    _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
+                    conversationGeneration++
+                    invalidateResumeRequests()
+                    clearPrivilegedControls()
                     _uiState.update {
                         it.copy(
                             isLoading = false,
@@ -432,12 +526,15 @@ class ChatViewModel(
         preloadModelOptions()
         val currentId = _uiState.value.currentSessionId
         if (currentId != null) {
+            val resumeFence = captureResumeFence(currentId)
             viewModelScope.launch(Dispatchers.IO) {
-                wsClient.send(
-                    WsMethods.SESSION_RESUME,
-                    mapOf("session_id" to currentId, "omit_messages" to true),
-                    onSent = { id -> trackResumeRequest(id, currentId) },
-                )
+                if (resumeFence != null && isResumeFenceCurrent(resumeFence)) {
+                    wsClient.send(
+                        WsMethods.SESSION_RESUME,
+                        mapOf("session_id" to currentId, "omit_messages" to true),
+                        onSent = { id -> trackResumeRequest(id, resumeFence) },
+                    )
+                }
             }
             loadSessionMessages(currentId)
         } else {
@@ -458,7 +555,14 @@ class ChatViewModel(
                 is WsEvent.RpcError -> event.id
                 else -> null
             }
+        if (rpcId != null && consumeRetiredResumeRequest(rpcId)) return
         val pending = rpcId?.let(pendingRequests::get)
+        if (pending?.method == WsMethods.SESSION_RESUME &&
+            pending.resumeFence?.let(::isResumeFenceCurrent) != true
+        ) {
+            pendingRequests.remove(rpcId)
+            return
+        }
         if (
             pending?.method == WsMethods.SESSION_BRANCH &&
             pending.branchSessionId != null &&
@@ -507,8 +611,9 @@ class ChatViewModel(
         for (effect in result.effects) {
             when (effect) {
                 is ReducerEffect.PersistMessage -> {
+                    val acceptedRevision = repo.replacementGeneration(effect.sessionId)
                     viewModelScope.launch(Dispatchers.IO) {
-                        repo.persistMessage(effect.message, effect.sessionId)
+                        repo.persistMessage(effect.message, effect.sessionId, acceptedRevision)
                     }
                 }
 
@@ -528,8 +633,9 @@ class ChatViewModel(
                     // attachments (images inline, every other file tappable)
                     // via the gateway /api/files/download endpoint. Works on a
                     // remote phone too.
+                    val acceptedRevision = repo.replacementGeneration(effect.sessionId)
                     viewModelScope.launch(Dispatchers.IO) {
-                        attachHostMedia(effect.sessionId, effect.messageId)
+                        attachHostMedia(effect.sessionId, effect.messageId, acceptedRevision)
                     }
                 }
             }
@@ -652,8 +758,45 @@ class ChatViewModel(
                 handleSudoRequest(event)
             }
 
+            is WsEvent.SudoExpire -> {
+                _uiState.update { state ->
+                    val expired =
+                        state.sudoPrompt?.binding?.let {
+                            expiryMatches(
+                                binding = it,
+                                requestId = event.requestId,
+                                sessionId = event.sessionId,
+                                profileId = event.sourceProfileId,
+                                generation = event.connectionGeneration,
+                            )
+                        } ?: false
+                    if (expired) state.copy(sudoPrompt = null) else state
+                }
+            }
+
             is WsEvent.SecretRequest -> {
                 handleSecretRequest(event)
+            }
+
+            is WsEvent.SecretExpire -> {
+                _uiState.update { state ->
+                    val expired =
+                        state.secretPrompt?.binding?.let {
+                            expiryMatches(
+                                binding = it,
+                                requestId = event.requestId,
+                                sessionId = event.sessionId,
+                                profileId = event.sourceProfileId,
+                                generation = event.connectionGeneration,
+                            )
+                        } ?: false
+                    if (expired) state.copy(secretPrompt = null) else state
+                }
+            }
+
+            is WsEvent.PrivilegedRequestRejected -> {
+                // A privileged frame without a bindable request id. Never
+                // surfaced and never answered — the parser already dropped it.
             }
 
             is WsEvent.GatewayError -> {
@@ -758,6 +901,7 @@ class ChatViewModel(
                 val provider = (info?.get("provider") as? String)?.trim().orEmpty()
                 val reasoningEffort = (info?.get("reasoning_effort") as? String)?.trim()
                 val terminalBackend = (info?.get("terminal_backend") as? String)?.trim()
+                clearPrivilegedControls()
                 runtimeSessionId = newId
                 _uiState.update {
                     it.copy(
@@ -811,6 +955,8 @@ class ChatViewModel(
             }
 
             WsMethods.SESSION_RESUME -> {
+                val resumeFence = request.resumeFence ?: return
+                if (!isResumeFenceCurrent(resumeFence)) return
                 val resultMap = result as? Map<String, Any?>
                 val requestedSessionId = request.resumeSessionId
                 val selectedSessionId = _uiState.value.currentSessionId
@@ -840,6 +986,14 @@ class ChatViewModel(
                 // overwrite any message the user sent between switchSession() and
                 // the server ack, making the chat appear to go blank.
                 _uiState.update {
+                    if (!isResumeFenceCurrent(
+                            resumeFence,
+                            allowRuntimeChange = true,
+                            allowSessionChange = true,
+                        )
+                    ) {
+                        return@update it
+                    }
                     it.copy(
                         isLoading = false,
                         currentSessionId = sessionId,
@@ -863,6 +1017,7 @@ class ChatViewModel(
                     )
                 }
                 if (sessionId != null) {
+                    if (!isResumeFenceCurrent(resumeFence, allowRuntimeChange = true, allowSessionChange = true)) return
                     hydrateResumeMessages(
                         sessionId = sessionId,
                         payload = resultMap?.get("messages"),
@@ -871,8 +1026,10 @@ class ChatViewModel(
                                 requestedSessionId != sessionId,
                     )
                 }
+                if (!isResumeFenceCurrent(resumeFence, allowRuntimeChange = true, allowSessionChange = true)) return
                 // Mirror the active runtime session id app-wide (issue #532).
                 ActiveSessionHolder.set(runtimeSessionId ?: sessionId, sessionId)
+                if (!isResumeFenceCurrent(resumeFence, allowRuntimeChange = true, allowSessionChange = true)) return
                 addSystemMessage("Session resumed")
             }
 
@@ -1058,8 +1215,9 @@ class ChatViewModel(
         }
 
         // Persist under the original Desktop session ID.
+        val acceptedRevision = repo.replacementGeneration(storageSessionId)
         viewModelScope.launch(Dispatchers.IO) {
-            repo.persistMessage(userMessage, storageSessionId)
+            repo.persistMessage(userMessage, storageSessionId, acceptedRevision)
         }
 
         // Upload attachments then submit prompt
@@ -1227,8 +1385,9 @@ class ChatViewModel(
 
         // Persist — OUTSIDE update{}
         if (sessionId != null) {
+            val acceptedRevision = repo.replacementGeneration(sessionId)
             viewModelScope.launch(Dispatchers.IO) {
-                repo.persistMessage(userMsg, sessionId)
+                repo.persistMessage(userMsg, sessionId, acceptedRevision)
             }
         }
 
@@ -1269,10 +1428,229 @@ class ChatViewModel(
                 handleQueueCommand(command)
             }
 
+            is SlashResult.Undo -> {
+                handleUndoCommand(result.count, command)
+            }
+
             is SlashResult.RpcDispatch -> {
                 dispatchViaRpc(command)
             }
         }
+    }
+
+    private data class UndoFence(
+        val storageSessionId: String,
+        val runtimeSessionId: String,
+        val profileId: String,
+        val connectionBinding: ConnectionBinding,
+        val generation: Long,
+        val persistenceGeneration: Long,
+    )
+
+    private data class HistoryLoadFence(
+        val storageSessionId: String,
+        val runtimeSessionId: String?,
+        val profileId: String,
+        val connectionBinding: ConnectionBinding,
+        val generation: Long,
+        val transcriptRevision: Long,
+    )
+
+    private data class CacheLoadFence(
+        val storageSessionId: String,
+        val runtimeSessionId: String?,
+        val profileId: String,
+        val generation: Long,
+    )
+
+    private fun captureCacheLoadFence(sessionId: String) =
+        CacheLoadFence(
+            storageSessionId = sessionId,
+            runtimeSessionId = runtimeSessionId,
+            profileId = selectedProfileId(),
+            generation = conversationGeneration,
+        )
+
+    private fun isCacheLoadCurrent(
+        fence: CacheLoadFence,
+        owner: Long,
+    ): Boolean =
+        activeCacheLoadOwner == owner &&
+            fence.generation == conversationGeneration &&
+            fence.profileId == selectedProfileId() &&
+            fence.storageSessionId == _uiState.value.currentSessionId &&
+            fence.runtimeSessionId == runtimeSessionId
+
+    private fun captureHistoryLoadFence(sessionId: String): HistoryLoadFence? {
+        val profileId = selectedProfileId()
+        val connectionBinding = wsClient.connectionBinding(profileId) ?: return null
+        return HistoryLoadFence(
+            storageSessionId = sessionId,
+            runtimeSessionId = runtimeSessionId,
+            profileId = profileId,
+            connectionBinding = connectionBinding,
+            generation = conversationGeneration,
+            transcriptRevision = repo.replacementGeneration(sessionId),
+        )
+    }
+
+    private fun isHistoryLoadFenceCurrent(fence: HistoryLoadFence): Boolean =
+        fence.generation == conversationGeneration &&
+            fence.profileId == selectedProfileId() &&
+            fence.storageSessionId == _uiState.value.currentSessionId &&
+            fence.runtimeSessionId == runtimeSessionId &&
+            fence.transcriptRevision == repo.replacementGeneration(fence.storageSessionId) &&
+            wsClient.isConnectionBindingCurrent(fence.connectionBinding)
+
+    private fun isHistoryRefreshCurrent(
+        fence: HistoryLoadFence,
+        owner: Long,
+    ): Boolean = activeHistoryRefreshOwner == owner && isHistoryLoadFenceCurrent(fence)
+
+    private fun invalidateHistoryRefresh() {
+        retireSync()
+        retireCacheLoad()
+        activeHistoryRefreshOwner = null
+        historyRefreshCounter++
+        historyRefreshJob?.cancel()
+        historyRefreshJob = null
+    }
+
+    private fun retireCacheLoad() {
+        activeCacheLoadOwner = null
+        cacheLoadCounter++
+        cacheLoadJob?.cancel()
+        cacheLoadJob = null
+        activeCacheMessageIds = emptySet()
+    }
+
+    private fun launchHistoryLoad(block: suspend () -> Unit): Job {
+        val job = viewModelScope.launch { block() }
+        synchronized(historyLoadJobs) { historyLoadJobs += job }
+        job.invokeOnCompletion { synchronized(historyLoadJobs) { historyLoadJobs -= job } }
+        return job
+    }
+
+    private fun invalidateHistoryLoads(sessionId: String) {
+        invalidateHistoryRefresh()
+        repo.invalidateReplacementWrites(sessionId)
+        invalidateResumeRequests()
+        val jobs = synchronized(historyLoadJobs) { historyLoadJobs.toList().also { historyLoadJobs.clear() } }
+        jobs.forEach(Job::cancel)
+    }
+
+    private fun handleUndoCommand(
+        count: String,
+        command: String,
+    ) {
+        val storageSessionId = _uiState.value.currentSessionId ?: return
+        val agentSessionId = runtimeSessionId ?: return
+        val profileId = selectedProfileId()
+        val connectionBinding = wsClient.connectionBinding(profileId) ?: return
+        val fence =
+            UndoFence(
+                storageSessionId = storageSessionId,
+                runtimeSessionId = agentSessionId,
+                profileId = profileId,
+                connectionBinding = connectionBinding,
+                generation = conversationGeneration,
+                persistenceGeneration = repo.replacementGeneration(storageSessionId),
+            )
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result =
+                    wsClient
+                        .requestForConnection(
+                            fence.connectionBinding,
+                            WsMethods.COMMAND_DISPATCH,
+                            mapOf("name" to "undo", "arg" to count, "session_id" to agentSessionId),
+                        ).await()
+                if (!isUndoFenceCurrent(fence)) return@launch
+                recordAcceptedSlash(command)
+                handleUndoResult(result, fence)
+            } catch (e: Exception) {
+                if (isUndoFenceCurrent(fence)) {
+                    addAssistantMessage(e.message ?: "Failed to undo.")
+                }
+            }
+        }
+    }
+
+    private fun isUndoFenceCurrent(fence: UndoFence): Boolean =
+        fence.generation == conversationGeneration &&
+            fence.profileId == selectedProfileId() &&
+            fence.storageSessionId == _uiState.value.currentSessionId &&
+            fence.runtimeSessionId == runtimeSessionId &&
+            wsClient.isConnectionBindingCurrent(fence.connectionBinding)
+
+    private suspend fun handleUndoResult(
+        result: Any?,
+        fence: UndoFence,
+    ) {
+        val map = result as? Map<*, *> ?: return
+        if (map["type"] != "prefill") {
+            if (isUndoFenceCurrent(fence)) handleDispatchResult(result)
+            return
+        }
+        val prefill = map["message"] as? String ?: ""
+        val notice = (map["notice"] as? String).orEmpty().ifBlank { "Rewound conversation" }
+        invalidateHistoryLoads(fence.storageSessionId)
+        val authoritativeFence =
+            fence.copy(persistenceGeneration = repo.replacementGeneration(fence.storageSessionId))
+        val transcript = fetchCompleteSessionHistory(authoritativeFence) ?: return
+        if (!isUndoFenceCurrent(authoritativeFence)) return
+        val feedback = ChatMessage(role = MessageRole.SYSTEM, content = notice)
+        val reconciled = transcript + feedback
+        if (
+            !repo.replaceMessagesIfCurrent(
+                reconciled,
+                fence.storageSessionId,
+                authoritativeFence.persistenceGeneration,
+            )
+        ) {
+            return
+        }
+        if (!isUndoFenceCurrent(authoritativeFence)) return
+        loadedMessageOffset = 0
+        latestPaging = true
+        _uiState.update { state ->
+            if (!isUndoFenceCurrent(fence)) return@update state
+            state.copy(
+                messages = reconciled,
+                todos = restoredTodos(emptyList(), transcript),
+                hasOlderMessages = false,
+                isLoadingOlder = false,
+                pendingPrefillText = prefill.takeIf { it.isNotBlank() },
+            )
+        }
+    }
+
+    private suspend fun fetchCompleteSessionHistory(fence: UndoFence): List<ChatMessage>? {
+        val pages = mutableListOf<List<ChatMessage>>()
+        var offset = 0
+        while (true) {
+            if (!isUndoFenceCurrent(fence)) return null
+            val result = fetchMessagePage(fence.storageSessionId, offset, MESSAGE_PAGE_SIZE, order = "latest")
+            if (!isUndoFenceCurrent(fence)) return null
+            if (result !is NetworkResult.Success) return null
+            val pagination = result.data.pagination
+            val effectiveOffset = pagination?.offset ?: offset
+            pages += mapServerMessages(fence.storageSessionId, result.data.messages.orEmpty(), effectiveOffset)
+            val returned = pagination?.returned ?: result.data.messages.size
+            val total = pagination?.total
+            if (returned <= 0 ||
+                (total != null && effectiveOffset + returned >= total) ||
+                (total == null && returned < MESSAGE_PAGE_SIZE)
+            ) {
+                break
+            }
+            offset = effectiveOffset + returned
+        }
+        return if (isUndoFenceCurrent(fence)) pages.asReversed().flatten().distinctBy { it.id } else null
+    }
+
+    fun consumePendingPrefill() {
+        _uiState.update { it.copy(pendingPrefillText = null) }
     }
 
     private fun handleQueueCommand(command: String) {
@@ -1446,8 +1824,9 @@ class ChatViewModel(
         // Persist — OUTSIDE update{}
         val sessionId = _uiState.value.currentSessionId
         if (sessionId != null) {
+            val acceptedRevision = repo.replacementGeneration(sessionId)
             viewModelScope.launch(Dispatchers.IO) {
-                repo.persistMessage(msg, sessionId)
+                repo.persistMessage(msg, sessionId, acceptedRevision)
             }
         }
     }
@@ -1494,6 +1873,11 @@ class ChatViewModel(
         setLoading: Boolean = true,
         onDispatched: (() -> Unit)? = null,
     ) {
+        clearPrivilegedControls()
+        invalidateHistoryRefresh()
+        _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
+        conversationGeneration++
+        invalidateResumeRequests()
         val generation = ++sessionCreateCounter
         sessionCreateJob?.cancel()
         sessionCreateJob = null
@@ -1514,6 +1898,7 @@ class ChatViewModel(
                 terminalBackend = null,
                 contextUsage = null,
                 showContextDetail = false,
+                pendingPrefillText = null,
             )
         }
         _streamingState.update { StreamingState() }
@@ -1942,6 +2327,11 @@ class ChatViewModel(
     fun switchSession(sessionId: String) {
         if (sessionId == _uiState.value.currentSessionId) return
 
+        clearPrivilegedControls()
+        invalidateHistoryRefresh()
+        _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
+        conversationGeneration++
+        invalidateResumeRequests()
         // A pending session.create belongs to the conversation the user just
         // left. Retiring the generation makes any late answer inert, and the
         // timer must go with it or it would retry a create into this session.
@@ -1976,132 +2366,181 @@ class ChatViewModel(
                 // first turn lands.
                 contextUsage = null,
                 showContextDetail = false,
+                pendingPrefillText = null,
             )
         }
         // Mirror the active session id app-wide (issue #532).
         ActiveSessionHolder.set(sessionId)
         _streamingState.update { StreamingState() }
+        val resumeFence = captureResumeFence(sessionId)
         viewModelScope.launch {
             // Resume the selected desktop session, then load its complete transcript.
             launch(Dispatchers.IO) {
-                wsClient.send(
-                    WsMethods.SESSION_RESUME,
-                    mapOf("session_id" to sessionId, "omit_messages" to true),
-                    onSent = { id -> trackResumeRequest(id, sessionId) },
-                )
+                if (resumeFence != null && isResumeFenceCurrent(resumeFence)) {
+                    wsClient.send(
+                        WsMethods.SESSION_RESUME,
+                        mapOf("session_id" to sessionId, "omit_messages" to true),
+                        onSent = { id -> trackResumeRequest(id, resumeFence) },
+                    )
+                }
             }
             loadSessionMessages(sessionId)
             loadSessions()
         }
     }
 
-    private fun loadCachedMessages(sessionId: String): Job =
-        viewModelScope.launch(Dispatchers.IO) {
-            val cachedMessages = repo.loadMessages(sessionId)
-            _uiState.update { state ->
-                // Only replace if still showing this session
-                if (state.currentSessionId == sessionId) {
-                    state.copy(
-                        messages = cachedMessages,
-                        todos = restoredTodos(state.todos, cachedMessages),
-                        isLoading = false,
-                    )
-                } else {
-                    state
+    private fun loadCachedMessages(sessionId: String) {
+        val fence = captureCacheLoadFence(sessionId)
+        val owner = ++cacheLoadCounter
+        activeCacheLoadOwner = owner
+        cacheLoadJob?.cancel()
+        cacheLoadJob =
+            launchHistoryLoad {
+                val cachedMessages = repo.loadMessages(sessionId)
+                _uiState.update { state ->
+                    // Cache is only a blank-transcript fallback. A live, resume,
+                    // or server mutation that wins the race owns the transcript.
+                    if (isCacheLoadCurrent(fence, owner) && state.messages.isEmpty()) {
+                        activeCacheMessageIds = cachedMessages.mapTo(mutableSetOf()) { it.id }
+                        state.copy(
+                            messages = cachedMessages,
+                            todos = restoredTodos(state.todos, cachedMessages),
+                        )
+                    } else {
+                        state
+                    }
                 }
+                if (activeCacheLoadOwner == owner) cacheLoadJob = null
             }
-        }
+    }
 
     private fun loadSessionMessages(sessionId: String) {
-        viewModelScope.launch {
-            val latestResult =
-                fetchMessagePage(
-                    sessionId,
-                    offset = 0,
-                    limit = MESSAGE_PAGE_SIZE,
-                    order = "latest",
-                )
-            val (result, requestedOffset) =
-                if (
-                    latestResult is NetworkResult.Success &&
-                    latestResult.data.pagination?.order == "latest"
-                ) {
-                    latestPaging = true
-                    latestResult to 0
-                } else if (latestResult is NetworkResult.Success) {
-                    latestPaging = false
-                    val messageCount = fetchServerMessageCount(sessionId)
-                    val offset = (messageCount - MESSAGE_PAGE_SIZE).coerceAtLeast(0)
-                    fetchMessagePage(sessionId, offset, MESSAGE_PAGE_SIZE) to offset
-                } else {
-                    latestPaging = false
-                    latestResult to 0
-                }
-            when (result) {
-                is NetworkResult.Success -> {
-                    val offset =
-                        result.data.pagination?.offset ?: requestedOffset
-                    val chatMessages =
-                        mapServerMessages(
-                            sessionId,
-                            result.data.messages.orEmpty(),
-                            offset,
-                        )
+        // A full refresh supersedes any incremental sync. Retire it before the
+        // repository FIFO barrier and refresh-fence capture so a sync already
+        // queued for persistence cannot become authoritative afterward.
+        retireSync()
+        retireOlderLoad()
+        val owner = ++historyRefreshCounter
+        activeHistoryRefreshOwner = owner
+        historyRefreshJob?.cancel()
+        retireCacheLoad()
+        val baselineMessageIds = _uiState.value.messages.mapTo(mutableSetOf()) { it.id }
+        _uiState.update { it.copy(isLoading = true, errorMessage = null) }
+        loadCachedMessages(sessionId)
+        historyRefreshJob =
+            launchHistoryLoad {
+                try {
                     withContext(Dispatchers.IO) {
-                        repo.persistMessages(chatMessages, sessionId)
+                        repo.awaitSessionOperations(sessionId)
                     }
-                    _uiState.update { state ->
-                        if (state.currentSessionId != sessionId) return@update state
-                        val hasResumeHistory =
-                            state.messages.any {
-                                it.id.startsWith("resume-$sessionId-")
-                            }
-                        if (chatMessages.isEmpty() && hasResumeHistory) {
-                            state.copy(
-                                isLoading = false,
-                                isLoadingOlder = false,
-                            )
-                        } else {
-                            val hasOlder =
-                                if (latestPaging) {
-                                    val returned =
-                                        result.data.pagination?.returned
-                                            ?: chatMessages.size
-                                    returned >= MESSAGE_PAGE_SIZE &&
-                                        chatMessages.isNotEmpty()
-                                } else {
-                                    offset > 0 && chatMessages.isNotEmpty()
-                                }
-                            state.copy(
-                                messages = chatMessages,
-                                todos = restoredTodos(state.todos, chatMessages),
-                                isLoading = false,
-                                hasOlderMessages = hasOlder,
-                                isLoadingOlder = false,
-                            )
-                        }
-                    }
-                    val hasRestHistory =
-                        _uiState.value.messages.any {
-                            serverMessageIndex(it.id, sessionId) != null
-                        }
-                    if (chatMessages.isNotEmpty() && hasRestHistory) {
-                        loadedMessageOffset = offset
-                    }
-                }
-
-                is NetworkResult.Failure -> {
-                    _uiState.update {
-                        if (it.currentSessionId != sessionId) return@update it
-                        it.copy(
-                            isLoading = false,
-                            isLoadingOlder = false,
-                            errorMessage = "Failed to load messages: ${result.error.message}",
+                    if (activeHistoryRefreshOwner != owner) return@launchHistoryLoad
+                    val fence = captureHistoryLoadFence(sessionId) ?: return@launchHistoryLoad
+                    if (!isHistoryRefreshCurrent(fence, owner)) return@launchHistoryLoad
+                    val latestResult =
+                        fetchMessagePage(
+                            sessionId,
+                            offset = 0,
+                            limit = MESSAGE_PAGE_SIZE,
+                            order = "latest",
                         )
+                    if (!isHistoryRefreshCurrent(fence, owner)) return@launchHistoryLoad
+                    val useLatestPaging: Boolean
+                    val (result, requestedOffset) =
+                        if (
+                            latestResult is NetworkResult.Success &&
+                            latestResult.data.pagination?.order == "latest"
+                        ) {
+                            useLatestPaging = true
+                            latestResult to 0
+                        } else if (latestResult is NetworkResult.Success) {
+                            useLatestPaging = false
+                            val messageCount =
+                                fetchServerMessageCount(sessionId, fence, owner)
+                                    ?: return@launchHistoryLoad
+                            val offset = (messageCount - MESSAGE_PAGE_SIZE).coerceAtLeast(0)
+                            if (!isHistoryRefreshCurrent(fence, owner)) return@launchHistoryLoad
+                            fetchMessagePage(sessionId, offset, MESSAGE_PAGE_SIZE) to offset
+                        } else {
+                            useLatestPaging = false
+                            latestResult to 0
+                        }
+                    if (!isHistoryRefreshCurrent(fence, owner)) return@launchHistoryLoad
+                    latestPaging = useLatestPaging
+                    when (result) {
+                        is NetworkResult.Success -> {
+                            val offset = result.data.pagination?.offset ?: requestedOffset
+                            val chatMessages =
+                                mapServerMessages(
+                                    sessionId,
+                                    result.data.messages.orEmpty(),
+                                    offset,
+                                    useLatestPaging,
+                                )
+                            val persisted =
+                                withContext(Dispatchers.IO) {
+                                    repo.persistMessagesIfCurrent(
+                                        chatMessages,
+                                        sessionId,
+                                        fence.transcriptRevision,
+                                    ) {
+                                        isHistoryRefreshCurrent(fence, owner)
+                                    }
+                                }
+                            if (!persisted || !isHistoryRefreshCurrent(fence, owner)) return@launchHistoryLoad
+                            val cachedMessageIds = activeCacheMessageIds
+                            retireCacheLoad()
+                            _uiState.update { state ->
+                                if (!isHistoryRefreshCurrent(fence, owner)) return@update state
+                                val hasResumeHistory = state.messages.any { it.id.startsWith("resume-$sessionId-") }
+                                if (chatMessages.isEmpty() && hasResumeHistory) {
+                                    state.copy(isLoading = false, isLoadingOlder = false)
+                                } else {
+                                    val authoritativeIds = chatMessages.mapTo(mutableSetOf()) { it.id }
+                                    val newerMessages =
+                                        state.messages.filter { message ->
+                                            message.id !in baselineMessageIds &&
+                                                message.id !in cachedMessageIds &&
+                                                message.id !in authoritativeIds
+                                        }
+                                    val refreshedMessages = chatMessages + newerMessages
+                                    val hasOlder =
+                                        if (useLatestPaging) {
+                                            val returned = result.data.pagination?.returned ?: chatMessages.size
+                                            returned >= MESSAGE_PAGE_SIZE && chatMessages.isNotEmpty()
+                                        } else {
+                                            offset > 0 && chatMessages.isNotEmpty()
+                                        }
+                                    state.copy(
+                                        messages = refreshedMessages,
+                                        todos = restoredTodos(state.todos, refreshedMessages),
+                                        isLoading = false,
+                                        hasOlderMessages = hasOlder,
+                                        isLoadingOlder = false,
+                                    )
+                                }
+                            }
+                            if (isHistoryRefreshCurrent(fence, owner)) {
+                                val hasRestHistory =
+                                    _uiState.value.messages.any { serverMessageIndex(it.id, sessionId) != null }
+                                if (chatMessages.isNotEmpty() && hasRestHistory) loadedMessageOffset = offset
+                            }
+                        }
+
+                        is NetworkResult.Failure -> {
+                            _uiState.update {
+                                if (!isHistoryRefreshCurrent(fence, owner)) return@update it
+                                it.copy(
+                                    isLoading = false,
+                                    isLoadingOlder = false,
+                                    errorMessage = "Failed to load messages: ${result.error.message}",
+                                )
+                            }
+                        }
                     }
+                } finally {
+                    if (activeHistoryRefreshOwner == owner) historyRefreshJob = null
                 }
             }
-        }
     }
 
     fun loadOlderMessages() {
@@ -2111,68 +2550,87 @@ class ChatViewModel(
         if (!latestPaging && loadedMessageOffset <= 0) return
         val oldOffset = loadedMessageOffset
         val newOffset =
-            if (latestPaging) {
-                oldOffset + MESSAGE_PAGE_SIZE
-            } else {
-                (oldOffset - MESSAGE_PAGE_SIZE).coerceAtLeast(0)
-            }
+            if (latestPaging) oldOffset + MESSAGE_PAGE_SIZE else (oldOffset - MESSAGE_PAGE_SIZE).coerceAtLeast(0)
         val limit = if (latestPaging) MESSAGE_PAGE_SIZE else oldOffset - newOffset
+        val useLatestPaging = latestPaging
+        val fence = captureHistoryLoadFence(sessionId) ?: return
+        val owner = ++olderLoadCounter
+        activeOlderLoadOwner = owner
         _uiState.update { it.copy(isLoadingOlder = true) }
-        viewModelScope.launch {
-            val result =
-                fetchMessagePage(
-                    sessionId,
-                    newOffset,
-                    limit,
-                    order = if (latestPaging) "latest" else null,
-                )
-            when (result) {
-                is NetworkResult.Success -> {
-                    val effectiveOffset =
-                        result.data.pagination?.offset ?: newOffset
+        olderLoadJob =
+            launchHistoryLoad {
+                try {
+                    val result =
+                        fetchMessagePage(
+                            sessionId,
+                            newOffset,
+                            limit,
+                            order = if (useLatestPaging) "latest" else null,
+                        )
+                    if (result !is NetworkResult.Success || !isOlderLoadCurrent(fence, owner)) {
+                        return@launchHistoryLoad
+                    }
+                    val effectiveOffset = result.data.pagination?.offset ?: newOffset
                     val older =
                         mapServerMessages(
                             sessionId,
                             result.data.messages.orEmpty(),
                             effectiveOffset,
+                            useLatestPaging,
                         )
-                    withContext(Dispatchers.IO) {
-                        repo.persistMessages(older, sessionId)
-                    }
-                    _uiState.update { current ->
-                        if (current.currentSessionId != sessionId) {
-                            return@update current
+                    val persisted =
+                        withContext(Dispatchers.IO) {
+                            repo.persistMessagesIfCurrent(
+                                older,
+                                sessionId,
+                                fence.transcriptRevision,
+                            ) {
+                                isOlderLoadCurrent(fence, owner)
+                            }
                         }
+                    if (!persisted || !isOlderLoadCurrent(fence, owner)) return@launchHistoryLoad
+                    _uiState.update { current ->
+                        if (!isOlderLoadCurrent(fence, owner)) return@update current
                         loadedMessageOffset = effectiveOffset
-                        val mergedMessages =
-                            (older + current.messages).distinctBy { it.id }
+                        val mergedMessages = (older + current.messages).distinctBy { it.id }
                         val hasOlder =
-                            if (latestPaging) {
-                                val returned =
-                                    result.data.pagination?.returned
-                                        ?: older.size
+                            if (useLatestPaging) {
+                                val returned = result.data.pagination?.returned ?: older.size
                                 returned >= limit && older.isNotEmpty()
                             } else {
                                 effectiveOffset > 0 && older.isNotEmpty()
                             }
                         current.copy(
                             messages = mergedMessages,
-                            todos =
-                                restoredTodos(
-                                    current.todos,
-                                    mergedMessages,
-                                ),
-                            isLoadingOlder = false,
+                            todos = restoredTodos(current.todos, mergedMessages),
                             hasOlderMessages = hasOlder,
                         )
                     }
-                }
-
-                is NetworkResult.Failure -> {
-                    _uiState.update { it.copy(isLoadingOlder = false) }
+                } finally {
+                    releaseOlderLoad(owner)
                 }
             }
-        }
+    }
+
+    private fun isOlderLoadCurrent(
+        fence: HistoryLoadFence,
+        owner: Long,
+    ): Boolean = activeOlderLoadOwner == owner && isHistoryLoadFenceCurrent(fence)
+
+    private fun retireOlderLoad() {
+        val owner = activeOlderLoadOwner ?: return
+        if (activeOlderLoadOwner != owner) return
+        activeOlderLoadOwner = null
+        olderLoadJob?.cancel()
+        olderLoadJob = null
+        _uiState.update { it.copy(isLoadingOlder = false) }
+    }
+
+    private fun releaseOlderLoad(owner: Long) {
+        if (activeOlderLoadOwner != owner) return
+        activeOlderLoadOwner = null
+        olderLoadJob = null
+        _uiState.update { it.copy(isLoadingOlder = false) }
     }
 
     fun syncCurrentSession() {
@@ -2193,48 +2651,85 @@ class ChatViewModel(
                     ?.plus(1)
                     ?: loadedMessageOffset
             }
+        val fence = captureHistoryLoadFence(sessionId) ?: return
+        val owner = ++syncCounter
+        activeSyncOwner = owner
         isSyncingMessages = true
-        viewModelScope.launch {
-            try {
-                val result =
-                    fetchMessagePage(
-                        sessionId,
-                        nextOffset,
-                        MESSAGE_PAGE_SIZE,
-                        order = if (latestPaging) "latest" else null,
-                    )
-                when (result) {
-                    is NetworkResult.Success -> {
-                        val incoming = mapServerMessages(sessionId, result.data.messages.orEmpty(), nextOffset)
-                        if (incoming.isEmpty()) return@launch
-                        withContext(Dispatchers.IO) { repo.persistMessages(incoming, sessionId) }
-                        _uiState.update { current ->
-                            if (current.currentSessionId != sessionId) return@update current
-                            val merged =
-                                mergeSyncedMessages(
-                                    current = current.messages,
-                                    incoming = incoming,
-                                    isServerMessage = { id ->
-                                        serverMessageIndex(id, sessionId) != null
-                                    },
-                                )
-                            if (sameMessages(current.messages, merged)) {
-                                current
-                            } else {
-                                current.copy(
-                                    messages = merged,
-                                    todos = restoredTodos(current.todos, merged),
-                                )
+        syncJob =
+            launchHistoryLoad {
+                try {
+                    val result =
+                        fetchMessagePage(
+                            sessionId,
+                            nextOffset,
+                            MESSAGE_PAGE_SIZE,
+                            order = if (latestPaging) "latest" else null,
+                        )
+                    if (!isSyncCurrent(fence, owner)) return@launchHistoryLoad
+                    when (result) {
+                        is NetworkResult.Success -> {
+                            if (!isSyncCurrent(fence, owner)) return@launchHistoryLoad
+                            val incoming = mapServerMessages(sessionId, result.data.messages.orEmpty(), nextOffset)
+                            if (!isSyncCurrent(fence, owner)) return@launchHistoryLoad
+                            if (incoming.isEmpty()) return@launchHistoryLoad
+                            val persisted =
+                                withContext(Dispatchers.IO) {
+                                    repo.persistMessagesIfCurrent(
+                                        incoming,
+                                        sessionId,
+                                        fence.transcriptRevision,
+                                    ) {
+                                        isSyncCurrent(fence, owner)
+                                    }
+                                }
+                            if (!persisted || !isSyncCurrent(fence, owner)) return@launchHistoryLoad
+                            _uiState.update { current ->
+                                if (!isSyncCurrent(fence, owner)) return@update current
+                                val merged =
+                                    mergeSyncedMessages(
+                                        current = current.messages,
+                                        incoming = incoming,
+                                        isServerMessage = { id ->
+                                            serverMessageIndex(id, sessionId) != null
+                                        },
+                                    )
+                                if (sameMessages(current.messages, merged)) {
+                                    current
+                                } else {
+                                    current.copy(
+                                        messages = merged,
+                                        todos = restoredTodos(current.todos, merged),
+                                    )
+                                }
                             }
                         }
-                    }
 
-                    is NetworkResult.Failure -> {}
+                        is NetworkResult.Failure -> {}
+                    }
+                } finally {
+                    releaseSync(owner)
                 }
-            } finally {
-                isSyncingMessages = false
             }
-        }
+    }
+
+    private fun isSyncCurrent(
+        fence: HistoryLoadFence,
+        owner: Long,
+    ): Boolean = activeSyncOwner == owner && isHistoryLoadFenceCurrent(fence)
+
+    private fun retireSync() {
+        activeSyncOwner = null
+        syncCounter++
+        syncJob?.cancel()
+        syncJob = null
+        isSyncingMessages = false
+    }
+
+    private fun releaseSync(owner: Long) {
+        if (activeSyncOwner != owner) return
+        activeSyncOwner = null
+        syncJob = null
+        isSyncingMessages = false
     }
 
     private fun restoredTodos(
@@ -2242,38 +2737,39 @@ class ChatViewModel(
         messages: List<ChatMessage>,
     ): List<TodoItem> = hydrateTodosFromMessages(messages).ifEmpty { currentTodos }
 
-    private suspend fun fetchServerMessageCount(sessionId: String): Int {
+    private suspend fun fetchServerMessageCount(
+        sessionId: String,
+        fence: HistoryLoadFence,
+        owner: Long,
+    ): Int? {
+        if (!isHistoryRefreshCurrent(fence, owner)) return null
         val known =
             _uiState.value.sessions
                 .find { it.id == sessionId }
                 ?.messageCount
-        if (known != null) return known
+        if (known != null) return known.takeIf { isHistoryRefreshCurrent(fence, owner) }
         val result =
             withContext(Dispatchers.IO) {
                 safeApiCall { ApiClient.hermesApi.getSessions(limit = 500, offset = 0, order = "recent") }
             }
         if (result is NetworkResult.Success) {
+            if (!isHistoryRefreshCurrent(fence, owner)) return null
             val sessions = result.data.sessions.orEmpty()
             val count = sessions.find { it.id == sessionId }?.message_count
             if (count != null) {
                 _uiState.update { current ->
+                    if (!isHistoryRefreshCurrent(fence, owner)) return@update current
                     current.copy(
                         sessions =
                             current.sessions.map {
-                                if (it.id == sessionId) {
-                                    it.copy(
-                                        messageCount = count,
-                                    )
-                                } else {
-                                    it
-                                }
+                                if (it.id == sessionId) it.copy(messageCount = count) else it
                             },
                     )
                 }
-                return count
+                return count.takeIf { isHistoryRefreshCurrent(fence, owner) }
             }
         }
-        return known ?: _uiState.value.messages.size
+        return (_uiState.value.messages.size).takeIf { isHistoryRefreshCurrent(fence, owner) }
     }
 
     private suspend fun fetchMessagePage(
@@ -2297,6 +2793,7 @@ class ChatViewModel(
         sessionId: String,
         messages: List<SessionMessage>,
         offset: Int,
+        useLatestPaging: Boolean = latestPaging,
     ): List<ChatMessage> {
         val existingWithReasoning =
             _uiState.value.messages.filter { it.reasoningText.isNotBlank() }
@@ -2335,7 +2832,7 @@ class ChatViewModel(
                 }
             val globalIndex = offset + index
             val id =
-                if (latestPaging) {
+                if (useLatestPaging) {
                     msg.id?.let { "rest-$sessionId-$it" }
                         ?: "rest-$sessionId-$globalIndex"
                 } else {
@@ -2538,12 +3035,13 @@ class ChatViewModel(
     private suspend fun attachHostMedia(
         sessionId: String,
         messageId: String,
+        acceptedRevision: Long,
     ) {
         val current = _uiState.value.messages.find { it.id == messageId } ?: return
         val content = current.content
         val items = HostMediaExtractor.extract(content)
         if (items.isEmpty()) {
-            repo.persistMessage(current, sessionId)
+            repo.persistMessage(current, sessionId, acceptedRevision)
             return
         }
 
@@ -2566,7 +3064,7 @@ class ChatViewModel(
                 )
             }
         if (newAttachments.isEmpty()) {
-            repo.persistMessage(current, sessionId)
+            repo.persistMessage(current, sessionId, acceptedRevision)
             return
         }
 
@@ -2585,7 +3083,7 @@ class ChatViewModel(
                     },
             )
         }
-        repo.persistMessage(updatedMessage, sessionId)
+        repo.persistMessage(updatedMessage, sessionId, acceptedRevision)
     }
 
     /**
@@ -2797,71 +3295,139 @@ class ChatViewModel(
      * visible in the transcript.
      */
     fun dismissClarify() {
-        val sessionId = _uiState.value.currentSessionId ?: return
-        val clarifyId = _uiState.value.clarifyRequest?.clarifyId
-        _uiState.update { it.copy(clarifyRequest = null) }
-
-        addSystemMessage("Clarify dismissed — no answer sent", persist = true)
-
+        val state = _uiState.value
+        if (state.currentSessionId == null) return
+        val runtimeId = runtimeSessionId ?: return
+        val expected = state.clarifyRequest ?: return
+        val requestId = expected.clarifyId ?: return
+        val profileId = expected.sourceProfileId ?: return
+        val generation = expected.connectionGeneration ?: return
+        if (expected.sessionId != runtimeId) return
         viewModelScope.launch(Dispatchers.IO) {
-            val params =
-                mutableMapOf<String, Any>(
-                    "session_id" to sessionId,
-                    "response" to CLARIFY_DISMISS_RESPONSE,
-                    "answer" to CLARIFY_DISMISS_RESPONSE,
-                )
-            if (clarifyId != null) {
-                params["clarify_id"] = clarifyId
-                params["request_id"] = clarifyId
+            val dismissedIds = mutableSetOf<String>()
+            for (question in expected.resolvedQuestions) {
+                if (!clarifyRequestIsCurrent(expected, state.currentSessionId, runtimeId)) break
+                val sent =
+                    wsClient.respondToClarify(
+                        sessionId = runtimeId,
+                        clarifyRequestId = requestId,
+                        questionId = expected.wireQuestionId(question),
+                        answer = CLARIFY_DISMISS_RESPONSE,
+                        sourceProfileId = profileId,
+                        sourceConnectionGeneration = generation,
+                    )
+                if (!sent) break
+                dismissedIds += question.qid
             }
-            wsClient.send(
-                method = WsMethods.CLARIFY_RESPOND,
-                params = params,
-                onSent = { id -> trackRequest(id, WsMethods.CLARIFY_RESPOND) },
-            )
+            if (dismissedIds.isEmpty()) return@launch
+
+            val remaining = expected.resolvedQuestions.filterNot { it.qid in dismissedIds }
+            val completedCurrentRequest =
+                replaceClarifyIfCurrent(expected, expected.withRemainingQuestions(remaining))
+            if (completedCurrentRequest && remaining.isEmpty()) {
+                addSystemMessage("Clarify dismissed — no answer sent", persist = true)
+            }
         }
     }
 
     fun respondToClarify(option: String) {
-        val sessionId = _uiState.value.currentSessionId ?: return
-        val clarifyId = _uiState.value.clarifyRequest?.clarifyId
-        _uiState.update { it.copy(clarifyRequest = null) }
+        val clarify = _uiState.value.clarifyRequest ?: return
+        val qid = clarify.questionId ?: clarify.questions.singleOrNull()?.qid
+        respondToClarifyBatch(clarify, mapOf((qid ?: "q0") to option))
+    }
 
-        val userMessage =
-            ChatMessage(
-                role = MessageRole.USER,
-                content = option,
-            )
-
-        _uiState.update { state ->
-            state.copy(
-                messages = state.messages + userMessage,
-                isAgentTyping = true,
-            )
+    fun respondToClarifyBatch(
+        expected: ClarifyUi,
+        answers: Map<String, String>,
+    ) {
+        val state = _uiState.value
+        val sessionId = state.currentSessionId ?: return
+        val runtimeId = runtimeSessionId ?: return
+        val profileId = expected.sourceProfileId ?: return
+        val generation = expected.connectionGeneration ?: return
+        if (state.clarifyRequest != expected ||
+            expected.sessionId != runtimeId
+        ) {
+            return
         }
-
+        val questions = expected.resolvedQuestions
+        val normalized = answers.mapValues { it.value.trim() }.filterValues { it.isNotEmpty() }
+        if (normalized.isEmpty() || normalized.keys.any { answerId -> questions.none { it.qid == answerId } }) return
+        val requestId = expected.clarifyId ?: return
+        val acceptedRevision = repo.replacementGeneration(sessionId)
         viewModelScope.launch(Dispatchers.IO) {
-            repo.persistMessage(userMessage, sessionId)
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            val params =
-                mutableMapOf<String, Any>(
-                    "session_id" to sessionId,
-                    "response" to option,
-                    "answer" to option,
-                )
-            if (clarifyId != null) {
-                params["clarify_id"] = clarifyId
-                params["request_id"] = clarifyId
+            val answeredIds = mutableSetOf<String>()
+            for (question in questions) {
+                val answer = normalized[question.qid] ?: continue
+                if (!clarifyRequestIsCurrent(expected, sessionId, runtimeId)) break
+                val sent =
+                    wsClient.respondToClarify(
+                        sessionId = runtimeId,
+                        clarifyRequestId = requestId,
+                        questionId = expected.wireQuestionId(question),
+                        answer = answer,
+                        sourceProfileId = profileId,
+                        sourceConnectionGeneration = generation,
+                    )
+                if (!sent) break
+                answeredIds += question.qid
             }
-            wsClient.send(
-                method = WsMethods.CLARIFY_RESPOND,
-                params = params,
-                onSent = { id -> trackRequest(id, WsMethods.CLARIFY_RESPOND) },
-            )
+            if (answeredIds.isEmpty()) return@launch
+
+            val remaining = questions.filterNot { it.qid in answeredIds }
+            val displayAnswer =
+                questions.filter { it.qid in answeredIds }.joinToString(
+                    "\n",
+                ) { normalized.getValue(it.qid) }
+            val userMessage = ChatMessage(role = MessageRole.USER, content = displayAnswer)
+            _uiState.update { current ->
+                if (current.clarifyRequest == expected) {
+                    current.copy(
+                        clarifyRequest = expected.withRemainingQuestions(remaining),
+                        messages = current.messages + userMessage,
+                        isAgentTyping = remaining.isEmpty(),
+                    ).let { updated ->
+                        if (remaining.isEmpty()) updated.copy(clarifyRequest = null) else updated
+                    }
+                } else {
+                    current
+                }
+            }
+            if (_uiState.value.messages.any { it.id == userMessage.id }) {
+                repo.persistMessage(userMessage, sessionId, acceptedRevision)
+            }
         }
     }
+
+    private fun ClarifyUi.wireQuestionId(question: ClarifyQuestionUi): String? =
+        if (questions.isNotEmpty()) question.qid else questionId
+
+    private fun clarifyRequestIsCurrent(
+        expected: ClarifyUi,
+        sessionId: String,
+        runtimeId: String,
+    ): Boolean =
+        _uiState.value.clarifyRequest == expected &&
+            _uiState.value.currentSessionId == sessionId &&
+            runtimeSessionId == runtimeId
+
+    private fun replaceClarifyIfCurrent(
+        expected: ClarifyUi,
+        replacement: ClarifyUi?,
+    ): Boolean {
+        while (true) {
+            val current = _uiState.value
+            if (current.clarifyRequest != expected) return false
+            if (_uiState.compareAndSet(current, current.copy(clarifyRequest = replacement))) return true
+        }
+    }
+
+    private fun ClarifyUi.withRemainingQuestions(remaining: List<ClarifyQuestionUi>): ClarifyUi? =
+        when {
+            remaining.isEmpty() -> null
+            questions.isEmpty() -> this
+            else -> copy(questions = remaining)
+        }
 
     fun clearError() {
         _uiState.update { it.copy(errorMessage = null) }
@@ -2873,7 +3439,26 @@ class ChatViewModel(
 
     // ── Approval flow ───────────────────────────────────────────────────
 
+    private fun clearPrivilegedControls() {
+        approvalExpiryJobs.values.forEach(Job::cancel)
+        approvalExpiryJobs.clear()
+        _uiState.update { state ->
+            state.copy(
+                messages = state.messages.map { message -> message.copy(approvalInfo = null) },
+                sudoPrompt = null,
+                secretPrompt = null,
+            )
+        }
+    }
+
     private fun handleApprovalRequest(event: WsEvent.ApprovalRequest) {
+        val binding =
+            privilegedBinding(
+                requestId = event.requestId,
+                eventSessionId = event.sessionId,
+                profileId = event.sourceProfileId,
+                generation = event.connectionGeneration,
+            ) ?: return
         val description = event.description ?: event.command ?: "Unknown command"
         val content = "**Approval Required**\n$description"
         val msg =
@@ -2885,6 +3470,7 @@ class ChatViewModel(
                         command = event.command,
                         description = event.description,
                         patternKeys = event.patternKeys,
+                        privilegedBinding = binding,
                     ),
             )
         _uiState.update { state ->
@@ -2893,37 +3479,132 @@ class ChatViewModel(
                 isAgentTyping = false,
             )
         }
+        scheduleApprovalExpiry(msg.id, binding, event.timeoutSeconds)
     }
 
-    fun respondToApproval(action: String) {
-        val state = _uiState.value
-        val approvalMsg = state.messages.lastOrNull { it.approvalInfo != null } ?: return
-        val sessionId = state.currentSessionId ?: return
+    /**
+     * Retire the controls once the gateway's own approval deadline has elapsed
+     * locally. The gateway publishes the exact lifetime its waiting thread uses
+     * (`timeout_seconds`), so the buttons disappear when the request they would
+     * answer is already gone, rather than lingering and resolving nothing.
+     */
+    private fun scheduleApprovalExpiry(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+        timeoutSeconds: Double,
+    ) {
+        val key = ApprovalTimerKey(messageId, binding)
+        val job =
+            viewModelScope.launch {
+                delay((timeoutSeconds * 1_000.0).toLong().coerceAtLeast(1L))
+                approvalExpiryJobs.remove(key, coroutineContext[Job])
+                clearApprovalControls(messageId, binding)
+            }
+        approvalExpiryJobs.put(key, job)?.cancel()
+    }
 
-        // Clear buttons immediately
-        _uiState.update { s ->
-            s.copy(
-                messages =
-                    s.messages.map {
-                        if (it.id == approvalMsg.id) {
-                            it.copy(approvalInfo = null)
-                        } else {
-                            it
-                        }
-                    },
-            )
-        }
+    /** Approve exactly once. Session-wide and permanent allows are not offered. */
+    fun respondToApproval(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+        action: String,
+    ) {
+        val choice =
+            when (action) {
+                "approve" -> "once"
+                "deny" -> "deny"
+                // "session" / "always" are deliberately unreachable: a phone
+                // cannot show what a standing allow would later authorize.
+                else -> return
+            }
+        submitApproval(messageId, binding, WsMethods.APPROVAL_RESPOND, mapOf("choice" to choice))
+    }
+
+    /** Explicit Cancel — a typed `approval.cancel`, not a denial and not a dismissal. */
+    fun cancelApproval(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+    ) {
+        submitApproval(messageId, binding, WsMethods.APPROVAL_CANCEL, emptyMap())
+    }
+
+    private fun submitApproval(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+        method: String,
+        params: Map<String, String>,
+    ) {
+        if (!claimApprovalSubmission(messageId, binding)) return
 
         viewModelScope.launch(Dispatchers.IO) {
-            wsClient.send(
-                method = WsMethods.APPROVAL_RESPOND,
-                params =
-                    mapOf(
-                        "session_id" to sessionId,
-                        "choice" to action,
-                        "all" to false,
-                    ),
-                onSent = { id -> trackRequest(id, WsMethods.APPROVAL_RESPOND) },
+            runCatching {
+                wsClient.privilegedRequest(method = method, binding = binding, params = params).await()
+            }.onSuccess {
+                approvalExpiryJobs.remove(ApprovalTimerKey(messageId, binding))?.cancel()
+                clearApprovalControls(messageId, binding)
+            }.onFailure { error ->
+                restoreApprovalControls(messageId, binding, error.message)
+            }
+        }
+    }
+
+    private fun claimApprovalSubmission(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+    ): Boolean {
+        while (true) {
+            val state = _uiState.value
+            var matched = false
+            val messages =
+                state.messages.map { message ->
+                    val info = message.approvalInfo
+                    if (message.id == messageId && info?.privilegedBinding == binding && !info.isSubmitting) {
+                        matched = true
+                        message.copy(approvalInfo = info.copy(isSubmitting = true))
+                    } else {
+                        message
+                    }
+                }
+            if (!matched) return false
+            if (_uiState.compareAndSet(state, state.copy(messages = messages))) return true
+        }
+    }
+
+    private fun restoreApprovalControls(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+        errorMessage: String?,
+    ) {
+        _uiState.update { state ->
+            state.copy(
+                messages =
+                    state.messages.map { message ->
+                        val info = message.approvalInfo
+                        if (message.id == messageId && info?.privilegedBinding == binding) {
+                            message.copy(approvalInfo = info.copy(isSubmitting = false))
+                        } else {
+                            message
+                        }
+                    },
+                errorMessage = errorMessage,
+            )
+        }
+    }
+
+    private fun clearApprovalControls(
+        messageId: String,
+        binding: PrivilegedRequestBinding,
+    ) {
+        _uiState.update { state ->
+            state.copy(
+                messages =
+                    state.messages.map { message ->
+                        if (message.id == messageId && message.approvalInfo?.privilegedBinding == binding) {
+                            message.copy(approvalInfo = null)
+                        } else {
+                            message
+                        }
+                    },
             )
         }
     }
@@ -2935,9 +3616,16 @@ class ChatViewModel(
      * hung forever. Now we surface a secure dialog and reply via sudo.respond.
      */
     private fun handleSudoRequest(event: WsEvent.SudoRequest) {
+        val binding =
+            privilegedBinding(
+                requestId = event.requestId,
+                eventSessionId = event.sessionId,
+                profileId = event.sourceProfileId,
+                generation = event.connectionGeneration,
+            ) ?: return
         _uiState.update {
             it.copy(
-                sudoPrompt = SudoPromptUi(event.requestId, event.sessionId),
+                sudoPrompt = SudoPromptUi(binding),
                 isAgentTyping = false,
             )
         }
@@ -2949,74 +3637,185 @@ class ChatViewModel(
      * secret.respond.
      */
     private fun handleSecretRequest(event: WsEvent.SecretRequest) {
+        val binding =
+            privilegedBinding(
+                requestId = event.requestId,
+                eventSessionId = event.sessionId,
+                profileId = event.sourceProfileId,
+                generation = event.connectionGeneration,
+            ) ?: return
         _uiState.update {
             it.copy(
-                secretPrompt = SecretPromptUi(event.requestId, event.sessionId),
+                secretPrompt = SecretPromptUi(binding, event.envVar, event.prompt),
                 isAgentTyping = false,
             )
         }
     }
 
-    fun dismissSudo() {
-        _uiState.update { it.copy(sudoPrompt = null) }
-    }
-
-    fun dismissSecret() {
-        _uiState.update { it.copy(secretPrompt = null) }
-    }
-
     /**
-     * Send the user's sudo password back to the gateway. Mirrors
-     * respondToApproval: clear the prompt immediately, then fire the RPC.
+     * Back gesture or a tap outside the dialog. Deliberately a no-op: an
+     * incidental dismissal is neither an answer nor a cancellation, and hiding
+     * the dialog would strand a gateway thread that is still blocked. The user
+     * cancels through the explicit Cancel action.
      */
+    fun dismissSudo() = Unit
+
+    /** Ordinary dismissal of the secret dialog. A no-op, for the same reason as [dismissSudo]. */
+    fun dismissSecret() = Unit
+
+    /** Send the user's sudo password back to the gateway on its exact bound request. */
     fun respondToSudo(password: String) {
         val prompt = _uiState.value.sudoPrompt ?: return
-        val sessionId = prompt.sessionId ?: _uiState.value.currentSessionId ?: return
         if (password.isBlank()) return
+        submitSudo(prompt, WsMethods.SUDO_RESPOND, mapOf("password" to password))
+    }
 
-        _uiState.update { it.copy(sudoPrompt = null) }
+    /** Explicit Cancel — a typed `sudo.cancel`, awaited, never a silent dismissal. */
+    fun cancelSudo() {
+        val prompt = _uiState.value.sudoPrompt ?: return
+        submitSudo(prompt, WsMethods.SUDO_CANCEL, emptyMap())
+    }
 
+    /** Send the user's secret value back to the gateway on its exact bound request. */
+    fun respondToSecret(value: String) {
+        val prompt = _uiState.value.secretPrompt ?: return
+        if (value.isBlank()) return
+        submitSecret(prompt, WsMethods.SECRET_RESPOND, mapOf("value" to value))
+    }
+
+    /** Explicit Cancel — a typed `secret.cancel`, awaited, never a silent dismissal. */
+    fun cancelSecret() {
+        val prompt = _uiState.value.secretPrompt ?: return
+        submitSecret(prompt, WsMethods.SECRET_CANCEL, emptyMap())
+    }
+
+    private fun submitSudo(
+        prompt: SudoPromptUi,
+        method: String,
+        params: Map<String, String>,
+    ) {
+        val claimed = claimSudoSubmission(prompt) ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            val params =
-                mutableMapOf<String, Any>(
-                    "session_id" to sessionId,
-                    "password" to password,
-                )
-            prompt.requestId?.let { id -> params["request_id"] = id }
-            wsClient.send(
-                method = WsMethods.SUDO_RESPOND,
-                params = params,
-                onSent = { id -> trackRequest(id, WsMethods.SUDO_RESPOND) },
-            )
+            runCatching {
+                wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
+            }.onSuccess {
+                _uiState.update { if (it.sudoPrompt == claimed) it.copy(sudoPrompt = null) else it }
+            }.onFailure {
+                _uiState.update {
+                    if (it.sudoPrompt == claimed) {
+                        it.copy(
+                            sudoPrompt = claimed.copy(isSubmitting = false),
+                            errorMessage = privilegedFailureMessage(),
+                        )
+                    } else {
+                        it
+                    }
+                }
+            }
+        }
+    }
+
+    private fun claimSudoSubmission(expected: SudoPromptUi): SudoPromptUi? {
+        val claimed = expected.copy(isSubmitting = true)
+        while (true) {
+            val state = _uiState.value
+            if (state.sudoPrompt != expected || expected.isSubmitting) return null
+            if (_uiState.compareAndSet(state, state.copy(sudoPrompt = claimed))) return claimed
+        }
+    }
+
+    private fun submitSecret(
+        prompt: SecretPromptUi,
+        method: String,
+        params: Map<String, String>,
+    ) {
+        val claimed = claimSecretSubmission(prompt) ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
+            }.onSuccess {
+                _uiState.update { if (it.secretPrompt == claimed) it.copy(secretPrompt = null) else it }
+            }.onFailure {
+                _uiState.update {
+                    if (it.secretPrompt == claimed) {
+                        it.copy(
+                            secretPrompt = claimed.copy(isSubmitting = false),
+                            errorMessage = privilegedFailureMessage(),
+                        )
+                    } else {
+                        it
+                    }
+                }
+            }
+        }
+    }
+
+    private fun claimSecretSubmission(expected: SecretPromptUi): SecretPromptUi? {
+        val claimed = expected.copy(isSubmitting = true)
+        while (true) {
+            val state = _uiState.value
+            if (state.secretPrompt != expected || expected.isSubmitting) return null
+            if (_uiState.compareAndSet(state, state.copy(secretPrompt = claimed))) return claimed
         }
     }
 
     /**
-     * Send the user's secret value back to the gateway. Mirrors respondToSudo.
+     * Fixed failure text for the two secret-bearing verbs.
+     *
+     * A gateway error string is attacker- or bug-reachable and could echo the
+     * submitted value; `errorMessage` is durable UI state. So sudo and secret
+     * failures never render the throwable — only this constant.
      */
-    fun respondToSecret(value: String) {
-        val prompt = _uiState.value.secretPrompt ?: return
-        val sessionId = prompt.sessionId ?: _uiState.value.currentSessionId ?: return
-        if (value.isBlank()) return
+    private fun privilegedFailureMessage(): String =
+        getApplication<Application>().getString(R.string.chat_privileged_not_acknowledged)
 
-        _uiState.update { it.copy(secretPrompt = null) }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            val params =
-                mutableMapOf<String, Any>(
-                    "session_id" to sessionId,
-                    "value" to value,
-                )
-            prompt.requestId?.let { id -> params["request_id"] = id }
-            wsClient.send(
-                method = WsMethods.SECRET_RESPOND,
-                params = params,
-                onSent = { id -> trackRequest(id, WsMethods.SECRET_RESPOND) },
-            )
-        }
+    /**
+     * Bind a privileged event to the exact request it can answer.
+     *
+     * Every component has to be present and current at dispatch: the opaque
+     * request id, the runtime session showing the request, the profile whose
+     * connection delivered it, and that connection's generation. Anything
+     * missing or stale yields `null`, and the caller drops the event rather than
+     * surfacing controls that would resolve some other request.
+     */
+    private fun privilegedBinding(
+        requestId: String,
+        eventSessionId: String?,
+        profileId: String?,
+        generation: Int?,
+    ): PrivilegedRequestBinding? {
+        if (requestId.isBlank()) return null
+        if (generation == null) return null
+        if (profileId.isNullOrBlank() || profileId != selectedProfileId()) return null
+        val runtimeId = eventSessionId?.takeIf { it.isNotBlank() } ?: return null
+        if (runtimeId != runtimeSessionId) return null
+        return PrivilegedRequestBinding(
+            requestId = requestId,
+            runtimeSessionId = runtimeId,
+            profileId = profileId,
+            connectionGeneration = generation,
+        )
     }
 
+    /**
+     * A server expiry clears a live prompt only when it names that same exact
+     * request on the same session, profile, and socket generation.
+     */
+    private fun expiryMatches(
+        binding: PrivilegedRequestBinding,
+        requestId: String,
+        sessionId: String?,
+        profileId: String?,
+        generation: Int?,
+    ): Boolean =
+        requestId == binding.requestId &&
+            profileId == binding.profileId &&
+            generation == binding.connectionGeneration &&
+            !sessionId.isNullOrBlank() &&
+            sessionId == binding.runtimeSessionId
+
     fun reconnect() {
+        retireSync()
         AuthSessionState.markAuthenticated()
         _uiState.update {
             it.copy(
@@ -3112,8 +3911,9 @@ class ChatViewModel(
 
         // Persist — OUTSIDE update{}
         if (persist && sessionId != null) {
+            val acceptedRevision = repo.replacementGeneration(sessionId)
             viewModelScope.launch(Dispatchers.IO) {
-                repo.persistMessage(msg, sessionId)
+                repo.persistMessage(msg, sessionId, acceptedRevision)
             }
         }
     }
@@ -3145,16 +3945,67 @@ class ChatViewModel(
             )
     }
 
+    private fun captureResumeFence(sessionId: String): ResumeFence? {
+        val profileId = selectedProfileId()
+        val binding = wsClient.connectionBinding(profileId) ?: return null
+        return ResumeFence(
+            storageSessionId = sessionId,
+            runtimeSessionId = runtimeSessionId,
+            profileId = profileId,
+            connectionBinding = binding,
+            generation = conversationGeneration,
+            transcriptRevision = repo.replacementGeneration(sessionId),
+        )
+    }
+
+    private fun isResumeFenceCurrent(
+        fence: ResumeFence,
+        allowRuntimeChange: Boolean = false,
+        allowSessionChange: Boolean = false,
+    ): Boolean =
+        fence.generation == conversationGeneration &&
+            fence.profileId == selectedProfileId() &&
+            (allowSessionChange || fence.storageSessionId == _uiState.value.currentSessionId) &&
+            (allowRuntimeChange || fence.runtimeSessionId == runtimeSessionId) &&
+            fence.transcriptRevision == repo.replacementGeneration(fence.storageSessionId) &&
+            wsClient.isConnectionBindingCurrent(fence.connectionBinding)
+
     private fun trackResumeRequest(
         id: String,
-        sessionId: String,
+        fence: ResumeFence,
     ) {
-        pendingRequests[id] =
-            PendingRpcRequest(
-                method = WsMethods.SESSION_RESUME,
-                resumeSessionId = sessionId,
-            )
+        synchronized(resumeRequestLock) {
+            invalidateResumeRequestsLocked()
+            pendingRequests[id] =
+                PendingRpcRequest(
+                    method = WsMethods.SESSION_RESUME,
+                    resumeSessionId = fence.storageSessionId,
+                    resumeFence = fence,
+                )
+        }
     }
+
+    private fun invalidateResumeRequests() {
+        synchronized(resumeRequestLock) {
+            invalidateResumeRequestsLocked()
+        }
+    }
+
+    private fun invalidateResumeRequestsLocked() {
+        pendingRequests.entries.removeIf { (id, request) ->
+            if (request.method != WsMethods.SESSION_RESUME) return@removeIf false
+            retiredResumeRequests += id
+            while (retiredResumeRequests.size > MAX_RETIRED_RESUME_REQUESTS) {
+                retiredResumeRequests.remove(retiredResumeRequests.first())
+            }
+            true
+        }
+    }
+
+    private fun consumeRetiredResumeRequest(id: String): Boolean =
+        synchronized(resumeRequestLock) {
+            retiredResumeRequests.remove(id)
+        }
 
     /**
      * Track a `session.create` alongside the attempt generation that issued it,

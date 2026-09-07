@@ -720,6 +720,11 @@
     <string name="mcp_servers_label_transport">전송: %1$s</string>
     <string name="mcp_servers_label_command">명령어:</string>
     <string name="mcp_servers_action_test">테스트</string>
+    <string name="mcp_servers_action_test_all">모두 테스트</string>
+    <string name="mcp_servers_status_healthy">정상</string>
+    <string name="mcp_servers_status_needs_auth">인증 필요</string>
+    <string name="mcp_servers_status_error">오류</string>
+    <string name="mcp_servers_status_testing">테스트 중…</string>
     <string name="mcp_servers_add_server">서버 추가</string>
     <string name="mcp_servers_add_http">HTTP URL</string>
     <string name="mcp_servers_empty_title">MCP 서버 없음</string>

@@ -34,6 +34,7 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.CallSplit
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
@@ -41,6 +42,7 @@ import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Search
@@ -54,6 +56,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -310,6 +313,7 @@ fun SessionsScreen(
     val onPrimaryContainer = MaterialTheme.colorScheme.onPrimaryContainer
 
     var pruneDays by remember { mutableStateOf("7") }
+    var expandedAutomationGroups by remember { mutableStateOf(emptySet<String>()) }
 
     val sessionSections =
         remember(state.sessions, state.pinnedSessionIds) {
@@ -333,6 +337,14 @@ fun SessionsScreen(
         }
 
     val hasSelection = state.selectedIds.isNotEmpty()
+    val automationRunGroups =
+        remember(sessionSections.recent) {
+            automationGroups(sessionSections.recent.map { it.session })
+        }
+    val recentItemsById =
+        remember(sessionSections.recent) {
+            sessionSections.recent.associateBy { it.session.id }
+        }
     val visibleSessionIds =
         remember(sessionsToDisplay) {
             sessionsToDisplay.mapTo(linkedSetOf()) { it.session.id }
@@ -488,6 +500,28 @@ fun SessionsScreen(
         // (The scaffold already applies top-bar padding via its inner Box, so we
         //  must NOT re-apply paddingValues here.)
         Column(modifier = Modifier.fillMaxSize()) {
+            // ── History section tabs ──────────────────────────────
+            Row(
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = spacing.md, vertical = spacing.sm),
+                horizontalArrangement = Arrangement.spacedBy(spacing.sm),
+            ) {
+                FilterChip(
+                    selected = state.section == HistorySection.CONVERSATIONS,
+                    onClick = { screenViewModel.selectSection(HistorySection.CONVERSATIONS) },
+                    label = { Text(stringResource(R.string.sessions_tab_conversations)) },
+                    modifier = Modifier.testTag("history_tab_conversations"),
+                )
+                FilterChip(
+                    selected = state.section == HistorySection.AUTOMATIONS,
+                    onClick = { screenViewModel.selectSection(HistorySection.AUTOMATIONS) },
+                    label = { Text(stringResource(R.string.sessions_tab_automations)) },
+                    modifier = Modifier.testTag("history_tab_automations"),
+                )
+            }
+
             // ── Search + bulk toggle (always visible) ─────────────
             Row(
                 modifier =
@@ -631,79 +665,101 @@ fun SessionsScreen(
                     }
 
                     state.sessions.isEmpty() -> {
+                        val isAutomations = state.section == HistorySection.AUTOMATIONS
                         EmptyState(
-                            title = stringResource(R.string.history_empty_title),
-                            subtitle = stringResource(R.string.history_empty_desc),
+                            title =
+                                stringResource(
+                                    if (isAutomations) {
+                                        R.string.sessions_automations_empty_title
+                                    } else {
+                                        R.string.history_empty_title
+                                    },
+                                ),
+                            subtitle =
+                                stringResource(
+                                    if (isAutomations) {
+                                        R.string.sessions_automations_empty_desc
+                                    } else {
+                                        R.string.history_empty_desc
+                                    },
+                                ),
                             icon = Icons.Filled.History,
-                            actionLabel = stringResource(R.string.empty_action_start_chat),
+                            // Automation runs are started by the scheduler, never from chat.
+                            actionLabel =
+                                if (isAutomations) {
+                                    null
+                                } else {
+                                    stringResource(R.string.empty_action_start_chat)
+                                },
                             onAction = { NavigationController.navigateTo(ChatScreen) },
                         )
                     }
 
                     else -> {
                         Column(modifier = Modifier.fillMaxSize()) {
-                            // ── Stats row ───────────────────────────────────────
-                            Row(
-                                modifier =
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .height(IntrinsicSize.Max)
-                                        .padding(horizontal = spacing.md, vertical = spacing.sm),
-                                horizontalArrangement = Arrangement.spacedBy(spacing.sm),
-                            ) {
-                                StatCard(
-                                    label = stringResource(R.string.sessions_stat_total),
-                                    value = if (state.isLoadingStats) "…" else state.stats.total.toString(),
-                                    icon = Icons.Filled.History,
-                                    modifier = Modifier.weight(1f).fillMaxHeight(),
-                                )
-                                StatCard(
-                                    label = stringResource(R.string.sessions_stat_messages),
-                                    value = if (state.isLoadingStats) "…" else state.stats.messages.toString(),
-                                    icon = Icons.Filled.CheckCircle,
-                                    accentColor = statusColors.success,
-                                    modifier = Modifier.weight(1f).fillMaxHeight(),
-                                )
-                                // Prune button card
-                                Card(
-                                    modifier = Modifier.weight(1f).fillMaxHeight(),
-                                    colors =
-                                        CardDefaults.cardColors(
-                                            containerColor = MaterialTheme.colorScheme.surfaceContainer,
-                                        ),
-                                    onClick = { screenViewModel.showPruneDialog() },
+                            // The stats and prune APIs are global, so only show them alongside
+                            // Conversations where they cannot be mistaken for automation totals.
+                            if (state.section.showsGlobalStats) {
+                                Row(
+                                    modifier =
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .height(IntrinsicSize.Max)
+                                            .padding(horizontal = spacing.md, vertical = spacing.sm),
+                                    horizontalArrangement = Arrangement.spacedBy(spacing.sm),
                                 ) {
-                                    Box(
-                                        modifier = Modifier.fillMaxSize().padding(spacing.md),
-                                        contentAlignment = Alignment.Center,
+                                    StatCard(
+                                        label = stringResource(R.string.sessions_stat_total),
+                                        value = if (state.isLoadingStats) "…" else state.stats.total.toString(),
+                                        icon = Icons.Filled.History,
+                                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                                    )
+                                    StatCard(
+                                        label = stringResource(R.string.sessions_stat_messages),
+                                        value = if (state.isLoadingStats) "…" else state.stats.messages.toString(),
+                                        icon = Icons.Filled.CheckCircle,
+                                        accentColor = statusColors.success,
+                                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                                    )
+                                    Card(
+                                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                                        colors =
+                                            CardDefaults.cardColors(
+                                                containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                                            ),
+                                        onClick = { screenViewModel.showPruneDialog() },
                                     ) {
-                                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                            Icon(
-                                                imageVector = Icons.Filled.DeleteSweep,
-                                                contentDescription = null,
-                                                tint = statusColors.warning,
-                                                modifier = Modifier.size(20.dp),
-                                            )
-                                            Spacer(modifier = Modifier.height(spacing.xs))
-                                            Text(
-                                                text = stringResource(R.string.sessions_action_prune),
-                                                style = MaterialTheme.typography.labelMedium,
-                                                color = statusColors.warning,
-                                                fontWeight = FontWeight.SemiBold,
-                                            )
+                                        Box(
+                                            modifier = Modifier.fillMaxSize().padding(spacing.md),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                                Icon(
+                                                    imageVector = Icons.Filled.DeleteSweep,
+                                                    contentDescription = null,
+                                                    tint = statusColors.warning,
+                                                    modifier = Modifier.size(20.dp),
+                                                )
+                                                Spacer(modifier = Modifier.height(spacing.xs))
+                                                Text(
+                                                    text = stringResource(R.string.sessions_action_prune),
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    color = statusColors.warning,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                )
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            // Stats error snack
-                            val statsError = state.statsError
-                            if (statsError != null) {
-                                Text(
-                                    text = statsError,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = statusColors.error,
-                                    modifier = Modifier.padding(horizontal = spacing.md),
-                                )
+                                val statsError = state.statsError
+                                if (statsError != null) {
+                                    Text(
+                                        text = statsError,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = statusColors.error,
+                                        modifier = Modifier.padding(horizontal = spacing.md),
+                                    )
+                                }
                             }
 
                             // ── Session list ────────────────────────────────────
@@ -798,11 +854,39 @@ fun SessionsScreen(
                                         }
                                     }
                                 }
-                                items(
-                                    items = sessionSections.recent,
-                                    key = { it.session.id },
-                                ) { item ->
-                                    sessionRow(item)
+                                if (state.section == HistorySection.AUTOMATIONS) {
+                                    automationRunGroups.forEach { group ->
+                                        val expanded = group.key in expandedAutomationGroups
+                                        item(key = "automation_group_${group.key}") {
+                                            AutomationGroupHeader(
+                                                group = group,
+                                                expanded = expanded,
+                                                onToggle = {
+                                                    expandedAutomationGroups =
+                                                        if (expanded) {
+                                                            expandedAutomationGroups - group.key
+                                                        } else {
+                                                            expandedAutomationGroups + group.key
+                                                        }
+                                                },
+                                            )
+                                        }
+                                        if (expanded) {
+                                            items(
+                                                items = group.sessions,
+                                                key = { "automation_${it.id}" },
+                                            ) { session ->
+                                                recentItemsById[session.id]?.let { sessionRow(it) }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    items(
+                                        items = sessionSections.recent,
+                                        key = { it.session.id },
+                                    ) { item ->
+                                        sessionRow(item)
+                                    }
                                 }
 
                                 // Load more
@@ -959,6 +1043,72 @@ private fun SessionSectionHeader(
             style = MaterialTheme.typography.labelLarge,
             fontWeight = FontWeight.Bold,
         )
+    }
+}
+
+/**
+ * Collapsible header for one automation job's runs. The job identity comes from the run ID,
+ * so a renamed or duplicated job title never merges or splits groups.
+ */
+@Composable
+private fun AutomationGroupHeader(
+    group: AutomationSessionGroup,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+) {
+    val spacing = LocalSpacing.current
+    val expandLabel =
+        stringResource(
+            if (expanded) {
+                R.string.content_desc_collapse_automation_group
+            } else {
+                R.string.content_desc_expand_automation_group
+            },
+        )
+    Row(
+        modifier =
+            Modifier
+                .fillMaxWidth()
+                .testTag("automation_group_${group.key}")
+                .clickable(onClickLabel = expandLabel, role = Role.Button, onClick = onToggle)
+                .padding(horizontal = 4.dp, vertical = spacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector =
+                if (expanded) {
+                    Icons.Filled.KeyboardArrowDown
+                } else {
+                    Icons.AutoMirrored.Filled.KeyboardArrowRight
+                },
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp),
+        )
+        Spacer(modifier = Modifier.width(spacing.sm))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text =
+                    group.title
+                        ?: group.jobId?.let {
+                            stringResource(R.string.sessions_section_automation_job, it)
+                        }
+                        ?: stringResource(R.string.sessions_section_automation_unknown),
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text =
+                    stringResource(
+                        R.string.sessions_section_automation_runs,
+                        group.sessions.size,
+                    ),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 

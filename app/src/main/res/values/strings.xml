@@ -27,6 +27,8 @@
     <string name="chat_secret_title">Secret Required</string>
     <string name="chat_secret_body">The agent needs a secret value (token or password) to continue. It will not be shown.</string>
     <string name="chat_secret_value">Secret</string>
+    <string name="chat_privileged_cancel">Cancel request</string>
+    <string name="chat_privileged_not_acknowledged">Hermes did not acknowledge that. The request is still waiting.</string>
     <string name="chat_search_placeholder">Search messages\u2026</string>
     <string name="chat_clear_search_desc">Clear</string>
     <string name="chat_prev_match_desc">Previous match</string>
@@ -543,6 +545,15 @@
     <string name="sessions_action_delete_n">Delete %1$d</string>
     <string name="sessions_section_pinned">Pinned</string>
     <string name="sessions_section_recent">Recent</string>
+    <string name="sessions_tab_conversations">Conversations</string>
+    <string name="sessions_tab_automations">Automations</string>
+    <string name="sessions_automations_empty_title">No automation history</string>
+    <string name="sessions_automations_empty_desc">Runs started by scheduled automations will appear here.</string>
+    <string name="sessions_section_automation_job">Job %1$s</string>
+    <string name="sessions_section_automation_unknown">Automation run</string>
+    <string name="sessions_section_automation_runs">%1$d loaded run(s)</string>
+    <string name="content_desc_expand_automation_group">Expand automation runs</string>
+    <string name="content_desc_collapse_automation_group">Collapse automation runs</string>
     <string name="content_desc_pin_session">Pin session</string>
     <string name="content_desc_unpin_session">Unpin session</string>
     <string name="content_desc_enter_selection">Select sessions</string>
@@ -725,6 +736,11 @@
     <string name="mcp_servers_label_transport">Transport: %1$s</string>
     <string name="mcp_servers_label_command">Command:</string>
     <string name="mcp_servers_action_test">Test</string>
+    <string name="mcp_servers_action_test_all">Test all</string>
+    <string name="mcp_servers_status_healthy">Healthy</string>
+    <string name="mcp_servers_status_needs_auth">Needs auth</string>
+    <string name="mcp_servers_status_error">Error</string>
+    <string name="mcp_servers_status_testing">Testing…</string>
     <string name="mcp_servers_add_server">Add server</string>
     <string name="mcp_servers_add_http">HTTP URL</string>
     <string name="mcp_servers_empty_title">No MCP servers</string>

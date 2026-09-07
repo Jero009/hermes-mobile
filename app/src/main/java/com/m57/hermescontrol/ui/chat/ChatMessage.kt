@@ -1,17 +1,24 @@
 package com.m57.hermescontrol.ui.chat
 
 import com.m57.hermescontrol.data.model.Attachment
+import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import java.util.UUID
 
 /**
  * Metadata for a [ChatMessage] that represents an approval request.
- * When present, the UI renders Approve/Deny buttons inline.
+ * When present, the UI renders Approve/Deny/Cancel controls inline.
  * Transient — not persisted to SQLite.
+ *
+ * [privilegedBinding] is mandatory. Controls exist only while there is an exact
+ * request to answer, so an approval that cannot be bound is never rendered
+ * rather than rendered with buttons that would guess a target.
  */
 data class ApprovalInfo(
     val command: String?,
     val description: String?,
     val patternKeys: List<String>?,
+    val privilegedBinding: PrivilegedRequestBinding,
+    val isSubmitting: Boolean = false,
 )
 
 /**
