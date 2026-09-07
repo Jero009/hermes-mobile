@@ -8,6 +8,61 @@ import org.junit.Test
 
 class ChatWsEventReducerTest {
     @Test
+    fun unbindableClarifyRequestsDoNotReplaceAnExistingPromptOrItsDraftIdentity() {
+        val existing =
+            ClarifyUi(
+                text = "Valid question",
+                options = listOf("Keep this draft"),
+                clarifyId = "valid-request",
+                questionId = "draft-question",
+                sessionId = "session-1",
+                sourceProfileId = "profile-a",
+                connectionGeneration = 8,
+            )
+        val state = ChatUiState(currentSessionId = "session-1", clarifyRequest = existing)
+        val invalidEvents =
+            listOf(
+                WsEvent.ClarifyRequest(
+                    "Invalid",
+                    emptyList(),
+                    "",
+                    "session-1",
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 8,
+                ),
+                WsEvent.ClarifyRequest(
+                    "Invalid",
+                    emptyList(),
+                    "new-request",
+                    "",
+                    sourceProfileId = "profile-a",
+                    connectionGeneration = 8,
+                ),
+                WsEvent.ClarifyRequest(
+                    "Invalid",
+                    emptyList(),
+                    "new-request",
+                    "session-1",
+                    sourceProfileId = "",
+                    connectionGeneration = 8,
+                ),
+                WsEvent.ClarifyRequest(
+                    "Invalid",
+                    emptyList(),
+                    "new-request",
+                    "session-1",
+                    sourceProfileId = "profile-a",
+                ),
+            )
+
+        invalidEvents.forEach { event ->
+            val result = ChatWsEventReducer.reduce(state, StreamingState(), event, "session-1")
+
+            assertEquals(existing, result.state.clarifyRequest)
+        }
+    }
+
+    @Test
     fun staleClarifyExpiryFromOldSocketDoesNotClearReusedRequestId() {
         val clarify =
             ClarifyUi(

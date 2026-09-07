@@ -622,9 +622,11 @@ object HermesWsClient {
             val deferred = CompletableDeferred<Any?>()
             val ws = webSocket
             if (!appInForeground.get() || !connected.get() || ws == null ||
+                binding.runtimeSessionId.isBlank() ||
                 binding.connectionGeneration != activeConnectionGeneration ||
                 binding.profileId != activeConnectionProfileId ||
-                binding.profileId != AuthManager.getSelectedProfileId()
+                binding.profileId != AuthManager.getSelectedProfileId() ||
+                ActiveSessionHolder.activeSessionId.value != binding.runtimeSessionId
             ) {
                 deferred.completeExceptionally(HermesRpcException("Privileged request is no longer active"))
                 return@synchronized deferred
@@ -846,11 +848,15 @@ object HermesWsClient {
         sourceConnectionGeneration: Int,
     ): Boolean =
         synchronized(connectionLock) {
+            val ws = webSocket
             if (!appInForeground.get() ||
                 !connected.get() ||
+                ws == null ||
+                sessionId.isBlank() ||
                 sourceConnectionGeneration != activeConnectionGeneration ||
                 sourceProfileId != activeConnectionProfileId ||
-                sourceProfileId != AuthManager.getSelectedProfileId()
+                sourceProfileId != AuthManager.getSelectedProfileId() ||
+                ActiveSessionHolder.activeSessionId.value != sessionId
             ) {
                 return@synchronized false
             }
@@ -870,7 +876,7 @@ object HermesWsClient {
                     method = WsMethods.CLARIFY_RESPOND,
                     params = params.mapValues { it.value.toJsonElement() },
                 )
-            webSocket?.send(OkHttpProvider.json.encodeToString(request)) == true
+            ws.send(OkHttpProvider.json.encodeToString(request))
         }
 
     /** Start an idle-close recovery without reopening a credential boundary. */

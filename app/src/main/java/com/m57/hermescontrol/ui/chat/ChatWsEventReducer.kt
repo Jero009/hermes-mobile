@@ -25,6 +25,16 @@ object ChatWsEventReducer {
         event: WsEvent,
         currentSessionId: String? = null,
     ): ReducerResult {
+        if (event is WsEvent.ClarifyRequest &&
+            (
+                event.clarifyId.isNullOrBlank() ||
+                    event.sessionId.isNullOrBlank() ||
+                    event.sourceProfileId.isNullOrBlank() ||
+                    event.connectionGeneration == null
+            )
+        ) {
+            return ReducerResult(state = state, streamingState = streamingState)
+        }
         val eventSessionId =
             when (event) {
                 is WsEvent.MessageStart -> event.sessionId

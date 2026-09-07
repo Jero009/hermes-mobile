@@ -221,8 +221,10 @@ class EventParserTest {
                 params =
                     mapOf(
                         "type" to "clarify.request",
+                        "session_id" to "session-1",
                         "payload" to
                             mapOf(
+                                "request_id" to "request-1",
                                 "text" to "Select option?",
                                 "options" to listOf("Yes", "No"),
                             ),
@@ -247,8 +249,10 @@ class EventParserTest {
                 params =
                     mapOf(
                         "type" to "clarify.request",
+                        "session_id" to "session-1",
                         "payload" to
                             mapOf(
+                                "request_id" to "request-1",
                                 "question" to "Which environment?",
                                 "choices" to listOf("staging", "production"),
                             ),
@@ -303,6 +307,28 @@ class EventParserTest {
         assertEquals(listOf("language", "target"), event.questions.map { it.qid })
         assertTrue(event.questions.first().multiSelect)
         assertFalse(event.questions.last().multiSelect)
+    }
+
+    @Test
+    fun clarifyRequestWithoutExactRequestAndSessionBindingIsRejected() {
+        val invalidBindings =
+            listOf(
+                null to "session-1",
+                "" to "session-1",
+                "request-1" to null,
+                "request-1" to " ",
+            )
+
+        invalidBindings.forEach { (requestId, sessionId) ->
+            val payload = mutableMapOf<String, Any>("question" to "Must not render")
+            requestId?.let { payload["request_id"] = it }
+            val params = mutableMapOf<String, Any>("type" to "clarify.request", "payload" to payload)
+            sessionId?.let { params["session_id"] = it }
+
+            val event = EventParser.parse(createJsonRpcResponse("2.0", null, null, null, "event", params))
+
+            assertTrue(event is WsEvent.Unknown)
+        }
     }
 
     @Test

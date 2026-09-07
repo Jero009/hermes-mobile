@@ -124,6 +124,7 @@ object EventParser {
             }
 
             "clarify.request" -> {
+                val clarifySessionId = privilegedSessionId ?: return WsEvent.Unknown(rawJson)
                 // Gateway sends "question"/"choices" — fall back to "text"/"options" for any
                 // older client or test that still uses the legacy field names. (Issue #206)
                 val text =
@@ -132,7 +133,7 @@ object EventParser {
                 val rawOptions =
                     payload?.get("choices")
                         ?: payload?.get("options")
-                val clarifyId = payload?.get("clarify_id") as? String ?: payload?.get("request_id") as? String
+                val clarifyId = exactClarifyRequestId(payload) ?: return WsEvent.Unknown(rawJson)
                 val questionId = payload?.get("qid") as? String ?: payload?.get("question_id") as? String
                 val multiSelect = payload?.get("multi_select") as? Boolean ?: false
 
@@ -152,7 +153,7 @@ object EventParser {
                                 multiSelect = question["multi_select"] as? Boolean ?: false,
                             )
                         }
-                WsEvent.ClarifyRequest(text, options, clarifyId, sessionId, questionId, multiSelect, questions)
+                WsEvent.ClarifyRequest(text, options, clarifyId, clarifySessionId, questionId, multiSelect, questions)
             }
 
             "clarify.expire" -> {
@@ -271,6 +272,11 @@ object EventParser {
      */
     private fun privilegedRequestId(payload: Map<String, Any?>?): String? =
         (payload?.get("request_id") as? String)?.takeIf { it.isNotBlank() }
+
+    /** Require one non-blank clarification request id from either supported alias. */
+    private fun exactClarifyRequestId(payload: Map<String, Any?>?): String? =
+        ((payload?.get("clarify_id") as? String) ?: (payload?.get("request_id") as? String))
+            ?.takeIf { it.isNotBlank() }
 
     /** Require one non-blank runtime session, with no conflicting payload alias. */
     private fun exactPrivilegedSessionId(
