@@ -1,5 +1,6 @@
 package com.m57.hermescontrol.ui.chat
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -16,12 +17,7 @@ object SpeechInputHelper {
             @Suppress("DEPRECATION")
             packageManager.queryIntentActivities(intent, 0)
         },
-        queryModern: (PackageManager, Intent) -> List<ResolveInfo?> = { packageManager, intent ->
-            packageManager.queryIntentActivities(
-                intent,
-                PackageManager.ResolveInfoFlags.of(0L),
-            )
-        },
+        queryModern: (PackageManager, Intent) -> List<ResolveInfo?> = ::queryModernActivities,
     ): Boolean {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
         val activities: List<ResolveInfo?> =
@@ -35,4 +31,14 @@ object SpeechInputHelper {
 
         return activities.any { it != null }
     }
+
+    @SuppressLint("NewApi")
+    private fun queryModernActivities(
+        packageManager: PackageManager,
+        intent: Intent,
+    ): List<ResolveInfo?> =
+        packageManager.queryIntentActivities(
+            intent,
+            PackageManager.ResolveInfoFlags.of(0L),
+        )
 }
