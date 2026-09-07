@@ -2,6 +2,10 @@ package com.m57.hermescontrol.ui.chat
 
 import com.m57.hermescontrol.data.local.ChatMessageDao
 import com.m57.hermescontrol.data.local.ChatMessageEntity
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -14,6 +18,147 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
 class ChatPersistenceRepositoryTest {
+    @Test
+    fun earlierRegisteredWriteCompletesBeforeLaterReplacement() =
+        runBlocking {
+            val firstRegistered = CompletableDeferred<Unit>()
+            val releaseFirst = CompletableDeferred<Unit>()
+            val secondRegistered = CompletableDeferred<Unit>()
+            var registration = 0
+            val dao = RacingDao()
+            val repository =
+                ChatPersistenceRepository(
+                    dao = dao,
+                    operationRegistrationHook =
+                        OperationRegistrationHook {
+                            when (++registration) {
+                                1 -> {
+                                    firstRegistered.complete(Unit)
+                                    releaseFirst.await()
+                                }
+                                2 -> secondRegistered.complete(Unit)
+                            }
+                        },
+                )
+
+            val earlierWrite = async { repository.persistMessage(message("earlier"), "session-a") }
+            firstRegistered.await()
+            val laterReplacement =
+                async {
+                    repository.replaceMessagesIfCurrent(
+                        listOf(message("replacement")),
+                        "session-a",
+                        repository.replacementGeneration(),
+                    )
+                }
+            secondRegistered.await()
+
+            assertEquals(emptyList<String>(), dao.contents("session-a"))
+            releaseFirst.complete(Unit)
+            earlierWrite.await()
+            assertTrue(laterReplacement.await())
+            assertEquals(listOf("replacement"), dao.contents("session-a"))
+            assertEquals(0, repository.queuedSessionCount())
+        }
+
+    @Test
+    fun cancelledOperationDoesNotStrandRegisteredSuccessor() =
+        runBlocking {
+            val firstRegistered = CompletableDeferred<Unit>()
+            val secondRegistered = CompletableDeferred<Unit>()
+            var registration = 0
+            val dao = RacingDao()
+            val repository =
+                ChatPersistenceRepository(
+                    dao = dao,
+                    operationRegistrationHook =
+                        OperationRegistrationHook {
+                            when (++registration) {
+                                1 -> {
+                                    firstRegistered.complete(Unit)
+                                    awaitCancellation()
+                                }
+                                2 -> secondRegistered.complete(Unit)
+                            }
+                        },
+                )
+
+            val cancelled = async { repository.persistMessage(message("cancelled"), "session-a") }
+            firstRegistered.await()
+            val successor = async { repository.persistMessage(message("successor"), "session-a") }
+            secondRegistered.await()
+            cancelled.cancel()
+            try {
+                cancelled.await()
+            } catch (_: CancellationException) {
+                // Expected: cancellation belongs to this caller only.
+            }
+            successor.await()
+
+            assertEquals(listOf("successor"), dao.contents("session-a"))
+            assertEquals(0, repository.queuedSessionCount())
+        }
+
+    @Test
+    fun cancelledWaiterDoesNotLetSuccessorOvertakeUnfinishedPredecessor() =
+        runBlocking {
+            val registrations = List(3) { CompletableDeferred<Unit>() }
+            val releasePredecessor = CompletableDeferred<Unit>()
+            var registration = 0
+            val dao = RacingDao()
+            val repository =
+                ChatPersistenceRepository(
+                    dao = dao,
+                    operationRegistrationHook =
+                        OperationRegistrationHook {
+                            val index = registration++
+                            registrations[index].complete(Unit)
+                            if (index == 0) releasePredecessor.await()
+                        },
+                )
+
+            val predecessor = async { repository.persistMessage(message("predecessor"), "session-a") }
+            registrations[0].await()
+            val cancelledWaiter = async { repository.persistMessage(message("cancelled"), "session-a") }
+            registrations[1].await()
+            val successor = async { repository.persistMessage(message("successor"), "session-a") }
+            registrations[2].await()
+
+            cancelledWaiter.cancel()
+            assertFalse(successor.isCompleted)
+            assertEquals(emptyList<String>(), dao.contents("session-a"))
+
+            releasePredecessor.complete(Unit)
+            predecessor.await()
+            try {
+                cancelledWaiter.await()
+            } catch (_: CancellationException) {
+                // Expected: its queue link remains until the predecessor finishes.
+            }
+            successor.await()
+
+            assertEquals(listOf("predecessor", "successor"), dao.contents("session-a"))
+            assertEquals(0, repository.queuedSessionCount())
+        }
+
+    @Test
+    fun failedOperationPropagatesAndQueueContinues() =
+        runBlocking {
+            val dao = RacingDao(failContent = "fails")
+            val repository = ChatPersistenceRepository(dao)
+
+            try {
+                repository.persistMessage(message("fails"), "session-a")
+                throw AssertionError("Expected operation failure")
+            } catch (error: IllegalStateException) {
+                assertEquals("planned failure", error.message)
+            }
+            repository.persistMessage(message("successor"), "session-a")
+
+            assertEquals(listOf("successor"), dao.contents("session-a"))
+            assertEquals(0, repository.queuedSessionCount())
+        }
+
     @Test
     fun writeStartedBeforeReplacementCannotResurrectMessage() {
         val dao = RacingDao(blockContent = "stale")
@@ -210,6 +355,7 @@ class ChatPersistenceRepositoryTest {
     private class RacingDao(
         private val blockContent: String? = null,
         private val blockReplacement: Boolean = false,
+        private val failContent: String? = null,
     ) : ChatMessageDao {
         private val messages = ConcurrentHashMap<String, MutableList<ChatMessageEntity>>()
         val blockedWriteStarted = CountDownLatch(1)
@@ -224,11 +370,13 @@ class ChatPersistenceRepositoryTest {
 
         override suspend fun upsert(message: ChatMessageEntity) {
             blockWriteIfNeeded(listOf(message))
+            failIfNeeded(listOf(message))
             store(listOf(message))
         }
 
         override fun upsertAll(messages: List<ChatMessageEntity>) {
             blockWriteIfNeeded(messages)
+            failIfNeeded(messages)
             store(messages)
         }
 
@@ -255,6 +403,10 @@ class ChatPersistenceRepositoryTest {
                 blockedWriteStarted.countDown()
                 assertTrue(allowBlockedWrite.await(5, TimeUnit.SECONDS))
             }
+        }
+
+        private fun failIfNeeded(messages: List<ChatMessageEntity>) {
+            if (messages.any { it.content == failContent }) throw IllegalStateException("planned failure")
         }
 
         private fun store(newMessages: List<ChatMessageEntity>) {

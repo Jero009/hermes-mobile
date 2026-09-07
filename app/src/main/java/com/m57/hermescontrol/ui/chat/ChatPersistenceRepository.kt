@@ -3,7 +3,13 @@ package com.m57.hermescontrol.ui.chat
 import com.m57.hermescontrol.data.local.ChatMessageDao
 import com.m57.hermescontrol.data.local.toEntity
 import com.m57.hermescontrol.data.local.toUiModel
-import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+
+internal fun interface OperationRegistrationHook {
+    suspend fun afterRegistration(sessionId: String)
+}
 
 /**
  * Wraps Room DAO operations for chat message persistence.
@@ -11,39 +17,41 @@ import kotlinx.coroutines.sync.Mutex
  * Extracted from ChatViewModel to separate persistence concerns from
  * UI state management and WebSocket event handling.
  */
-open class ChatPersistenceRepository(
+open class ChatPersistenceRepository internal constructor(
     private val dao: ChatMessageDao,
+    private val operationRegistrationHook: OperationRegistrationHook,
 ) {
+    constructor(dao: ChatMessageDao) : this(dao, OperationRegistrationHook {})
+
     private val replacementLock = Any()
-    private val sessionWriteLocks = mutableMapOf<String, SessionWriteLock>()
+    private val operationTails = mutableMapOf<String, CompletableDeferred<Unit>>()
     private var replacementGeneration = 0L
 
-    private class SessionWriteLock(
-        val mutex: Mutex = Mutex(),
-        var users: Int = 0,
-    )
-
-    private suspend fun <T> withSessionWriteLock(
+    private suspend fun <T> enqueueSessionOperation(
         sessionId: String,
         action: suspend () -> T,
     ): T {
-        val sessionLock =
-            synchronized(sessionWriteLocks) {
-                sessionWriteLocks.getOrPut(sessionId) { SessionWriteLock() }.also { it.users++ }
+        val completion = CompletableDeferred<Unit>()
+        val predecessor =
+            synchronized(operationTails) {
+                operationTails.put(sessionId, completion)
             }
-        var acquired = false
         try {
-            sessionLock.mutex.lock()
-            acquired = true
+            operationRegistrationHook.afterRegistration(sessionId)
+            predecessor?.await()
             return action()
         } finally {
-            if (acquired) sessionLock.mutex.unlock()
-            synchronized(sessionWriteLocks) {
-                sessionLock.users--
-                if (sessionLock.users == 0) sessionWriteLocks.remove(sessionId, sessionLock)
+            withContext(NonCancellable) {
+                predecessor?.await()
+                completion.complete(Unit)
+                synchronized(operationTails) {
+                    operationTails.remove(sessionId, completion)
+                }
             }
         }
     }
+
+    internal fun queuedSessionCount(): Int = synchronized(operationTails) { operationTails.size }
 
     fun replacementGeneration(): Long = synchronized(replacementLock) { replacementGeneration }
 
@@ -56,7 +64,7 @@ open class ChatPersistenceRepository(
         message: ChatMessage,
         sessionId: String,
     ) {
-        withSessionWriteLock(sessionId) {
+        enqueueSessionOperation(sessionId) {
             dao.upsert(message.toEntity(sessionId))
         }
     }
@@ -66,7 +74,7 @@ open class ChatPersistenceRepository(
         messages: List<ChatMessage>,
         sessionId: String,
     ) {
-        withSessionWriteLock(sessionId) {
+        enqueueSessionOperation(sessionId) {
             val entities = messages.map { it.toEntity(sessionId) }
             dao.upsertAll(entities)
         }
@@ -81,7 +89,7 @@ open class ChatPersistenceRepository(
         sessionId: String,
         expectedGeneration: Long,
     ): Boolean =
-        withSessionWriteLock(sessionId) {
+        enqueueSessionOperation(sessionId) {
             synchronized(replacementLock) {
                 if (replacementGeneration != expectedGeneration) return@synchronized false
                 dao.replaceMessagesForSession(sessionId, messages.map { it.toEntity(sessionId) })
