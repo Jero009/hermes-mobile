@@ -3,6 +3,7 @@ package com.m57.hermescontrol.ui.chat
 import com.m57.hermescontrol.data.local.ChatMessageDao
 import com.m57.hermescontrol.data.local.toEntity
 import com.m57.hermescontrol.data.local.toUiModel
+import kotlinx.coroutines.sync.Mutex
 
 /**
  * Wraps Room DAO operations for chat message persistence.
@@ -14,7 +15,35 @@ open class ChatPersistenceRepository(
     private val dao: ChatMessageDao,
 ) {
     private val replacementLock = Any()
+    private val sessionWriteLocks = mutableMapOf<String, SessionWriteLock>()
     private var replacementGeneration = 0L
+
+    private class SessionWriteLock(
+        val mutex: Mutex = Mutex(),
+        var users: Int = 0,
+    )
+
+    private suspend fun <T> withSessionWriteLock(
+        sessionId: String,
+        action: suspend () -> T,
+    ): T {
+        val sessionLock =
+            synchronized(sessionWriteLocks) {
+                sessionWriteLocks.getOrPut(sessionId) { SessionWriteLock() }.also { it.users++ }
+            }
+        var acquired = false
+        try {
+            sessionLock.mutex.lock()
+            acquired = true
+            return action()
+        } finally {
+            if (acquired) sessionLock.mutex.unlock()
+            synchronized(sessionWriteLocks) {
+                sessionLock.users--
+                if (sessionLock.users == 0) sessionWriteLocks.remove(sessionId, sessionLock)
+            }
+        }
+    }
 
     fun replacementGeneration(): Long = synchronized(replacementLock) { replacementGeneration }
 
@@ -27,7 +56,9 @@ open class ChatPersistenceRepository(
         message: ChatMessage,
         sessionId: String,
     ) {
-        dao.upsert(message.toEntity(sessionId))
+        withSessionWriteLock(sessionId) {
+            dao.upsert(message.toEntity(sessionId))
+        }
     }
 
     /** Persist multiple messages in one transaction. */
@@ -35,8 +66,10 @@ open class ChatPersistenceRepository(
         messages: List<ChatMessage>,
         sessionId: String,
     ) {
-        val entities = messages.map { it.toEntity(sessionId) }
-        dao.upsertAll(entities)
+        withSessionWriteLock(sessionId) {
+            val entities = messages.map { it.toEntity(sessionId) }
+            dao.upsertAll(entities)
+        }
     }
 
     /** Load cached messages for a session from Room. */
@@ -48,9 +81,11 @@ open class ChatPersistenceRepository(
         sessionId: String,
         expectedGeneration: Long,
     ): Boolean =
-        synchronized(replacementLock) {
-            if (replacementGeneration != expectedGeneration) return@synchronized false
-            dao.replaceMessagesForSession(sessionId, messages.map { it.toEntity(sessionId) })
-            true
+        withSessionWriteLock(sessionId) {
+            synchronized(replacementLock) {
+                if (replacementGeneration != expectedGeneration) return@synchronized false
+                dao.replaceMessagesForSession(sessionId, messages.map { it.toEntity(sessionId) })
+                true
+            }
         }
 }
