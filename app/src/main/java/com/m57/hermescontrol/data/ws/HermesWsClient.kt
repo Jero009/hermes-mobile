@@ -59,19 +59,18 @@ internal data class SourcedWsEvent(
     val storedSessionId: String? = null,
 )
 
-
 data class PrivilegedRequestBinding(
     val requestId: String,
     val runtimeSessionId: String,
     val profileId: String,
     val connectionGeneration: Int,
+)
 
 /** Immutable identity of one live WebSocket connection. */
 class ConnectionBinding internal constructor(
     val profileId: String,
     val generation: Int,
     internal val socket: WebSocket,
-
 )
 
 /**
@@ -600,8 +599,6 @@ object HermesWsClient {
             deferred
         }
 
-
-
     /**
      * Answer or cancel exactly one privileged gateway request.
      *
@@ -653,6 +650,7 @@ object HermesWsClient {
                     }
             }
             deferred
+        }
 
     /** Capture the exact live profile/socket identity for a later bound request. */
     fun connectionBinding(expectedProfileId: String): ConnectionBinding? =
@@ -698,7 +696,6 @@ object HermesWsClient {
                 }
             }
             request(method, params, timeoutMs)
-
         }
 
     /** Complete (or fail) a single pending call and cancel its timer. */

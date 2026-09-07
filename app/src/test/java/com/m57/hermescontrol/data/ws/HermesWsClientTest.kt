@@ -305,7 +305,6 @@ class HermesWsClientTest {
         assertTrue(HermesWsClient.isConnected)
     }
 
-
     // ── Privileged sends (hermes-agent d90045be2 / a77692158) ────────────
     //
     // A privileged frame is never queued, never retried, and never replayed
@@ -563,6 +562,7 @@ class HermesWsClientTest {
         val secretExpire = received.filterIsInstance<WsEvent.SecretExpire>().first()
         assertEquals("profile-a", secretExpire.sourceProfileId)
         assertEquals(generation, secretExpire.connectionGeneration)
+    }
 
     @Test
     fun testConnectionBoundRequestRefusesWrongProfileBeforeSocketWrite() {
@@ -573,7 +573,6 @@ class HermesWsClientTest {
         assertEquals(null, HermesWsClient.connectionBinding("profile-b"))
         verify(exactly = 0) { socket.send(any<String>()) }
         assertTrue(pendingCalls().isEmpty())
-
     }
 
     @Test
