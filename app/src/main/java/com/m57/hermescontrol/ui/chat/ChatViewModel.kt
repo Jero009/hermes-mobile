@@ -1420,7 +1420,8 @@ class ChatViewModel(
         fence.generation == conversationGeneration &&
             fence.profileId == selectedProfileId() &&
             fence.storageSessionId == _uiState.value.currentSessionId &&
-            fence.runtimeSessionId == runtimeSessionId
+            fence.runtimeSessionId == runtimeSessionId &&
+            wsClient.isConnectionBindingCurrent(fence.connectionBinding)
 
     private suspend fun handleUndoResult(
         result: Any?,
@@ -1459,6 +1460,7 @@ class ChatViewModel(
         while (true) {
             if (!isUndoFenceCurrent(fence)) return null
             val result = fetchMessagePage(fence.storageSessionId, offset, MESSAGE_PAGE_SIZE, order = "latest")
+            if (!isUndoFenceCurrent(fence)) return null
             if (result !is NetworkResult.Success) return null
             val pagination = result.data.pagination
             val effectiveOffset = pagination?.offset ?: offset
@@ -1473,7 +1475,7 @@ class ChatViewModel(
             }
             offset = effectiveOffset + returned
         }
-        return pages.asReversed().flatten().distinctBy { it.id }
+        return if (isUndoFenceCurrent(fence)) pages.asReversed().flatten().distinctBy { it.id } else null
     }
 
     fun consumePendingPrefill() {

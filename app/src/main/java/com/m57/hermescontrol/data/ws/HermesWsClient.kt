@@ -669,6 +669,15 @@ object HermesWsClient {
             }
         }
 
+    /** Synchronously validate that [binding] still identifies the exact live socket. */
+    fun isConnectionBindingCurrent(binding: ConnectionBinding): Boolean =
+        synchronized(connectionLock) {
+            connected.get() &&
+                webSocket === binding.socket &&
+                activeConnectionProfileId == binding.profileId &&
+                activeConnectionGeneration == binding.generation &&
+                binding.generation == connectionGeneration.get()
+        }
 
     /** Atomically refuse requests captured for a superseded profile/socket. */
     fun requestForConnection(

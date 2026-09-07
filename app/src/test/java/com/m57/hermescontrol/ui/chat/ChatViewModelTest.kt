@@ -142,6 +142,7 @@ class ChatViewModelTest {
         every { HermesWsClient.request(WsMethods.CONFIG_SET, any(), any()) } returns
             CompletableDeferred<Any?>(mapOf("ok" to true))
         every { HermesWsClient.connectionBinding("profile-a") } returns mockk()
+        every { HermesWsClient.isConnectionBindingCurrent(any()) } returns true
         every { HermesWsClient.requestForConnection(any(), any(), any(), any()) } returns
             CompletableDeferred<Any?>(mapOf("ok" to true))
 
@@ -332,6 +333,81 @@ class ChatViewModelTest {
 
             assertNull(viewModel.uiState.value.pendingPrefillText)
             assertFalse(viewModel.uiState.value.messages.any { it.content == "stale" })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "/undo" })
+        }
+
+    @Test
+    fun testUndoCommand_socketGenerationChangeBeforeResultIsInertWithoutStatusUpdate() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+            var messagePageCalls = 0
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), any(), any()) } answers {
+                messagePageCalls++
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(messages = emptyList()),
+                )
+            }
+
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            every { HermesWsClient.isConnectionBindingCurrent(any()) } returns false
+            undoResult.complete(mapOf("type" to "prefill", "message" to "stale", "notice" to "stale"))
+            advanceUntilIdle()
+
+            assertEquals(ConnectionStatus.CONNECTED, mockConnectionStatus.value)
+            assertNull(viewModel.uiState.value.pendingPrefillText)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale" })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "/undo" })
+            assertEquals(0, messagePageCalls)
+        }
+
+    @Test
+    fun testUndoCommand_socketGenerationChangeDuringPaginationStopsBeforeReplacement() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+            var messagePageCalls = 0
+            coEvery { mockApi.getSessionMessages(sessionId, any(), any(), true, "latest") } answers {
+                messagePageCalls++
+                every { HermesWsClient.isConnectionBindingCurrent(any()) } returns false
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 20,
+                                    role = "assistant",
+                                    content = "stale page",
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                limit = 150,
+                                offset = 0,
+                                order = "latest",
+                                returned = 150,
+                                total = 300,
+                            ),
+                    ),
+                )
+            }
+
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            undoResult.complete(mapOf("type" to "prefill", "message" to "stale", "notice" to "stale"))
+            advanceUntilIdle()
+
+            assertEquals(ConnectionStatus.CONNECTED, mockConnectionStatus.value)
+            assertEquals(1, messagePageCalls)
+            assertNull(viewModel.uiState.value.pendingPrefillText)
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale page" || it.content == "stale" })
             assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "/undo" })
         }
 
