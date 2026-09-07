@@ -331,6 +331,11 @@ class ChatViewModel(
 
     @Volatile private var activeHistoryRefreshOwner: Long? = null
     private var historyRefreshJob: Job? = null
+    private var cacheLoadCounter = 0L
+
+    @Volatile private var activeCacheLoadOwner: Long? = null
+    private var cacheLoadJob: Job? = null
+    private var activeCacheMessageIds: Set<String> = emptySet()
     private var olderLoadCounter = 0L
 
     @Volatile private var activeOlderLoadOwner: Long? = null
@@ -1447,6 +1452,31 @@ class ChatViewModel(
         val transcriptRevision: Long,
     )
 
+    private data class CacheLoadFence(
+        val storageSessionId: String,
+        val runtimeSessionId: String?,
+        val profileId: String,
+        val generation: Long,
+    )
+
+    private fun captureCacheLoadFence(sessionId: String) =
+        CacheLoadFence(
+            storageSessionId = sessionId,
+            runtimeSessionId = runtimeSessionId,
+            profileId = selectedProfileId(),
+            generation = conversationGeneration,
+        )
+
+    private fun isCacheLoadCurrent(
+        fence: CacheLoadFence,
+        owner: Long,
+    ): Boolean =
+        activeCacheLoadOwner == owner &&
+            fence.generation == conversationGeneration &&
+            fence.profileId == selectedProfileId() &&
+            fence.storageSessionId == _uiState.value.currentSessionId &&
+            fence.runtimeSessionId == runtimeSessionId
+
     private fun captureHistoryLoadFence(sessionId: String): HistoryLoadFence? {
         val profileId = selectedProfileId()
         val connectionBinding = wsClient.connectionBinding(profileId) ?: return null
@@ -1475,10 +1505,19 @@ class ChatViewModel(
 
     private fun invalidateHistoryRefresh() {
         retireSync()
+        retireCacheLoad()
         activeHistoryRefreshOwner = null
         historyRefreshCounter++
         historyRefreshJob?.cancel()
         historyRefreshJob = null
+    }
+
+    private fun retireCacheLoad() {
+        activeCacheLoadOwner = null
+        cacheLoadCounter++
+        cacheLoadJob?.cancel()
+        cacheLoadJob = null
+        activeCacheMessageIds = emptySet()
     }
 
     private fun launchHistoryLoad(block: suspend () -> Unit): Job {
@@ -2345,23 +2384,29 @@ class ChatViewModel(
         }
     }
 
-    private fun loadCachedMessages(sessionId: String): Job? {
-        val fence = captureHistoryLoadFence(sessionId) ?: return null
-        return launchHistoryLoad {
-            val cachedMessages = repo.loadMessages(sessionId)
-            _uiState.update { state ->
-                // Only replace if this exact transcript load is still current.
-                if (isHistoryLoadFenceCurrent(fence)) {
-                    state.copy(
-                        messages = cachedMessages,
-                        todos = restoredTodos(state.todos, cachedMessages),
-                        isLoading = false,
-                    )
-                } else {
-                    state
+    private fun loadCachedMessages(sessionId: String) {
+        val fence = captureCacheLoadFence(sessionId)
+        val owner = ++cacheLoadCounter
+        activeCacheLoadOwner = owner
+        cacheLoadJob?.cancel()
+        cacheLoadJob =
+            launchHistoryLoad {
+                val cachedMessages = repo.loadMessages(sessionId)
+                _uiState.update { state ->
+                    // Cache is only a blank-transcript fallback. A live, resume,
+                    // or server mutation that wins the race owns the transcript.
+                    if (isCacheLoadCurrent(fence, owner) && state.messages.isEmpty()) {
+                        activeCacheMessageIds = cachedMessages.mapTo(mutableSetOf()) { it.id }
+                        state.copy(
+                            messages = cachedMessages,
+                            todos = restoredTodos(state.todos, cachedMessages),
+                        )
+                    } else {
+                        state
+                    }
                 }
+                if (activeCacheLoadOwner == owner) cacheLoadJob = null
             }
-        }
     }
 
     private fun loadSessionMessages(sessionId: String) {
@@ -2373,7 +2418,10 @@ class ChatViewModel(
         val owner = ++historyRefreshCounter
         activeHistoryRefreshOwner = owner
         historyRefreshJob?.cancel()
+        retireCacheLoad()
+        val baselineMessageIds = _uiState.value.messages.mapTo(mutableSetOf()) { it.id }
         _uiState.update { it.copy(isLoading = true, errorMessage = null) }
+        loadCachedMessages(sessionId)
         historyRefreshJob =
             launchHistoryLoad {
                 try {
@@ -2434,12 +2482,22 @@ class ChatViewModel(
                                     }
                                 }
                             if (!persisted || !isHistoryRefreshCurrent(fence, owner)) return@launchHistoryLoad
+                            val cachedMessageIds = activeCacheMessageIds
+                            retireCacheLoad()
                             _uiState.update { state ->
                                 if (!isHistoryRefreshCurrent(fence, owner)) return@update state
                                 val hasResumeHistory = state.messages.any { it.id.startsWith("resume-$sessionId-") }
                                 if (chatMessages.isEmpty() && hasResumeHistory) {
                                     state.copy(isLoading = false, isLoadingOlder = false)
                                 } else {
+                                    val authoritativeIds = chatMessages.mapTo(mutableSetOf()) { it.id }
+                                    val newerMessages =
+                                        state.messages.filter { message ->
+                                            message.id !in baselineMessageIds &&
+                                                message.id !in cachedMessageIds &&
+                                                message.id !in authoritativeIds
+                                        }
+                                    val refreshedMessages = chatMessages + newerMessages
                                     val hasOlder =
                                         if (useLatestPaging) {
                                             val returned = result.data.pagination?.returned ?: chatMessages.size
@@ -2448,8 +2506,8 @@ class ChatViewModel(
                                             offset > 0 && chatMessages.isNotEmpty()
                                         }
                                     state.copy(
-                                        messages = chatMessages,
-                                        todos = restoredTodos(state.todos, chatMessages),
+                                        messages = refreshedMessages,
+                                        todos = restoredTodos(state.todos, refreshedMessages),
                                         isLoading = false,
                                         hasOlderMessages = hasOlder,
                                         isLoadingOlder = false,

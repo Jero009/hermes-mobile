@@ -199,6 +199,40 @@ class ChatViewModelTest {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
+    private fun cachedEntity(
+        sessionId: String,
+        content: String,
+        id: String = "cache-$content",
+    ) = ChatMessageEntity(
+        id = id,
+        sessionId = sessionId,
+        role = "assistant",
+        content = content,
+        timestamp = 1L,
+    )
+
+    private fun serverMessages(content: String) =
+        retrofit2.Response.success(
+            com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                messages =
+                    listOf(
+                        com.m57.hermescontrol.data.model.SessionMessage(
+                            id = 1,
+                            role = "assistant",
+                            content = content,
+                        ),
+                    ),
+                pagination =
+                    com.m57.hermescontrol.data.model.SessionMessagePagination(
+                        limit = 150,
+                        offset = 0,
+                        order = "latest",
+                        returned = 1,
+                        total = 1,
+                    ),
+            ),
+        )
+
     /** Create a ViewModel with the fake repo injected directly. */
     private fun createViewModel(startCleanup: Boolean = false): ChatViewModel =
         ChatViewModel(app, startCleanup, fakeRepo, fakeSlashUsageStore, testDispatcher)
@@ -3343,6 +3377,111 @@ class ChatViewModelTest {
             assertEquals(4, calls)
             assertTrue(viewModel.uiState.value.messages.any { it.content == "post-refresh sync" })
             assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "post-refresh sync" })
+        }
+
+    @Test
+    fun cachedHistorySurvivesViewModelRecreationWhenRefreshIsOffline() =
+        runTest {
+            fakeRepo.dao.addMessageDirect(cachedEntity("offline-session", "cached history"))
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), true, any()) } throws
+                java.io.IOException("offline")
+
+            val recreated = createViewModel()
+            recreated.switchSession("offline-session")
+            advanceUntilIdle()
+
+            assertEquals(listOf("cached history"), recreated.uiState.value.messages.map { it.content })
+            assertFalse(recreated.uiState.value.isLoading)
+            assertTrue(recreated.uiState.value.errorMessage?.contains("Failed to load messages") == true)
+        }
+
+    @Test
+    fun lateCacheCannotReplaceSuccessfulRefresh() =
+        runTest {
+            val releaseCache = CompletableDeferred<Unit>()
+            val delayedRepo =
+                object : FakeChatPersistenceRepository() {
+                    override suspend fun loadMessages(sessionId: String): List<ChatMessage> {
+                        withContext(NonCancellable) { releaseCache.await() }
+                        return listOf(ChatMessage(id = "cached", role = MessageRole.ASSISTANT, content = "stale cache"))
+                    }
+                }
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), true, any()) } returns serverMessages("server")
+            val viewModel = ChatViewModel(app, false, delayedRepo, fakeSlashUsageStore, testDispatcher)
+
+            viewModel.switchSession("session-a")
+            runCurrent()
+            assertEquals(listOf("server"), viewModel.uiState.value.messages.map { it.content })
+            releaseCache.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals(listOf("server"), viewModel.uiState.value.messages.map { it.content })
+        }
+
+    @Test
+    fun lateCacheFromOldSessionAndProfileIsRejected() =
+        runTest {
+            val releaseCache = CompletableDeferred<Unit>()
+            val selectedProfile = MutableStateFlow("profile-a")
+            val delayedRepo =
+                object : FakeChatPersistenceRepository() {
+                    override suspend fun loadMessages(sessionId: String): List<ChatMessage> {
+                        if (sessionId != "session-a") return emptyList()
+                        withContext(NonCancellable) { releaseCache.await() }
+                        return listOf(
+                            ChatMessage(
+                                id = sessionId,
+                                role = MessageRole.ASSISTANT,
+                                content = "stale-$sessionId",
+                            ),
+                        )
+                    }
+                }
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), true, any()) } throws
+                java.io.IOException("offline")
+            val viewModel =
+                ChatViewModel(
+                    app,
+                    false,
+                    delayedRepo,
+                    fakeSlashUsageStore,
+                    testDispatcher,
+                    selectedProfileId = { selectedProfile.value },
+                    selectedProfileIds = selectedProfile,
+                )
+
+            viewModel.switchSession("session-a")
+            runCurrent()
+            viewModel.switchSession("session-b")
+            selectedProfile.value = "profile-b"
+            releaseCache.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals("session-b", viewModel.uiState.value.currentSessionId)
+            assertFalse(viewModel.uiState.value.messages.any { it.content.startsWith("stale-") })
+        }
+
+    @Test
+    fun successfulRefreshSupersedesCacheWithoutLosingNewerLiveMessage() =
+        runTest {
+            val releaseRefresh = CompletableDeferred<Unit>()
+            fakeRepo.dao.addMessageDirect(cachedEntity("session-a", "cached history"))
+            coEvery { mockApi.getSessionMessages(any(), any(), any(), true, any()) } coAnswers {
+                releaseRefresh.await()
+                serverMessages("server").body()!!
+                    .let { retrofit2.Response.success(it) }
+            }
+            val viewModel = createViewModel()
+
+            viewModel.switchSession("session-a")
+            runCurrent()
+            assertEquals(listOf("cached history"), viewModel.uiState.value.messages.map { it.content })
+            mockEventsFlow.emit(WsEvent.MessageComplete("live", sessionId = "session-a"))
+            runCurrent()
+            releaseRefresh.complete(Unit)
+            advanceUntilIdle()
+
+            assertEquals(listOf("server", "live"), viewModel.uiState.value.messages.map { it.content })
         }
 
     @Test

@@ -107,7 +107,7 @@ open class ChatPersistenceRepository internal constructor(
         }
 
     /** Load cached messages for a session from Room. */
-    suspend fun loadMessages(sessionId: String): List<ChatMessage> =
+    open suspend fun loadMessages(sessionId: String): List<ChatMessage> =
         dao.getMessagesForSession(sessionId).map { it.toUiModel() }
 
     suspend fun replaceMessagesIfCurrent(

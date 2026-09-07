@@ -16,7 +16,7 @@ import com.m57.hermescontrol.ui.chat.OperationRegistrationHook
  * val vm = ChatViewModel(app, startCleanup, fakeRepo)
  * ```
  */
-internal class FakeChatPersistenceRepository(
+internal open class FakeChatPersistenceRepository(
     val dao: FakeChatMessageDao = FakeChatMessageDao(),
     operationRegistrationHook: OperationRegistrationHook = OperationRegistrationHook {},
 ) : ChatPersistenceRepository(dao, operationRegistrationHook) {
