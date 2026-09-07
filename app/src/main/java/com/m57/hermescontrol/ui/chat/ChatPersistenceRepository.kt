@@ -23,14 +23,14 @@ open class ChatPersistenceRepository internal constructor(
 ) {
     constructor(dao: ChatMessageDao) : this(dao, OperationRegistrationHook {})
 
-    private class ReplacementFence(var generation: Long = 0L)
+    private class TranscriptRevision(var generation: Long = 0L)
 
-    private val replacementFences = mutableMapOf<String, ReplacementFence>()
+    private val replacementFences = mutableMapOf<String, TranscriptRevision>()
     private val operationTails = mutableMapOf<String, CompletableDeferred<Unit>>()
 
-    private fun replacementFence(sessionId: String): ReplacementFence =
+    private fun replacementFence(sessionId: String): TranscriptRevision =
         synchronized(replacementFences) {
-            replacementFences.getOrPut(sessionId) { ReplacementFence() }
+            replacementFences.getOrPut(sessionId) { TranscriptRevision() }
         }
 
     private suspend fun <T> enqueueSessionOperation(
@@ -86,6 +86,20 @@ open class ChatPersistenceRepository internal constructor(
             dao.upsertAll(entities)
         }
     }
+
+    suspend fun persistMessagesIfCurrent(
+        messages: List<ChatMessage>,
+        sessionId: String,
+        expectedGeneration: Long,
+    ): Boolean =
+        enqueueSessionOperation(sessionId) {
+            val fence = replacementFence(sessionId)
+            synchronized(fence) {
+                if (fence.generation != expectedGeneration) return@synchronized false
+                dao.upsertAll(messages.map { it.toEntity(sessionId) })
+                true
+            }
+        }
 
     /** Load cached messages for a session from Room. */
     suspend fun loadMessages(sessionId: String): List<ChatMessage> =

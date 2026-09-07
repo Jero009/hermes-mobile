@@ -415,6 +415,27 @@ class ChatPersistenceRepositoryTest {
         )
     }
 
+    @Test
+    fun pagedPersistenceRejectsInvalidatedTranscriptRevision() {
+        val dao = RacingDao()
+        val repository = ChatPersistenceRepository(dao)
+        val staleRevision = repository.replacementGeneration("session-a")
+        repository.invalidateReplacementWrites("session-a")
+
+        assertFalse(
+            runBlocking {
+                repository.persistMessagesIfCurrent(listOf(message("stale page")), "session-a", staleRevision)
+            },
+        )
+        val currentRevision = repository.replacementGeneration("session-a")
+        assertTrue(
+            runBlocking {
+                repository.persistMessagesIfCurrent(listOf(message("current page")), "session-a", currentRevision)
+            },
+        )
+        assertEquals(listOf("current page"), dao.contents("session-a"))
+    }
+
     private fun message(content: String) =
         ChatMessage(
             id = content,

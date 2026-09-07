@@ -39,6 +39,7 @@ import io.mockk.verify
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
@@ -49,6 +50,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withContext
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -409,6 +411,91 @@ class ChatViewModelTest {
             assertNull(viewModel.uiState.value.pendingPrefillText)
             assertFalse(viewModel.uiState.value.messages.any { it.content == "stale page" || it.content == "stale" })
             assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "/undo" })
+        }
+
+    @Test
+    fun undoFencesSuspendedRefreshAndOlderPageButAllowsPostUndoRefresh() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val staleRefresh = CompletableDeferred<Unit>()
+            val staleOlder = CompletableDeferred<Unit>()
+            var offsetZeroCalls = 0
+
+            fun page(
+                content: String,
+                offset: Int,
+                returned: Int = 1,
+                total: Int = 1,
+            ) = com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                messages =
+                    listOf(
+                        com.m57.hermescontrol.data.model.SessionMessage(
+                            id = content.hashCode(),
+                            role = "assistant",
+                            content = content,
+                        ),
+                    ),
+                pagination =
+                    com.m57.hermescontrol.data.model.SessionMessagePagination(
+                        limit = 150,
+                        offset = offset,
+                        order = "latest",
+                        returned = returned,
+                        total = total,
+                    ),
+            )
+
+            coEvery { mockApi.getSessionMessages(sessionId, any(), any(), true, "latest") } coAnswers {
+                val offset = arg<Int>(2)
+                val response =
+                    if (offset == 150) {
+                        withContext(NonCancellable) { staleOlder.await() }
+                        page("stale older", offset)
+                    } else {
+                        offsetZeroCalls++
+                        when (offsetZeroCalls) {
+                            1 -> page("initial", 0, returned = 150, total = 300)
+                            2 -> {
+                                withContext(NonCancellable) { staleRefresh.await() }
+                                page("stale refresh", 0)
+                            }
+                            3 -> page("authoritative", 0)
+                            else -> page("post undo", 0)
+                        }
+                    }
+                retrofit2.Response.success(response)
+            }
+            val undoResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.requestForConnection(any(), WsMethods.COMMAND_DISPATCH, any(), any())
+            } returns undoResult
+
+            viewModel.refreshCurrentSession()
+            advanceUntilIdle()
+            assertTrue(viewModel.uiState.value.hasOlderMessages)
+
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            viewModel.loadOlderMessages()
+            runCurrent()
+            viewModel.sendMessage("/undo")
+            runCurrent()
+            undoResult.complete(mapOf("type" to "prefill", "message" to "rewound", "notice" to "undone"))
+            runCurrent()
+
+            assertEquals(listOf("authoritative", "undone"), viewModel.uiState.value.messages.map { it.content })
+            assertEquals(setOf("authoritative", "undone"), fakeRepo.loadMessages(sessionId).map { it.content }.toSet())
+
+            staleRefresh.complete(Unit)
+            staleOlder.complete(Unit)
+            advanceUntilIdle()
+            assertEquals(listOf("authoritative", "undone"), viewModel.uiState.value.messages.map { it.content })
+            assertEquals(setOf("authoritative", "undone"), fakeRepo.loadMessages(sessionId).map { it.content }.toSet())
+
+            viewModel.refreshCurrentSession()
+            advanceUntilIdle()
+            assertEquals(listOf("post undo"), viewModel.uiState.value.messages.map { it.content })
+            assertTrue(fakeRepo.loadMessages(sessionId).any { it.content == "post undo" })
         }
 
     @Test
