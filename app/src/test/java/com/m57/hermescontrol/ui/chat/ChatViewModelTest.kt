@@ -2523,6 +2523,130 @@ class ChatViewModelTest {
             assertFalse(viewModel.uiState.value.isLoadingOlder)
         }
 
+    @Test
+    fun fullRefreshRetiresSuspendedOlderFetchWithoutRoomOrUiPrependAndAllowsNextPage() =
+        runTest {
+            val viewModel = createPaginatedViewModel()
+            val olderFetchStarted = CompletableDeferred<Unit>()
+            val releaseOlderFetch = CompletableDeferred<Unit>()
+            val freshFetchStarted = CompletableDeferred<Unit>()
+            val releaseFreshFetch = CompletableDeferred<Unit>()
+            var olderCalls = 0
+            coEvery { mockApi.getSessionMessages("paged", 150, any(), true, "latest") } coAnswers {
+                val call = ++olderCalls
+                if (call == 1) {
+                    olderFetchStarted.complete(Unit)
+                    withContext(NonCancellable) { releaseOlderFetch.await() }
+                } else {
+                    freshFetchStarted.complete(Unit)
+                    releaseFreshFetch.await()
+                }
+                val content = if (call == 1) "stale older" else "fresh older"
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = call,
+                                    role = "assistant",
+                                    content = content,
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(
+                                limit = 150,
+                                offset = 150,
+                                order = "latest",
+                                returned = if (call == 1) 1 else 150,
+                                total = 300,
+                            ),
+                    ),
+                )
+            }
+            coEvery { mockApi.getSessionMessages("paged", 150, 0, true, "latest") } returns
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 200,
+                                    role = "assistant",
+                                    content = "refreshed recent",
+                                ),
+                            ),
+                        pagination =
+                            com.m57.hermescontrol.data.model.SessionMessagePagination(150, 0, "latest", 150, 300),
+                    ),
+                )
+
+            viewModel.loadOlderMessages()
+            olderFetchStarted.await()
+            viewModel.refreshCurrentSession()
+            runCurrent()
+
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+            assertEquals(listOf("refreshed recent"), viewModel.uiState.value.messages.map { it.content })
+
+            viewModel.loadOlderMessages()
+            freshFetchStarted.await()
+            assertTrue(viewModel.uiState.value.isLoadingOlder)
+            releaseOlderFetch.complete(Unit)
+            runCurrent()
+            assertEquals(listOf("refreshed recent"), viewModel.uiState.value.messages.map { it.content })
+            assertFalse(fakeRepo.loadMessages("paged").any { it.content == "stale older" })
+            assertTrue(viewModel.uiState.value.isLoadingOlder)
+
+            releaseFreshFetch.complete(Unit)
+            advanceUntilIdle()
+            assertTrue(viewModel.uiState.value.messages.any { it.content == "fresh older" })
+            assertTrue(fakeRepo.loadMessages("paged").any { it.content == "fresh older" })
+        }
+
+    @Test
+    fun fullRefreshAtomicallyRejectsOlderPageWaitingInPersistenceFifo() =
+        runTest {
+            val olderPersistenceRegistered = CompletableDeferred<Unit>()
+            val releaseOlderPersistence = CompletableDeferred<Unit>()
+            var suspendNextRegistration = false
+            fakeRepo =
+                FakeChatPersistenceRepository(
+                    operationRegistrationHook = {
+                        if (suspendNextRegistration) {
+                            suspendNextRegistration = false
+                            olderPersistenceRegistered.complete(Unit)
+                            withContext(NonCancellable) { releaseOlderPersistence.await() }
+                        }
+                    },
+                )
+            val viewModel = createPaginatedViewModel()
+            coEvery { mockApi.getSessionMessages("paged", 150, 150, true, "latest") } returns
+                retrofit2.Response.success(
+                    com.m57.hermescontrol.data.model.SessionMessagesResponse(
+                        messages =
+                            listOf(
+                                com.m57.hermescontrol.data.model.SessionMessage(
+                                    id = 50,
+                                    role = "assistant",
+                                    content = "stale persisted older",
+                                ),
+                            ),
+                    ),
+                )
+            suspendNextRegistration = true
+            viewModel.loadOlderMessages()
+            olderPersistenceRegistered.await()
+
+            viewModel.refreshCurrentSession()
+            runCurrent()
+            assertFalse(viewModel.uiState.value.isLoadingOlder)
+            releaseOlderPersistence.complete(Unit)
+            advanceUntilIdle()
+
+            assertFalse(viewModel.uiState.value.messages.any { it.content == "stale persisted older" })
+            assertFalse(fakeRepo.loadMessages("paged").any { it.content == "stale persisted older" })
+            assertEquals(listOf("recent"), viewModel.uiState.value.messages.map { it.content })
+        }
+
     // ── Session switch ───────────────────────────────────────────────────────
 
     @Test

@@ -328,7 +328,9 @@ class ChatViewModel(
     @Volatile private var activeHistoryRefreshOwner: Long? = null
     private var historyRefreshJob: Job? = null
     private var olderLoadCounter = 0L
-    private var activeOlderLoadOwner: Long? = null
+
+    @Volatile private var activeOlderLoadOwner: Long? = null
+    private var olderLoadJob: Job? = null
     val streamingState: StateFlow<StreamingState> = _streamingState.asStateFlow()
 
     /** Tracks the auto-clear coroutine for reaction animations. */
@@ -2359,6 +2361,7 @@ class ChatViewModel(
     private fun loadSessionMessages(sessionId: String) {
         val fence = captureHistoryLoadFence(sessionId) ?: return
         val owner = ++historyRefreshCounter
+        retireOlderLoad()
         activeHistoryRefreshOwner = owner
         historyRefreshJob?.cancel()
         _uiState.update { it.copy(isLoading = true, errorMessage = null) }
@@ -2471,53 +2474,84 @@ class ChatViewModel(
         val newOffset =
             if (latestPaging) oldOffset + MESSAGE_PAGE_SIZE else (oldOffset - MESSAGE_PAGE_SIZE).coerceAtLeast(0)
         val limit = if (latestPaging) MESSAGE_PAGE_SIZE else oldOffset - newOffset
+        val useLatestPaging = latestPaging
         val fence = captureHistoryLoadFence(sessionId) ?: return
         val owner = ++olderLoadCounter
         activeOlderLoadOwner = owner
         _uiState.update { it.copy(isLoadingOlder = true) }
-        launchHistoryLoad {
-            try {
-                val result =
-                    fetchMessagePage(
-                        sessionId,
-                        newOffset,
-                        limit,
-                        order = if (latestPaging) "latest" else null,
-                    )
-                if (result !is NetworkResult.Success || !isHistoryLoadFenceCurrent(fence)) return@launchHistoryLoad
-                val effectiveOffset = result.data.pagination?.offset ?: newOffset
-                val older = mapServerMessages(sessionId, result.data.messages.orEmpty(), effectiveOffset)
-                val persisted =
-                    withContext(Dispatchers.IO) {
-                        repo.persistMessagesIfCurrent(older, sessionId, fence.transcriptRevision)
+        olderLoadJob =
+            launchHistoryLoad {
+                try {
+                    val result =
+                        fetchMessagePage(
+                            sessionId,
+                            newOffset,
+                            limit,
+                            order = if (useLatestPaging) "latest" else null,
+                        )
+                    if (result !is NetworkResult.Success || !isOlderLoadCurrent(fence, owner)) {
+                        return@launchHistoryLoad
                     }
-                if (!persisted || !isHistoryLoadFenceCurrent(fence)) return@launchHistoryLoad
-                _uiState.update { current ->
-                    if (!isHistoryLoadFenceCurrent(fence) || activeOlderLoadOwner != owner) return@update current
-                    loadedMessageOffset = effectiveOffset
-                    val mergedMessages = (older + current.messages).distinctBy { it.id }
-                    val hasOlder =
-                        if (latestPaging) {
-                            val returned = result.data.pagination?.returned ?: older.size
-                            returned >= limit && older.isNotEmpty()
-                        } else {
-                            effectiveOffset > 0 && older.isNotEmpty()
+                    val effectiveOffset = result.data.pagination?.offset ?: newOffset
+                    val older =
+                        mapServerMessages(
+                            sessionId,
+                            result.data.messages.orEmpty(),
+                            effectiveOffset,
+                            useLatestPaging,
+                        )
+                    val persisted =
+                        withContext(Dispatchers.IO) {
+                            repo.persistMessagesIfCurrent(
+                                older,
+                                sessionId,
+                                fence.transcriptRevision,
+                            ) {
+                                isOlderLoadCurrent(fence, owner)
+                            }
                         }
-                    current.copy(
-                        messages = mergedMessages,
-                        todos = restoredTodos(current.todos, mergedMessages),
-                        hasOlderMessages = hasOlder,
-                    )
+                    if (!persisted || !isOlderLoadCurrent(fence, owner)) return@launchHistoryLoad
+                    _uiState.update { current ->
+                        if (!isOlderLoadCurrent(fence, owner)) return@update current
+                        loadedMessageOffset = effectiveOffset
+                        val mergedMessages = (older + current.messages).distinctBy { it.id }
+                        val hasOlder =
+                            if (useLatestPaging) {
+                                val returned = result.data.pagination?.returned ?: older.size
+                                returned >= limit && older.isNotEmpty()
+                            } else {
+                                effectiveOffset > 0 && older.isNotEmpty()
+                            }
+                        current.copy(
+                            messages = mergedMessages,
+                            todos = restoredTodos(current.todos, mergedMessages),
+                            hasOlderMessages = hasOlder,
+                        )
+                    }
+                } finally {
+                    releaseOlderLoad(owner)
                 }
-            } finally {
-                releaseOlderLoad(owner)
             }
-        }
+    }
+
+    private fun isOlderLoadCurrent(
+        fence: HistoryLoadFence,
+        owner: Long,
+    ): Boolean = activeOlderLoadOwner == owner && isHistoryLoadFenceCurrent(fence)
+
+    private fun retireOlderLoad() {
+        val owner = activeOlderLoadOwner ?: return
+        if (activeOlderLoadOwner != owner) return
+        activeOlderLoadOwner = null
+        olderLoadJob?.cancel()
+        olderLoadJob = null
+        _uiState.update { it.copy(isLoadingOlder = false) }
     }
 
     private fun releaseOlderLoad(owner: Long) {
         if (activeOlderLoadOwner != owner) return
         activeOlderLoadOwner = null
+        olderLoadJob = null
         _uiState.update { it.copy(isLoadingOlder = false) }
     }
 
