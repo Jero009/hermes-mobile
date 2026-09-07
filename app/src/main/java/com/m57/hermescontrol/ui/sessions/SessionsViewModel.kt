@@ -33,6 +33,9 @@ enum class HistorySection {
     AUTOMATIONS,
 }
 
+internal val HistorySection.showsGlobalStats: Boolean
+    get() = this == HistorySection.CONVERSATIONS
+
 internal val HistorySection.source: String?
     get() = if (this == HistorySection.AUTOMATIONS) AUTOMATION_SOURCE else null
 

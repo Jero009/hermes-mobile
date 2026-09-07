@@ -697,31 +697,30 @@ fun SessionsScreen(
 
                     else -> {
                         Column(modifier = Modifier.fillMaxSize()) {
-                            // ── Stats row ───────────────────────────────────────
-                            Row(
-                                modifier =
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .height(IntrinsicSize.Max)
-                                        .padding(horizontal = spacing.md, vertical = spacing.sm),
-                                horizontalArrangement = Arrangement.spacedBy(spacing.sm),
-                            ) {
-                                StatCard(
-                                    label = stringResource(R.string.sessions_stat_total),
-                                    value = if (state.isLoadingStats) "…" else state.stats.total.toString(),
-                                    icon = Icons.Filled.History,
-                                    modifier = Modifier.weight(1f).fillMaxHeight(),
-                                )
-                                StatCard(
-                                    label = stringResource(R.string.sessions_stat_messages),
-                                    value = if (state.isLoadingStats) "…" else state.stats.messages.toString(),
-                                    icon = Icons.Filled.CheckCircle,
-                                    accentColor = statusColors.success,
-                                    modifier = Modifier.weight(1f).fillMaxHeight(),
-                                )
-                                // Prune button card. The API prunes all history, so it is not
-                                // offered from the Automations tab where it would read as scoped.
-                                if (state.section == HistorySection.CONVERSATIONS) {
+                            // The stats and prune APIs are global, so only show them alongside
+                            // Conversations where they cannot be mistaken for automation totals.
+                            if (state.section.showsGlobalStats) {
+                                Row(
+                                    modifier =
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .height(IntrinsicSize.Max)
+                                            .padding(horizontal = spacing.md, vertical = spacing.sm),
+                                    horizontalArrangement = Arrangement.spacedBy(spacing.sm),
+                                ) {
+                                    StatCard(
+                                        label = stringResource(R.string.sessions_stat_total),
+                                        value = if (state.isLoadingStats) "…" else state.stats.total.toString(),
+                                        icon = Icons.Filled.History,
+                                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                                    )
+                                    StatCard(
+                                        label = stringResource(R.string.sessions_stat_messages),
+                                        value = if (state.isLoadingStats) "…" else state.stats.messages.toString(),
+                                        icon = Icons.Filled.CheckCircle,
+                                        accentColor = statusColors.success,
+                                        modifier = Modifier.weight(1f).fillMaxHeight(),
+                                    )
                                     Card(
                                         modifier = Modifier.weight(1f).fillMaxHeight(),
                                         colors =
@@ -752,16 +751,15 @@ fun SessionsScreen(
                                         }
                                     }
                                 }
-                            }
-                            // Stats error snack
-                            val statsError = state.statsError
-                            if (statsError != null) {
-                                Text(
-                                    text = statsError,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = statusColors.error,
-                                    modifier = Modifier.padding(horizontal = spacing.md),
-                                )
+                                val statsError = state.statsError
+                                if (statsError != null) {
+                                    Text(
+                                        text = statsError,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = statusColors.error,
+                                        modifier = Modifier.padding(horizontal = spacing.md),
+                                    )
+                                }
                             }
 
                             // ── Session list ────────────────────────────────────

@@ -223,6 +223,12 @@ class SessionsViewModelTest {
     // ── History sections (conversations vs. automations) ─────────────────
 
     @Test
+    fun `global statistics are only shown for conversations`() {
+        assertTrue(HistorySection.CONVERSATIONS.showsGlobalStats)
+        assertFalse(HistorySection.AUTOMATIONS.showsGlobalStats)
+    }
+
+    @Test
     fun `automation pagination advances on server rows not merged pin rows`() {
         val vm =
             SessionsViewModel(
