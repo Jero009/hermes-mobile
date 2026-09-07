@@ -75,6 +75,7 @@ class McpServersViewModel(
     private val _uiState = MutableStateFlow(McpServersUiState())
     val uiState: StateFlow<McpServersUiState> = _uiState.asStateFlow()
     private val serverTestMutexes = mutableMapOf<String, Mutex>()
+    private val serverTestConcurrencyLimiter = Semaphore(MAX_CONCURRENT_SERVER_TESTS)
     private val activeTestOperations = mutableMapOf<String, Long>()
     private var nextTestOperationId = 0L
     private var batchTestJob: Job? = null
@@ -182,12 +183,11 @@ class McpServersViewModel(
                         toastMessage = "Testing ${enabledServers.size} servers…",
                     )
                 }
-                val concurrencyLimiter = Semaphore(MAX_CONCURRENT_SERVER_TESTS)
                 val results =
                     enabledServers
                         .map { server ->
                             async {
-                                server.name to executeServerTest(server.name, concurrencyLimiter)
+                                server.name to executeServerTest(server.name)
                             }
                         }.awaitAll()
                         .toMap()
@@ -203,26 +203,17 @@ class McpServersViewModel(
             }
     }
 
-    private suspend fun executeServerTest(
-        name: String,
-        concurrencyLimiter: Semaphore? = null,
-    ): McpServerTestResponse =
+    private suspend fun executeServerTest(name: String): McpServerTestResponse =
         serverTestMutexes.getOrPut(name) { Mutex() }.withLock {
             val operationId = ++nextTestOperationId
             activeTestOperations[name] = operationId
             _uiState.update { it.copy(testingServers = it.testingServers + name) }
             try {
-                val call =
-                    suspend {
+                val result =
+                    serverTestConcurrencyLimiter.withPermit {
                         withContext(ioDispatcher) {
                             safeApiCall { ApiClient.hermesApi.testMcpServer(name) }
                         }
-                    }
-                val result =
-                    if (concurrencyLimiter == null) {
-                        call()
-                    } else {
-                        concurrencyLimiter.withPermit { call() }
                     }
                 val response =
                     when (result) {

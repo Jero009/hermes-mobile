@@ -118,6 +118,40 @@ class McpServersViewModelTest {
     }
 
     @Test
+    fun `single and batch tests share one concurrency bound`() {
+        val servers = (1..5).map { McpServer(name = "batch-$it", enabled = true) }
+        coEvery { api.getMcpServers() } returns Response.success(McpServersResponse(servers))
+        val release = CompletableDeferred<Unit>()
+        val inFlight = AtomicInteger()
+        val maximumInFlight = AtomicInteger()
+        coEvery { api.testMcpServer(any()) } coAnswers {
+            val current = inFlight.incrementAndGet()
+            maximumInFlight.updateAndGet { maximum -> maxOf(maximum, current) }
+            release.await()
+            inFlight.decrementAndGet()
+            Response.success(McpServerTestResponse(ok = true))
+        }
+
+        val viewModel = McpServersViewModel(ioDispatcher = dispatcher)
+        viewModel.loadServers()
+        dispatcher.scheduler.advanceUntilIdle()
+        viewModel.testServer("single-1")
+        viewModel.testServer("single-2")
+        viewModel.testAllServers()
+        dispatcher.scheduler.runCurrent()
+
+        assertEquals(4, maximumInFlight.get())
+        coVerify(exactly = 1) { api.testMcpServer("single-1") }
+        coVerify(exactly = 1) { api.testMcpServer("single-2") }
+        coVerify(exactly = 2) { api.testMcpServer(match { it.startsWith("batch-") }) }
+
+        release.complete(Unit)
+        dispatcher.scheduler.advanceUntilIdle()
+        coVerify(exactly = 7) { api.testMcpServer(any()) }
+        assertEquals(4, maximumInFlight.get())
+    }
+
+    @Test
     fun `single and batch tests for the same server are serialized without clearing active state`() {
         coEvery { api.getMcpServers() } returns
             Response.success(McpServersResponse(listOf(McpServer(name = "shared", enabled = true))))
