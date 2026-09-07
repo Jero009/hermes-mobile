@@ -4,6 +4,7 @@ package com.m57.hermescontrol.ui.chat
 
 import android.Manifest
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -317,7 +318,14 @@ fun ChatScreen(
                             )
                         }
                     isListening = true
-                    speechLauncher.launch(intent)
+                    try {
+                        speechLauncher.launch(intent)
+                    } catch (_: ActivityNotFoundException) {
+                        isListening = false
+                        scrollScope.launch {
+                            snackbarHostState.showSnackbar(sttNotAvailableMsg)
+                        }
+                    }
                 } else {
                     scrollScope.launch {
                         snackbarHostState.showSnackbar(sttNotAvailableMsg)
@@ -683,7 +691,14 @@ fun ChatScreen(
                                     )
                                 }
                             isListening = true
-                            speechLauncher.launch(intent)
+                            try {
+                                speechLauncher.launch(intent)
+                            } catch (_: ActivityNotFoundException) {
+                                isListening = false
+                                scrollScope.launch {
+                                    snackbarHostState.showSnackbar(sttNotAvailableMsg)
+                                }
+                            }
                         } else {
                             scrollScope.launch {
                                 snackbarHostState.showSnackbar(sttNotAvailableMsg)

@@ -6,10 +6,9 @@ import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
 import android.os.Build
 import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 
 object SpeechInputHelper {
-    /** Returns whether Android exposes either an activity or service for speech input. */
+    /** Returns whether Android exposes an activity that can handle speech input. */
     fun isSpeechInputAvailable(
         context: Context,
         sdkInt: Int = Build.VERSION.SDK_INT,
@@ -23,9 +22,6 @@ object SpeechInputHelper {
                 PackageManager.ResolveInfoFlags.of(0L),
             )
         },
-        isRecognizerServiceAvailable: (Context) -> Boolean = { candidate ->
-            runCatching { SpeechRecognizer.isRecognitionAvailable(candidate) }.getOrDefault(false)
-        },
     ): Boolean {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
         val activities: List<ResolveInfo?> =
@@ -37,6 +33,6 @@ object SpeechInputHelper {
                 }
             }.getOrDefault(emptyList())
 
-        return activities.any { it != null } || isRecognizerServiceAvailable(context)
+        return activities.any { it != null }
     }
 }

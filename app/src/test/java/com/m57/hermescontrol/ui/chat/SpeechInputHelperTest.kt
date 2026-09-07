@@ -39,13 +39,12 @@ class SpeechInputHelperTest {
             SpeechInputHelper.isSpeechInputAvailable(
                 context = context,
                 sdkInt = Build.VERSION_CODES.S,
-                isRecognizerServiceAvailable = { false },
             ),
         )
     }
 
     @Test
-    fun `speech input is unavailable when provider and recognizer service are absent`() {
+    fun `recognizer service without provider activity does not make speech input available`() {
         val context = mockk<Context>()
         val packageManager = mockk<PackageManager>()
         every { context.packageManager } returns packageManager
@@ -55,13 +54,12 @@ class SpeechInputHelperTest {
             SpeechInputHelper.isSpeechInputAvailable(
                 context = context,
                 sdkInt = Build.VERSION_CODES.S,
-                isRecognizerServiceAvailable = { false },
             ),
         )
     }
 
     @Test
-    fun `malformed and failed resolver responses fall back to recognizer service`() {
+    fun `malformed and failed resolver responses are unavailable`() {
         val malformedContext = mockk<Context>()
         val malformedPackageManager = mockk<PackageManager>()
         every { malformedContext.packageManager } returns malformedPackageManager
@@ -75,17 +73,15 @@ class SpeechInputHelperTest {
             SpeechInputHelper.isSpeechInputAvailable(
                 context = malformedContext,
                 sdkInt = Build.VERSION_CODES.S,
-                isRecognizerServiceAvailable = { false },
             ),
         )
 
         val failedContext = mockk<Context>()
         every { failedContext.packageManager } throws IllegalStateException("broken resolver")
-        assertTrue(
+        assertFalse(
             SpeechInputHelper.isSpeechInputAvailable(
                 context = failedContext,
                 sdkInt = Build.VERSION_CODES.S,
-                isRecognizerServiceAvailable = { true },
             ),
         )
     }
@@ -106,7 +102,6 @@ class SpeechInputHelperTest {
                     assertTrue(actualPackageManager === packageManager)
                     listOf(provider)
                 },
-                isRecognizerServiceAvailable = { false },
             ),
         )
     }
