@@ -352,6 +352,43 @@ class ChatPersistenceRepositoryTest {
     }
 
     @Test
+    fun singleMessageWriteAndInvalidationAreAtomic() {
+        val dao = RacingDao(blockContent = "blocked")
+        val repository = ChatPersistenceRepository(dao)
+        val revision = repository.replacementGeneration("session-a")
+        val executor = Executors.newFixedThreadPool(2)
+
+        try {
+            val write =
+                executor.submit<Boolean> {
+                    runBlocking {
+                        repository.persistMessage(message("blocked"), "session-a", revision)
+                    }
+                }
+            assertTrue(dao.blockedWriteStarted.await(5, TimeUnit.SECONDS))
+            val invalidationFinished = CountDownLatch(1)
+            executor.submit {
+                repository.invalidateReplacementWrites("session-a")
+                invalidationFinished.countDown()
+            }
+
+            assertFalse(invalidationFinished.await(100, TimeUnit.MILLISECONDS))
+            dao.allowBlockedWrite.countDown()
+            assertTrue(write.get(5, TimeUnit.SECONDS))
+            assertTrue(invalidationFinished.await(5, TimeUnit.SECONDS))
+            assertFalse(
+                runBlocking {
+                    repository.persistMessage(message("stale"), "session-a", revision)
+                },
+            )
+            assertEquals(listOf("blocked"), dao.contents("session-a"))
+        } finally {
+            dao.allowBlockedWrite.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
     fun replacementAndInvalidationAreAtomic() {
         val dao = RacingDao(blockReplacement = true)
         val repository = ChatPersistenceRepository(dao)

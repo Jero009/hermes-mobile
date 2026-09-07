@@ -78,9 +78,11 @@ open class ChatPersistenceRepository internal constructor(
     ): Boolean =
         enqueueSessionOperation(sessionId) {
             val fence = replacementFence(sessionId)
-            if (synchronized(fence) { fence.generation != expectedRevision }) return@enqueueSessionOperation false
-            dao.upsert(message.toEntity(sessionId))
-            true
+            synchronized(fence) {
+                if (fence.generation != expectedRevision) return@synchronized false
+                dao.upsertAll(listOf(message.toEntity(sessionId)))
+                true
+            }
         }
 
     /** Persist multiple messages in one transaction. */
