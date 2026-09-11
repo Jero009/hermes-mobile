@@ -31,6 +31,9 @@ object WsMethods {
     const val SUDO_CANCEL = "sudo.cancel"
     const val SECRET_CANCEL = "secret.cancel"
 
+    /** Inline WebSocket read-loop ping, bypasses server thread pool dispatch. */
+    const val GATEWAY_PING = "gateway.ping"
+
     // ── Commands catalog ──────────────────────────────────────────────────
     const val COMMANDS_CATALOG = "commands.catalog"
     const val COMMAND_DISPATCH = "command.dispatch"
