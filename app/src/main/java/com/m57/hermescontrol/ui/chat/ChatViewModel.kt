@@ -258,9 +258,11 @@ private const val CLARIFY_DISMISS_RESPONSE = "The user cancelled — no answer p
  */
 data class SudoPromptUi(
     val binding: PrivilegedRequestBinding,
+    val serverRequestBinding: ServerRequestBinding? = null,
     val isSubmitting: Boolean = false,
 ) {
     val requestId: String get() = binding.requestId
+    val fullBinding: Any get() = serverRequestBinding ?: binding
 }
 
 /**
@@ -273,8 +275,10 @@ data class SecretPromptUi(
     val binding: PrivilegedRequestBinding,
     val envVar: String? = null,
     val prompt: String? = null,
+    val serverRequestBinding: ServerRequestBinding? = null,
     val isSubmitting: Boolean = false,
 ) {
+    val fullBinding: Any get() = serverRequestBinding ?: binding
     val requestId: String get() = binding.requestId
 }
 
@@ -3485,6 +3489,40 @@ class ChatViewModel(
                 request.connectionGeneration,
             ) ?: return
         when (request.method) {
+            "sudo" -> {
+                val serverBinding =
+                    ServerRequestBinding(request.id, sessionId, binding.profileId, binding.connectionGeneration)
+                _uiState.update { state ->
+                    if (state.sudoPrompt?.serverRequestBinding == serverBinding) {
+                        state
+                    } else {
+                        state.copy(
+                            sudoPrompt = SudoPromptUi(binding = binding, serverRequestBinding = serverBinding),
+                            isAgentTyping = false,
+                        )
+                    }
+                }
+            }
+            "secret" -> {
+                val serverBinding =
+                    ServerRequestBinding(request.id, sessionId, binding.profileId, binding.connectionGeneration)
+                _uiState.update { state ->
+                    if (state.secretPrompt?.serverRequestBinding == serverBinding) {
+                        state
+                    } else {
+                        state.copy(
+                            secretPrompt =
+                                SecretPromptUi(
+                                    binding = binding,
+                                    envVar = request.params["env_var"] as? String,
+                                    prompt = request.params["prompt"] as? String,
+                                    serverRequestBinding = serverBinding,
+                                ),
+                            isAgentTyping = false,
+                        )
+                    }
+                }
+            }
             "approval" -> {
                 val duplicate =
                     _uiState.value.messages.any {
@@ -3582,8 +3620,33 @@ class ChatViewModel(
                         state
                     }
                 }
+            "sudo" ->
+                _uiState.update { state ->
+                    if (serverCancellationMatches(state.sudoPrompt?.serverRequestBinding, event)) {
+                        state.copy(sudoPrompt = null)
+                    } else {
+                        state
+                    }
+                }
+            "secret" ->
+                _uiState.update { state ->
+                    if (serverCancellationMatches(state.secretPrompt?.serverRequestBinding, event)) {
+                        state.copy(secretPrompt = null)
+                    } else {
+                        state
+                    }
+                }
         }
     }
+
+    private fun serverCancellationMatches(
+        binding: ServerRequestBinding?,
+        event: WsEvent.ServerRequestCancelled,
+    ): Boolean =
+        binding?.requestId == event.id &&
+            binding.runtimeSessionId == event.sessionId &&
+            binding.profileId == event.sourceProfileId &&
+            binding.connectionGeneration == event.connectionGeneration
 
     private fun clearPrivilegedControls() {
         approvalExpiryJobs.values.forEach(Job::cancel)
@@ -3876,11 +3939,18 @@ class ChatViewModel(
     ) {
         val claimed = claimSudoSubmission(prompt) ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
-            }.onSuccess {
+            val accepted =
+                claimed.serverRequestBinding?.let {
+                    wsClient.respondToServerRequest(
+                        it,
+                        buildJsonObject { put("value", params["password"].orEmpty()) },
+                    )
+                } ?: runCatching {
+                    wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
+                }.isSuccess
+            if (accepted) {
                 _uiState.update { if (it.sudoPrompt == claimed) it.copy(sudoPrompt = null) else it }
-            }.onFailure {
+            } else {
                 _uiState.update {
                     if (it.sudoPrompt == claimed) {
                         it.copy(
@@ -3911,11 +3981,18 @@ class ChatViewModel(
     ) {
         val claimed = claimSecretSubmission(prompt) ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
-            }.onSuccess {
+            val accepted =
+                claimed.serverRequestBinding?.let {
+                    wsClient.respondToServerRequest(
+                        it,
+                        buildJsonObject { put("value", params["value"].orEmpty()) },
+                    )
+                } ?: runCatching {
+                    wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
+                }.isSuccess
+            if (accepted) {
                 _uiState.update { if (it.secretPrompt == claimed) it.copy(secretPrompt = null) else it }
-            }.onFailure {
+            } else {
                 _uiState.update {
                     if (it.secretPrompt == claimed) {
                         it.copy(

@@ -55,6 +55,8 @@ import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -4006,6 +4008,76 @@ class ChatViewModelTest {
             runCurrent()
 
             assertEquals(1, viewModel.uiState.value.messages.count { it.approvalInfo != null })
+        }
+
+    @Test
+    fun gatewaySudoAndSecret_answerExactServerIds_withoutLegacyMethods() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val bindings = mutableListOf<ServerRequestBinding>()
+            val results = mutableListOf<JsonElement>()
+            every { HermesWsClient.respondToServerRequest(capture(bindings), capture(results)) } returns true
+
+            mockEventsFlow.emit(serverRequest("wire-sudo", "sudo"))
+            runCurrent()
+            viewModel.respondToSudo("sudo-value")
+            runCurrent()
+            mockEventsFlow.emit(serverRequest("wire-secret", "secret"))
+            runCurrent()
+            viewModel.cancelSecret()
+            runCurrent()
+
+            assertEquals(listOf("wire-sudo", "wire-secret"), bindings.map { it.requestId })
+            assertTrue(bindings.all { it.runtimeSessionId == sessionId })
+            assertEquals(listOf("sudo-value", ""), results.map { it.jsonObject["value"]!!.jsonPrimitive.content })
+            verify(exactly = 0) { HermesWsClient.privilegedRequest(any(), any(), any()) }
+            assertNull(viewModel.uiState.value.sudoPrompt)
+            assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun gatewaySecret_failedSendRetainsPrompt_andDoubleTapSendsOnce() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            every { HermesWsClient.respondToServerRequest(any(), any()) } returns false
+            mockEventsFlow.emit(serverRequest("wire-secret-fail", "secret"))
+            runCurrent()
+
+            viewModel.respondToSecret("hidden")
+            viewModel.respondToSecret("hidden")
+            runCurrent()
+
+            verify(exactly = 1) { HermesWsClient.respondToServerRequest(any(), any()) }
+            assertEquals("wire-secret-fail", viewModel.uiState.value.secretPrompt?.serverRequestBinding?.requestId)
+            assertFalse(viewModel.uiState.value.secretPrompt!!.isSubmitting)
+            assertEquals(PRIVILEGED_FAILURE_TEXT, viewModel.uiState.value.errorMessage)
+        }
+
+    @Test
+    fun gatewaySudo_duplicateRetainsBinding_replacementAndCancellationUseFullIdentity() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(serverRequest("same-id", "sudo"))
+            runCurrent()
+            val original = requireNotNull(viewModel.uiState.value.sudoPrompt)
+
+            mockEventsFlow.emit(serverRequest("same-id", "sudo", replayed = true))
+            runCurrent()
+            assertTrue(original === viewModel.uiState.value.sudoPrompt)
+
+            mockEventsFlow.emit(serverRequest("same-id", "sudo", generation = 8))
+            runCurrent()
+            val replacement = requireNotNull(viewModel.uiState.value.sudoPrompt)
+            assertEquals(8, replacement.serverRequestBinding?.connectionGeneration)
+
+            mockEventsFlow.emit(WsEvent.ServerRequestCancelled("same-id", "secret", "x", sessionId, "profile-a", 8))
+            mockEventsFlow.emit(WsEvent.ServerRequestCancelled("same-id", "sudo", "x", sessionId, "profile-a", 7))
+            runCurrent()
+            assertEquals(replacement, viewModel.uiState.value.sudoPrompt)
+
+            mockEventsFlow.emit(WsEvent.ServerRequestCancelled("same-id", "sudo", "x", sessionId, "profile-a", 8))
+            runCurrent()
+            assertNull(viewModel.uiState.value.sudoPrompt)
         }
 
     // ── Approval flow ────────────────────────────────────────────────────────

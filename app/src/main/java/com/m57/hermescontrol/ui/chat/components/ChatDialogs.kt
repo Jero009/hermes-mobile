@@ -26,7 +26,6 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.m57.hermescontrol.R
-import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import com.m57.hermescontrol.theme.LocalHermesStatusColors
 
 /**
@@ -41,7 +40,7 @@ import com.m57.hermescontrol.theme.LocalHermesStatusColors
  */
 @Composable
 fun SudoPromptDialog(
-    binding: PrivilegedRequestBinding,
+    binding: Any,
     onConfirm: (String) -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit,
@@ -104,7 +103,7 @@ fun SudoPromptDialog(
  */
 @Composable
 fun SecretPromptDialog(
-    binding: PrivilegedRequestBinding,
+    binding: Any,
     onConfirm: (String) -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit,

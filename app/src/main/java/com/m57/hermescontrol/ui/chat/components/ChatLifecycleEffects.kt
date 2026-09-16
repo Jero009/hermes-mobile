@@ -163,9 +163,9 @@ fun ChatLifecycleEffects(
 
     // Sudo / secret prompt dialogs (issue #524)
     sudoPrompt?.let { prompt ->
-        key(prompt.binding) {
+        key(prompt.fullBinding) {
             SudoPromptDialog(
-                binding = prompt.binding,
+                binding = prompt.fullBinding,
                 onConfirm = viewModel::respondToSudo,
                 onCancel = viewModel::cancelSudo,
                 onDismiss = viewModel::dismissSudo,
@@ -175,9 +175,9 @@ fun ChatLifecycleEffects(
     }
 
     secretPrompt?.let { prompt ->
-        key(prompt.binding) {
+        key(prompt.fullBinding) {
             SecretPromptDialog(
-                binding = prompt.binding,
+                binding = prompt.fullBinding,
                 onConfirm = viewModel::respondToSecret,
                 onCancel = viewModel::cancelSecret,
                 onDismiss = viewModel::dismissSecret,
