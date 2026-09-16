@@ -1200,6 +1200,7 @@ class ChatViewModel(
         if (text.isBlank() && state.pendingAttachments.isEmpty()) return false
         val storageSessionId = state.currentSessionId ?: return false
         val agentSessionId = runtimeSessionId ?: return false
+        val dispatchGeneration = conversationGeneration
 
         val trimmed = text.trim()
         if (trimmed.startsWith("/", ignoreCase = true)) {
@@ -1314,6 +1315,11 @@ class ChatViewModel(
                     fileRefs.joinToString("\n") +
                         if (text.isNotBlank()) "\n\n$text" else ""
                 }
+
+            // Attachment preparation can suspend while the active conversation
+            // changes. Fence by generation as well as ID so switching away and
+            // back to the same session cannot dispatch the stale prompt.
+            if (dispatchGeneration != conversationGeneration) return@launch
 
             // While a turn is still streaming and the prompt carries no
             // attachments, steer the in-flight turn via session.redirect
@@ -2290,6 +2296,7 @@ class ChatViewModel(
                     if (runtimeSessionId != sessionId) return@update it
                     it.copy(
                         currentSessionModel = confirmedLabel ?: it.currentSessionModel,
+                        contextUsage = it.contextUsage?.copy(maxTokens = null),
                         modelSwitchConfirmation = null,
                     )
                 }

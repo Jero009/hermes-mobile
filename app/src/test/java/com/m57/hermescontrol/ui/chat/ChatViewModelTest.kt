@@ -1483,7 +1483,21 @@ class ChatViewModelTest {
     @Test
     fun testModelPickerSelection_confirmsExpensiveModelBeforeUpdatingLabel() =
         runTest {
-            val (viewModel, _) = createViewModelWithSession()
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(
+                WsEvent.SessionUsage(
+                    data =
+                        mapOf(
+                            "usage" to
+                                mapOf(
+                                    "context_used" to 12_000L,
+                                    "context_max" to 272_000L,
+                                ),
+                        ),
+                    sessionId = sessionId,
+                ),
+            )
+            advanceUntilIdle()
             val calls = mutableListOf<Map<String, Any>>()
             every { HermesWsClient.request(WsMethods.CONFIG_SET, any(), any()) } answers {
                 val params = arg<Map<String, Any>>(1)
@@ -1519,6 +1533,8 @@ class ChatViewModelTest {
             advanceUntilIdle()
 
             assertEquals("openai/gpt-expensive", viewModel.uiState.value.currentSessionModel)
+            assertEquals(12_000L, viewModel.uiState.value.contextUsage?.usedTokens)
+            assertNull(viewModel.uiState.value.contextUsage?.maxTokens)
             assertNull(viewModel.uiState.value.modelSwitchConfirmation)
             assertEquals(true, calls.last()["confirm_expensive_model"])
         }
@@ -4979,6 +4995,42 @@ class ChatViewModelTest {
                 sessionId,
                 paramsSlot.captured["session_id"],
             )
+        }
+
+    @Test
+    fun testSendMessage_suspendedAttachmentDoesNotDispatchAfterSameSessionAba() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val attachmentResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.request(WsMethods.IMAGE_ATTACH_BYTES, any(), any())
+            } returns attachmentResult
+
+            mockkConstructor(android.util.Base64OutputStream::class)
+            every {
+                anyConstructed<android.util.Base64OutputStream>().write(any<ByteArray>(), any(), any())
+            } returns Unit
+            every { anyConstructed<android.util.Base64OutputStream>().close() } returns Unit
+            mockkStatic(Uri::class)
+            val mockUri = mockk<Uri>()
+            every { Uri.parse("content://suspended") } returns mockUri
+            val contentResolver = mockk<ContentResolver>()
+            every { app.contentResolver } returns contentResolver
+            every { contentResolver.openInputStream(any()) } returns
+                java.io.ByteArrayInputStream(byteArrayOf(1, 2, 3, 4))
+
+            viewModel.addAttachment("content://suspended", "test.png", "image/png", 4)
+            viewModel.sendMessage("stale prompt")
+            runCurrent()
+
+            viewModel.switchSession("other-session")
+            viewModel.switchSession(sessionId)
+            attachmentResult.complete(mapOf("attached" to true))
+            advanceUntilIdle()
+
+            verify(exactly = 0) {
+                HermesWsClient.sendMessage(any(), match { it.contains("stale prompt") }, any(), any())
+            }
         }
 
     // ── Pending request timeout + rejectAllPending (issue #526) ───────────

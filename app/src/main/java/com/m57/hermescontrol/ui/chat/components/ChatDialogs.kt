@@ -70,6 +70,11 @@ fun VaultPromptDialog(
                     modifier = Modifier.fillMaxWidth().testTag("vault_secret_input"),
                     singleLine = true,
                     visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions =
+                        KeyboardOptions(
+                            autoCorrectEnabled = false,
+                            keyboardType = KeyboardType.Password,
+                        ),
                     enabled = !prompt.isSubmitting,
                 )
             }
