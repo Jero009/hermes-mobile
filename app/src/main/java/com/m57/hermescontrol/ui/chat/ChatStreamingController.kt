@@ -89,32 +89,32 @@ class ChatStreamingController(
         val currentContent = streamingBuffer.toString()
         lastFlushMs = now
         streamingState.update { state ->
-                val current = state.streamingMessage
-                if (current != null) {
-                    val currentReasoning =
-                        current.reasoningText.ifBlank { state.reasoningText }
-                    state.copy(
-                        streamingMessage =
-                            current.copy(
-                                content = currentContent,
-                                reasoningText = currentReasoning,
-                            ),
-                        isThinking = false,
-                    )
-                } else {
-                    // Fallback: no MessageStart was received — create one now
-                    val msg =
-                        ChatMessage(
-                            role = MessageRole.ASSISTANT,
+            val current = state.streamingMessage
+            if (current != null) {
+                val currentReasoning =
+                    current.reasoningText.ifBlank { state.reasoningText }
+                state.copy(
+                    streamingMessage =
+                        current.copy(
                             content = currentContent,
-                            reasoningText = state.reasoningText,
-                            isStreaming = true,
-                        )
-                    state.copy(
-                        streamingMessage = msg,
-                        isThinking = false,
+                            reasoningText = currentReasoning,
+                        ),
+                    isThinking = false,
+                )
+            } else {
+                // Fallback: no MessageStart was received — create one now
+                val msg =
+                    ChatMessage(
+                        role = MessageRole.ASSISTANT,
+                        content = currentContent,
+                        reasoningText = state.reasoningText,
+                        isStreaming = true,
                     )
-                }
+                state.copy(
+                    streamingMessage = msg,
+                    isThinking = false,
+                )
+            }
         }
         uiState.update { it.copy(isAgentTyping = true) }
     }

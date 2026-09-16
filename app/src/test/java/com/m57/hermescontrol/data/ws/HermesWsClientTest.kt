@@ -99,6 +99,7 @@ class HermesWsClientTest {
         // next one's connection.
         outboundQueue().clear()
         pendingPromptSessions().clear()
+        pendingReplayResponses().clear()
         val pendingReplyField = HermesWsClient::class.java.getDeclaredField("pendingReply")
         pendingReplyField.isAccessible = true
         pendingReplyField.setBoolean(HermesWsClient, false)
@@ -399,7 +400,8 @@ class HermesWsClientTest {
 
             listener.onMessage(
                 socket,
-                """{"jsonrpc":"2.0","id":"$resumeId","result":{"open_requests":[{"id":"srq-replay","method":"secret","params":{"session_id":"session-a"}}]}}""",
+                """{"jsonrpc":"2.0","id":"$resumeId","result":{"open_requests":[""" +
+                    """{"id":"srq-replay","method":"secret","params":{"session_id":"session-a"}}]}}""",
             )
             val event = received.await() as WsEvent.ServerRequest
 
@@ -418,7 +420,10 @@ class HermesWsClientTest {
             val listener = installActiveListener(socket)
             ActiveSessionHolder.set("session-a")
 
-            suspend fun assertNoReplay(id: String, openRequest: String) {
+            suspend fun assertNoReplay(
+                id: String,
+                openRequest: String,
+            ) {
                 val received =
                     async(start = CoroutineStart.UNDISPATCHED) {
                         withTimeoutOrNull(100) {
@@ -456,6 +461,84 @@ class HermesWsClientTest {
             val malformedId =
                 HermesWsClient.send(WsMethods.SESSION_RESUME, mapOf("session_id" to "session-a"))
             assertNoReplay(malformedId, """{"id":"","method":"secret","params":{"session_id":"session-a"}}""")
+        }
+
+    @Test
+    fun replayAdmissionExistsBeforeSocketSendCanSynchronouslyRespond() =
+        runBlocking {
+            every { AuthManager.getSelectedProfileId() } returns "profile-a"
+            val socket = mockk<WebSocket>(relaxed = true)
+            val listener = installActiveListener(socket)
+            ActiveSessionHolder.set("session-a")
+            val received =
+                async(start = CoroutineStart.UNDISPATCHED) {
+                    withTimeout(5_000) {
+                        HermesWsClient.events.first { it is WsEvent.ServerRequest && it.replayed }
+                    }
+                }
+            every { socket.send(any<String>()) } answers {
+                val frame = Json.parseToJsonElement(invocation.args[0] as String).jsonObject
+                val id = frame["id"]!!.jsonPrimitive.content
+                listener.onMessage(
+                    socket,
+                    """{"jsonrpc":"2.0","id":"$id","result":{"open_requests":[""" +
+                        """{"id":"fast","method":"secret","params":{"session_id":"session-a"}}]}}""",
+                )
+                true
+            }
+
+            HermesWsClient.send(WsMethods.SESSION_RESUME, mapOf("session_id" to "session-a"))
+
+            assertEquals("fast", (received.await() as WsEvent.ServerRequest).id)
+            assertTrue(pendingReplayResponses().isEmpty())
+        }
+
+    @Test
+    fun disconnectAlwaysRetiresReplayAdmissionsButPreservesOutboundQueue() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val socket = mockk<WebSocket>(relaxed = true)
+        every { socket.send(any<String>()) } returns true
+        installActiveListener(socket)
+        ActiveSessionHolder.set("session-a")
+        HermesWsClient.send(WsMethods.SESSION_RESUME, mapOf("session_id" to "session-a"))
+        assertEquals(1, pendingReplayResponses().size)
+        outboundQueue().add("queued-frame")
+
+        HermesWsClient.disconnect(clearPendingMessages = false)
+
+        assertTrue(pendingReplayResponses().isEmpty())
+        assertEquals(1, outboundQueue().size)
+
+        val replacementListener = installActiveListener(socket)
+        HermesWsClient.send(WsMethods.SESSION_RESUME, mapOf("session_id" to "session-a"))
+        assertEquals(1, pendingReplayResponses().size)
+        replacementListener.onFailure(socket, java.io.IOException("test failure"), null)
+        assertTrue(pendingReplayResponses().isEmpty())
+    }
+
+    @Test
+    fun heterogeneousOpenRequestsSkipMalformedEntriesAndReplayValidSibling() =
+        runBlocking {
+            every { AuthManager.getSelectedProfileId() } returns "profile-a"
+            val socket = mockk<WebSocket>(relaxed = true)
+            every { socket.send(any<String>()) } returns true
+            val listener = installActiveListener(socket)
+            ActiveSessionHolder.set("session-a")
+            val resumeId = HermesWsClient.send(WsMethods.SESSION_RESUME, mapOf("session_id" to "session-a"))
+            val received =
+                async(start = CoroutineStart.UNDISPATCHED) {
+                    withTimeout(5_000) {
+                        HermesWsClient.events.first { it is WsEvent.ServerRequest && it.replayed }
+                    }
+                }
+
+            listener.onMessage(
+                socket,
+                """{"jsonrpc":"2.0","id":"$resumeId","result":{"open_requests":[null,7,"bad",""" +
+                    """{"id":"valid","method":"secret","params":{"session_id":"session-a"}}]}}""",
+            )
+
+            assertEquals("valid", (received.await() as WsEvent.ServerRequest).id)
         }
 
     @Test
@@ -1024,10 +1107,11 @@ class HermesWsClientTest {
         assertTrue(outboundQueue().isEmpty())
     }
 
-    private fun outboundQueue(): java.util.Queue<*> {
+    private fun outboundQueue(): java.util.Queue<String> {
         val queueField = HermesWsClient::class.java.getDeclaredField("messageQueue")
         queueField.isAccessible = true
-        return queueField.get(HermesWsClient) as java.util.Queue<*>
+        @Suppress("UNCHECKED_CAST")
+        return queueField.get(HermesWsClient) as java.util.Queue<String>
     }
 
     private fun pendingCalls(): MutableMap<String, *> {
@@ -1041,6 +1125,13 @@ class HermesWsClientTest {
         val field = HermesWsClient::class.java.getDeclaredField("pendingPromptSessions")
         field.isAccessible = true
         return field.get(HermesWsClient) as MutableMap<*, *>
+    }
+
+    private fun pendingReplayResponses(): MutableMap<String, *> {
+        val field = HermesWsClient::class.java.getDeclaredField("pendingReplayResponses")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        return field.get(HermesWsClient) as MutableMap<String, *>
     }
 
     private fun connectionGeneration(): Int {

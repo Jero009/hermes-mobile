@@ -557,6 +557,7 @@ object HermesWsClient {
             // Fail in-flight RPC callers now; otherwise they hang until the
             // 120 s per-request timeout after a profile transition.
             rejectAllPending()
+            pendingReplayResponses.clear()
             webSocket?.close(1000, "Client closed")
             webSocket = null
             activeConnectionProfileId = null
@@ -565,7 +566,6 @@ object HermesWsClient {
             if (clearPendingMessages) {
                 messageQueue.clear()
                 pendingPromptSessions.clear()
-                pendingReplayResponses.clear()
                 pendingReply = false
             }
             _connectionStatus.value = ConnectionStatus.DISCONNECTED
@@ -886,6 +886,9 @@ object HermesWsClient {
             }
             val ws = webSocket
             if (ws != null && connected.get()) {
+                if (!pendingCalls.containsKey(id)) {
+                    replayAdmission(method, params)?.let { pendingReplayResponses[id] = it }
+                }
                 // OkHttp returns false when the frame could not be enqueued —
                 // the socket is closing or its outgoing buffer is full. The
                 // previous code ignored that and silently dropped the message.
@@ -918,13 +921,11 @@ object HermesWsClient {
                 pendingPromptSessions.remove(id)
                 pendingReply = pendingPromptSessions.isNotEmpty()
             }
+            if (!accepted) pendingReplayResponses.remove(id)
             if (accepted && backgroundIdleClosed.compareAndSet(true, false)) {
                 startConnectionLocked()
             }
             if (accepted) disconnectIfIdleInBackground()
-            if (accepted && !pendingCalls.containsKey(id)) {
-                replayAdmission(method, params)?.let { pendingReplayResponses[id] = it }
-            }
         }
         return id
     }
@@ -1268,6 +1269,7 @@ object HermesWsClient {
             connected.set(false)
             stopHealthTracking()
             rejectAllPending()
+            pendingReplayResponses.clear()
             true
         }
 
@@ -1373,16 +1375,18 @@ object HermesWsClient {
                                 profileId != null && admission.isCurrent(profileId, eventSocketGeneration)
                             }
                         val replaySessionId = admittedReplay?.runtimeSessionId
-                        @Suppress("UNCHECKED_CAST")
                         val openRequests =
                             if (replaySessionId != null) {
-                                (event.result as? Map<*, *>)?.get("open_requests") as? List<Map<*, *>>
+                                (event.result as? Map<*, *>)?.get("open_requests") as? List<*>
                             } else {
                                 null
                             }
-                        openRequests?.forEach { openRequest ->
-                            val openId = (openRequest["id"] as? String)?.takeIf { it.isNotBlank() } ?: return@forEach
-                            val method = (openRequest["method"] as? String)?.takeIf { it.isNotBlank() } ?: return@forEach
+                        openRequests?.forEach { entry ->
+                            val openRequest = entry as? Map<*, *> ?: return@forEach
+                            val openId =
+                                (openRequest["id"] as? String)?.takeIf { it.isNotBlank() } ?: return@forEach
+                            val method =
+                                (openRequest["method"] as? String)?.takeIf { it.isNotBlank() } ?: return@forEach
 
                             @Suppress("UNCHECKED_CAST")
                             val params = openRequest["params"] as? Map<String, Any?> ?: return@forEach

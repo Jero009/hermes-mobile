@@ -171,10 +171,12 @@ object EventParser {
             }
 
             "request.cancel" -> {
-                val requestId = (payload?.get("id") as? String)?.takeIf { it.isNotBlank() }
-                    ?: return WsEvent.Unknown(rawJson)
-                val requestMethod = (payload["method"] as? String)?.takeIf { it.isNotBlank() }
-                    ?: return WsEvent.Unknown(rawJson)
+                val requestId =
+                    (payload?.get("id") as? String)?.takeIf { it.isNotBlank() }
+                        ?: return WsEvent.Unknown(rawJson)
+                val requestMethod =
+                    (payload["method"] as? String)?.takeIf { it.isNotBlank() }
+                        ?: return WsEvent.Unknown(rawJson)
                 val cancelSessionId = privilegedSessionId ?: return WsEvent.Unknown(rawJson)
                 val reason = payload["reason"] as? String ?: ""
                 WsEvent.ServerRequestCancelled(requestId, requestMethod, reason, cancelSessionId)
