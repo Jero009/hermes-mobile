@@ -139,11 +139,12 @@ class SessionLiveStatusSourceTest {
                                 ),
                         )
                     },
-                    eventsProvider = { MutableSharedFlow() },
+                    sourcedEventsProvider = { MutableSharedFlow() },
                     connectionStatusProvider = { MutableStateFlow(ConnectionStatus.CONNECTED) },
+                    isConnectionCurrent = { true },
                 )
 
-            val snapshot = source.fetchActiveSessionsSnapshot()
+            val snapshot = source.fetchActiveSessionsSnapshot(SessionLiveConnection("profile-a", 1))
 
             assertEquals(WsMethods.SESSION_ACTIVE_LIST, capturedMethod)
             assertTrue(capturedParams!!.isEmpty())
@@ -157,11 +158,12 @@ class SessionLiveStatusSourceTest {
             val source =
                 HermesSessionLiveStatusSource(
                     rpcRequest = { _, _ -> throw RuntimeException("RPC error") },
-                    eventsProvider = { MutableSharedFlow() },
+                    sourcedEventsProvider = { MutableSharedFlow() },
                     connectionStatusProvider = { MutableStateFlow(ConnectionStatus.CONNECTED) },
+                    isConnectionCurrent = { true },
                 )
 
-            val snapshot = source.fetchActiveSessionsSnapshot()
+            val snapshot = source.fetchActiveSessionsSnapshot(SessionLiveConnection("profile-a", 1))
             assertNull(snapshot)
         }
 }

@@ -1,11 +1,13 @@
 package com.m57.hermescontrol.data.ws
 
+import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.model.ActiveSessionsResponse
 import com.m57.hermescontrol.data.model.LiveSessionSnapshot
 import com.m57.hermescontrol.data.model.SessionLiveStatus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -18,11 +20,25 @@ import kotlinx.serialization.serializer
  * Interface for polling and observing live session statuses.
  */
 interface SessionLiveStatusSource {
-    suspend fun fetchActiveSessionsSnapshot(): LiveSessionSnapshot?
+    suspend fun fetchActiveSessionsSnapshot(connection: SessionLiveConnection): LiveSessionSnapshot?
 
-    val events: Flow<WsEvent>
+    val sourcedEvents: Flow<SourcedSessionLiveEvent>
     val connectionStatus: StateFlow<ConnectionStatus>
+    val selectedProfileIds: Flow<String>
+
+    fun currentConnection(profileId: String): SessionLiveConnection?
 }
+
+data class SessionLiveConnection(
+    val profileId: String,
+    val generation: Int,
+)
+
+data class SourcedSessionLiveEvent(
+    val event: WsEvent,
+    val profileId: String?,
+    val connectionGeneration: Int,
+)
 
 /**
  * Decodes untyped RPC responses from `session.active_list` into a [LiveSessionSnapshot].
@@ -151,16 +167,31 @@ class HermesSessionLiveStatusSource(
     private val rpcRequest: suspend (method: String, params: Map<String, Any>) -> Any? = { method, params ->
         HermesWsClient.request(method, params).await()
     },
-    eventsProvider: () -> Flow<WsEvent> = { HermesWsClient.events },
+    sourcedEventsProvider: () -> Flow<SourcedSessionLiveEvent> = {
+        HermesWsClient.sourcedEvents.map { sourced ->
+            SourcedSessionLiveEvent(sourced.event, sourced.profileId, sourced.connectionGeneration)
+        }
+    },
     connectionStatusProvider: () -> StateFlow<ConnectionStatus> = { HermesWsClient.connectionStatus },
+    selectedProfileIdsProvider: () -> Flow<String> = { AuthManager.selectedProfileIdFlow },
+    private val currentConnectionProvider: (String) -> SessionLiveConnection? = { profileId ->
+        HermesWsClient.connectionBinding(profileId)?.let { SessionLiveConnection(it.profileId, it.generation) }
+    },
+    private val isConnectionCurrent: (SessionLiveConnection) -> Boolean = { connection ->
+        HermesWsClient.connectionBinding(connection.profileId)?.generation == connection.generation
+    },
 ) : SessionLiveStatusSource {
-    override val events: Flow<WsEvent> by lazy { eventsProvider() }
+    override val sourcedEvents: Flow<SourcedSessionLiveEvent> by lazy { sourcedEventsProvider() }
     override val connectionStatus: StateFlow<ConnectionStatus> by lazy { connectionStatusProvider() }
+    override val selectedProfileIds: Flow<String> by lazy { selectedProfileIdsProvider() }
 
-    override suspend fun fetchActiveSessionsSnapshot(): LiveSessionSnapshot? =
+    override fun currentConnection(profileId: String): SessionLiveConnection? = currentConnectionProvider(profileId)
+
+    override suspend fun fetchActiveSessionsSnapshot(connection: SessionLiveConnection): LiveSessionSnapshot? =
         try {
+            if (!isConnectionCurrent(connection)) return null
             val raw = rpcRequest(WsMethods.SESSION_ACTIVE_LIST, emptyMap())
-            SessionLiveStatusDecoder.decodeSnapshot(raw)
+            if (!isConnectionCurrent(connection)) null else SessionLiveStatusDecoder.decodeSnapshot(raw)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {

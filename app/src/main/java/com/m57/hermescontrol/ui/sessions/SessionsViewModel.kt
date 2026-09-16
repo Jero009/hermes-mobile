@@ -5,11 +5,16 @@ import androidx.lifecycle.viewModelScope
 import com.m57.hermescontrol.data.model.BulkDeleteRequest
 import com.m57.hermescontrol.data.model.PruneRequest
 import com.m57.hermescontrol.data.model.SessionInfo
+import com.m57.hermescontrol.data.model.SessionLiveStatus
 import com.m57.hermescontrol.data.model.SessionRenameRequest
 import com.m57.hermescontrol.data.model.SessionSearchResult
 import com.m57.hermescontrol.data.remote.ApiClient
 import com.m57.hermescontrol.data.remote.NetworkResult
 import com.m57.hermescontrol.data.remote.safeApiCall
+import com.m57.hermescontrol.data.ws.ConnectionStatus
+import com.m57.hermescontrol.data.ws.HermesSessionLiveStatusSource
+import com.m57.hermescontrol.data.ws.SessionLiveConnection
+import com.m57.hermescontrol.data.ws.SessionLiveStatusSource
 import com.m57.hermescontrol.ui.common.ToastHost
 import com.m57.hermescontrol.ui.common.safeLaunchLoad
 import kotlinx.coroutines.CoroutineDispatcher
@@ -70,6 +75,7 @@ data class SessionsUiState(
     val isSearching: Boolean = false,
     val searchResults: List<SessionSearchResult> = emptyList(),
     val searchError: String? = null,
+    val liveStatuses: Map<String, SessionLiveStatus> = emptyMap(),
 ) {
     val hasMore: Boolean get() = !paginationExhausted && total > serverOffset
     val isSearchMode: Boolean get() = searchQuery.isNotBlank()
@@ -81,6 +87,7 @@ private fun com.m57.hermescontrol.data.model.SessionListResponse.nextOffset(requ
 class SessionsViewModel(
     private val pinStore: SessionPinStore = AuthManagerSessionPinStore(),
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val liveStatusSource: SessionLiveStatusSource = HermesSessionLiveStatusSource(),
 ) : ViewModel(), ToastHost {
     private val _uiState =
         MutableStateFlow(
@@ -93,11 +100,20 @@ class SessionsViewModel(
     private var loadGeneration = 0
     private var statsJob: Job? = null
     private var hydratePinsJob: Job? = null
+    private var liveTrackingJob: Job? = null
+    private var liveTrackingGeneration = 0L
+    private var liveEventRevision = 0L
+    private var liveTrackingState = SessionLiveTrackingState()
+    private var selectedLiveProfileId: String? = null
+    private var activeLiveConnection: SessionLiveConnection? = null
+    private var liveRefreshInFlight = false
+    private var liveRefreshPending = false
 
     /** Page size matches the desktop sidebar while staying below the server cap. */
     private companion object {
         const val PAGE_SIZE = 50
         const val SEARCH_DEBOUNCE_MS = 300L
+        const val LIVE_STATUS_POLL_INTERVAL_MS = 30_000L
     }
 
     /**
@@ -643,5 +659,133 @@ class SessionsViewModel(
 
     override fun clearToast() {
         _uiState.update { it.copy(toastMessage = null) }
+    }
+
+    // ── Live session status tracking ─────────────────────────────────────
+
+    fun startLiveStatusTracking() {
+        if (liveTrackingJob?.isActive == true) return
+        liveTrackingJob =
+            viewModelScope.launch {
+                launch {
+                    liveStatusSource.selectedProfileIds.collect { profileId ->
+                        if (selectedLiveProfileId != profileId) {
+                            selectedLiveProfileId = profileId
+                            resetLiveTracking()
+                            reconnectLiveTrackingIfPossible()
+                        }
+                    }
+                }
+                launch {
+                    liveStatusSource.connectionStatus.collect { status ->
+                        if (status == ConnectionStatus.CONNECTED) {
+                            reconnectLiveTrackingIfPossible()
+                        } else {
+                            resetLiveTracking()
+                        }
+                    }
+                }
+                launch {
+                    liveStatusSource.sourcedEvents.collect { sourced ->
+                        val connection = activeLiveConnection ?: return@collect
+                        if (sourced.profileId != selectedLiveProfileId ||
+                            sourced.profileId != connection.profileId ||
+                            sourced.connectionGeneration != connection.generation
+                        ) {
+                            return@collect
+                        }
+                        liveEventRevision++
+                        liveTrackingState =
+                            SessionLiveStatusReducer.applyWsEvent(liveTrackingState, sourced.event)
+                        publishLiveStatuses()
+                        if (liveRefreshInFlight) liveRefreshPending = true
+                    }
+                }
+                launch {
+                    while (true) {
+                        delay(LIVE_STATUS_POLL_INTERVAL_MS)
+                        requestLiveStatusSnapshot()
+                    }
+                }
+            }
+    }
+
+    fun stopLiveStatusTracking() {
+        liveTrackingJob?.cancel()
+        liveTrackingJob = null
+        selectedLiveProfileId = null
+        resetLiveTracking()
+    }
+
+    fun refreshLiveStatuses() {
+        requestLiveStatusSnapshot()
+    }
+
+    private fun reconnectLiveTrackingIfPossible() {
+        val profileId = selectedLiveProfileId ?: return
+        if (liveStatusSource.connectionStatus.value != ConnectionStatus.CONNECTED) return
+        val connection = liveStatusSource.currentConnection(profileId) ?: return
+        if (activeLiveConnection != connection) {
+            resetLiveTracking()
+            activeLiveConnection = connection
+        }
+        requestLiveStatusSnapshot()
+    }
+
+    private fun resetLiveTracking() {
+        liveTrackingGeneration++
+        liveEventRevision++
+        activeLiveConnection = null
+        liveRefreshInFlight = false
+        liveRefreshPending = false
+        liveTrackingState = SessionLiveStatusReducer.clear()
+        publishLiveStatuses()
+    }
+
+    private fun requestLiveStatusSnapshot() {
+        val connection = activeLiveConnection ?: return
+        if (liveTrackingJob?.isActive != true ||
+            liveStatusSource.connectionStatus.value != ConnectionStatus.CONNECTED
+        ) {
+            return
+        }
+        if (liveRefreshInFlight) {
+            liveRefreshPending = true
+            return
+        }
+        liveRefreshInFlight = true
+        val generation = liveTrackingGeneration
+        val eventRevision = liveEventRevision
+        viewModelScope.launch {
+            try {
+                val snapshot = liveStatusSource.fetchActiveSessionsSnapshot(connection)
+                if (snapshot != null &&
+                    generation == liveTrackingGeneration &&
+                    eventRevision == liveEventRevision &&
+                    connection == activeLiveConnection &&
+                    liveStatusSource.connectionStatus.value == ConnectionStatus.CONNECTED
+                ) {
+                    liveTrackingState = SessionLiveStatusReducer.applySnapshot(liveTrackingState, snapshot)
+                    publishLiveStatuses()
+                }
+            } finally {
+                if (generation == liveTrackingGeneration && connection == activeLiveConnection) {
+                    liveRefreshInFlight = false
+                    if (liveRefreshPending) {
+                        liveRefreshPending = false
+                        requestLiveStatusSnapshot()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun publishLiveStatuses() {
+        _uiState.update { it.copy(liveStatuses = liveTrackingState.liveStatuses) }
+    }
+
+    override fun onCleared() {
+        stopLiveStatusTracking()
+        super.onCleared()
     }
 }
