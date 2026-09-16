@@ -1274,6 +1274,8 @@ object HermesWsClient {
                 when (parsedEvent) {
                     is WsEvent.ServerRequest ->
                         parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
+                    is WsEvent.ServerRequestCancelled ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
                     is WsEvent.ApprovalRequest ->
                         parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
                     is WsEvent.SudoRequest ->
@@ -1305,6 +1307,30 @@ object HermesWsClient {
                 when (event) {
                     is WsEvent.RpcResult -> {
                         resolvePending(event.id, event.result, null)
+                        @Suppress("UNCHECKED_CAST")
+                        val openRequests =
+                            (event.result as? Map<*, *>)?.get("open_requests") as? List<Map<*, *>>
+                        openRequests?.forEach { openRequest ->
+                            val openId = openRequest["id"] as? String ?: return@forEach
+                            val method = openRequest["method"] as? String ?: return@forEach
+                            @Suppress("UNCHECKED_CAST")
+                            val params = openRequest["params"] as? Map<String, Any?> ?: emptyMap()
+                            parsedEvents.tryEmit(
+                                SourcedWsEvent(
+                                    event =
+                                        WsEvent.ServerRequest(
+                                            id = openId,
+                                            method = method,
+                                            params = params,
+                                            replayed = true,
+                                            sourceProfileId = profileId,
+                                            connectionGeneration = eventSocketGeneration,
+                                        ),
+                                    profileId = profileId,
+                                    connectionGeneration = eventSocketGeneration,
+                                ),
+                            )
+                        }
                     }
                     is WsEvent.RpcError -> {
                         pendingPromptSessions.remove(event.id)

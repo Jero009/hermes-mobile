@@ -24,6 +24,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okhttp3.mockwebserver.MockResponse
@@ -305,6 +310,96 @@ class HermesWsClientTest {
         assertTrue(HermesWsClient.pendingReply)
         assertTrue(HermesWsClient.isConnected)
     }
+
+    // ── Gateway server-request replies ───────────────────────────────────
+
+    private fun serverBinding(
+        requestId: String = "srq-1",
+        sessionId: String = "session-a",
+        profileId: String = "profile-a",
+        generation: Int = activeConnectionGeneration(),
+    ): ServerRequestBinding {
+        ActiveSessionHolder.set(sessionId)
+        return ServerRequestBinding(requestId, sessionId, profileId, generation)
+    }
+
+    @Test
+    fun serverRequestResponsePreservesExactIdAndHasNoMethod() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val socket = mockk<WebSocket>(relaxed = true)
+        every { socket.send(any<String>()) } returns true
+        installActiveListener(socket)
+
+        assertTrue(
+            HermesWsClient.respondToServerRequest(
+                serverBinding(requestId = "srq-exact"),
+                buildJsonObject { put("value", "accepted") },
+            ),
+        )
+
+        verify {
+            socket.send(
+                match<String> { raw ->
+                    val frame = Json.parseToJsonElement(raw).jsonObject
+                    frame["id"]?.jsonPrimitive?.content == "srq-exact" &&
+                        frame["result"]?.jsonObject?.get("value")?.jsonPrimitive?.content == "accepted" &&
+                        !frame.containsKey("method")
+                },
+            )
+        }
+    }
+
+    @Test
+    fun serverRequestResponseRejectsStaleBindingsAndDisconnect() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val socket = mockk<WebSocket>(relaxed = true)
+        every { socket.send(any<String>()) } returns true
+        installActiveListener(socket)
+        val current = serverBinding()
+
+        assertFalse(
+            HermesWsClient.respondToServerRequest(
+                current.copy(connectionGeneration = current.connectionGeneration - 1),
+                buildJsonObject {},
+            ),
+        )
+        every { AuthManager.getSelectedProfileId() } returns "profile-b"
+        assertFalse(HermesWsClient.respondToServerRequest(current, buildJsonObject {}))
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        ActiveSessionHolder.set("session-b")
+        assertFalse(HermesWsClient.respondToServerRequest(current, buildJsonObject {}))
+        HermesWsClient.disconnect()
+        assertFalse(HermesWsClient.respondToServerRequest(current, buildJsonObject {}))
+
+        verify(exactly = 0) { socket.send(any<String>()) }
+        assertTrue(outboundQueue().isEmpty())
+    }
+
+    @Test
+    fun replayedOpenRequestCarriesLiveConnectionProvenance() =
+        runBlocking {
+            every { AuthManager.getSelectedProfileId() } returns "profile-a"
+            val socket = mockk<WebSocket>(relaxed = true)
+            val listener = installActiveListener(socket)
+            val generation = activeConnectionGeneration()
+            val received =
+                async(start = CoroutineStart.UNDISPATCHED) {
+                    withTimeout(5_000) {
+                        HermesWsClient.events.first { it is WsEvent.ServerRequest && it.replayed }
+                    }
+                }
+
+            listener.onMessage(
+                socket,
+                """{"jsonrpc":"2.0","id":"resume-1","result":{"open_requests":[{"id":"srq-replay","method":"secret","params":{"session_id":"session-a"}}]}}""",
+            )
+            val event = received.await() as WsEvent.ServerRequest
+
+            assertEquals("srq-replay", event.id)
+            assertEquals("profile-a", event.sourceProfileId)
+            assertEquals(generation, event.connectionGeneration)
+            assertEquals("session-a", event.params["session_id"])
+        }
 
     // ── Privileged sends (hermes-agent d90045be2 / a77692158) ────────────
     //

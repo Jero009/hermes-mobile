@@ -273,6 +273,8 @@ sealed class WsEvent {
         val method: String,
         val reason: String,
         val sessionId: String? = null,
+        val sourceProfileId: String? = null,
+        val connectionGeneration: Int? = null,
     ) : WsEvent()
 
     /**
