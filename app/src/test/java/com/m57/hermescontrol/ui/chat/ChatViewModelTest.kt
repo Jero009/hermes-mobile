@@ -3909,6 +3909,73 @@ class ChatViewModelTest {
     // ── Gateway server-request regressions ─────────────────────────────────
 
     @Test
+    fun gatewayVault_promptsUseExactIdsAndMethodSpecificStringValues() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val bindings = mutableListOf<ServerRequestBinding>()
+            val results = mutableListOf<JsonElement>()
+            every { HermesWsClient.respondToServerRequest(capture(bindings), capture(results)) } returns true
+
+            mockEventsFlow.emit(serverRequest("code-id", "vault.code"))
+            runCurrent()
+            viewModel.respondToVault("01A9")
+            runCurrent()
+            mockEventsFlow.emit(serverRequest("login-id", "vault.save_login"))
+            runCurrent()
+            viewModel.respondToVaultLogin("alice", "pw")
+            runCurrent()
+
+            assertEquals(listOf("code-id", "login-id"), bindings.map { it.requestId })
+            assertTrue(bindings.all { it.runtimeSessionId == sessionId })
+            assertEquals("{\"value\":\"01A9\"}", results[0].toString())
+            assertEquals(
+                "{\"value\":\"{\\\"identifier\\\":\\\"alice\\\",\\\"password\\\":\\\"pw\\\"}\"}",
+                results[1].toString(),
+            )
+        }
+
+    @Test
+    fun gatewayVault_rejectedSendRetainsEnabledPromptAndDoubleSubmitWritesOnce() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            every { HermesWsClient.respondToServerRequest(any(), any()) } returns false
+            mockEventsFlow.emit(serverRequest("unlock-id", "vault.unlock_prompt"))
+            runCurrent()
+
+            viewModel.respondToVault("pw")
+            viewModel.respondToVault("pw")
+            runCurrent()
+
+            verify(exactly = 1) { HermesWsClient.respondToServerRequest(any(), any()) }
+            assertFalse(requireNotNull(viewModel.uiState.value.vaultPrompt).isSubmitting)
+        }
+
+    @Test
+    fun gatewayVault_replacementAndCancellationRequireFullIdentity() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(serverRequest("same", "vault.code"))
+            runCurrent()
+            val original = requireNotNull(viewModel.uiState.value.vaultPrompt)
+            mockEventsFlow.emit(serverRequest("same", "vault.code", replayed = true))
+            runCurrent()
+            assertEquals(original, viewModel.uiState.value.vaultPrompt)
+            mockEventsFlow.emit(serverRequest("replacement", "vault.code"))
+            runCurrent()
+            assertEquals("replacement", viewModel.uiState.value.vaultPrompt?.binding?.requestId)
+            mockEventsFlow.emit(
+                WsEvent.ServerRequestCancelled("replacement", "vault.code", "x", sessionId, "profile-a", 8),
+            )
+            runCurrent()
+            assertNotNull(viewModel.uiState.value.vaultPrompt)
+            mockEventsFlow.emit(
+                WsEvent.ServerRequestCancelled("replacement", "vault.code", "x", sessionId, "profile-a", 7),
+            )
+            runCurrent()
+            assertNull(viewModel.uiState.value.vaultPrompt)
+        }
+
+    @Test
     fun gatewayApproval_answersTheExactServerIdWithoutMethodRpc() =
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()

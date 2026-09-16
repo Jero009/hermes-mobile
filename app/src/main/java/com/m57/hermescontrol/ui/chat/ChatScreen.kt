@@ -445,6 +445,7 @@ fun ChatScreen(
         clarifyRequest = state.clarifyRequest,
         sudoPrompt = state.sudoPrompt,
         secretPrompt = state.secretPrompt,
+        vaultPrompt = state.vaultPrompt,
         listState = listState,
         scrollController = scrollController,
         snackbarHostState = snackbarHostState,

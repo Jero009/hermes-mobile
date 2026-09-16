@@ -138,6 +138,7 @@ data class ChatUiState(
     // Sudo / secret prompts — surfaced as dialogs (issue #524)
     val sudoPrompt: SudoPromptUi? = null,
     val secretPrompt: SecretPromptUi? = null,
+    val vaultPrompt: VaultPromptUi? = null,
     val showSessionPicker: Boolean = false,
     // Search state
     val isSearchActive: Boolean = false,
@@ -281,6 +282,15 @@ data class SecretPromptUi(
     val fullBinding: Any get() = serverRequestBinding ?: binding
     val requestId: String get() = binding.requestId
 }
+
+data class VaultPromptUi(
+    val binding: ServerRequestBinding,
+    val method: String,
+    val title: String? = null,
+    val prompt: String? = null,
+    val identifier: String? = null,
+    val isSubmitting: Boolean = false,
+)
 
 /** Expensive-model confirmation returned by the gateway's config.set RPC. */
 data class ModelSwitchConfirmation(
@@ -3523,6 +3533,27 @@ class ChatViewModel(
                     }
                 }
             }
+            "vault.code", "vault.unlock_prompt", "vault.save_login" -> {
+                val serverBinding =
+                    ServerRequestBinding(request.id, sessionId, binding.profileId, binding.connectionGeneration)
+                _uiState.update { state ->
+                    if (state.vaultPrompt?.binding == serverBinding && state.vaultPrompt.method == request.method) {
+                        state
+                    } else {
+                        state.copy(
+                            vaultPrompt =
+                                VaultPromptUi(
+                                    binding = serverBinding,
+                                    method = request.method,
+                                    title = request.params["title"] as? String,
+                                    prompt = request.params["prompt"] as? String,
+                                    identifier = request.params["identifier"] as? String,
+                                ),
+                            isAgentTyping = false,
+                        )
+                    }
+                }
+            }
             "approval" -> {
                 val duplicate =
                     _uiState.value.messages.any {
@@ -3620,6 +3651,15 @@ class ChatViewModel(
                         state
                     }
                 }
+            "vault.code", "vault.unlock_prompt", "vault.save_login" ->
+                _uiState.update { state ->
+                    val prompt = state.vaultPrompt
+                    if (prompt?.method == event.method && serverCancellationMatches(prompt.binding, event)) {
+                        state.copy(vaultPrompt = null)
+                    } else {
+                        state
+                    }
+                }
             "sudo" ->
                 _uiState.update { state ->
                     if (serverCancellationMatches(state.sudoPrompt?.serverRequestBinding, event)) {
@@ -3656,6 +3696,7 @@ class ChatViewModel(
                 messages = state.messages.map { message -> message.copy(approvalInfo = null) },
                 sudoPrompt = null,
                 secretPrompt = null,
+                vaultPrompt = null,
             )
         }
     }
@@ -3930,6 +3971,60 @@ class ChatViewModel(
     fun cancelSecret() {
         val prompt = _uiState.value.secretPrompt ?: return
         submitSecret(prompt, WsMethods.SECRET_CANCEL, emptyMap())
+    }
+
+    fun respondToVault(value: String) {
+        val prompt = _uiState.value.vaultPrompt ?: return
+        if (value.isBlank()) return
+        submitVault(prompt, value)
+    }
+
+    fun respondToVaultLogin(
+        identifier: String,
+        password: String,
+    ) {
+        val prompt = _uiState.value.vaultPrompt ?: return
+        if (identifier.isBlank() || password.isBlank()) return
+        submitVault(
+            prompt,
+            buildJsonObject {
+                put("identifier", identifier)
+                put("password", password)
+            }.toString(),
+        )
+    }
+
+    fun cancelVault() {
+        _uiState.value.vaultPrompt?.let { submitVault(it, "") }
+    }
+
+    fun dismissVault() = Unit
+
+    private fun submitVault(
+        expected: VaultPromptUi,
+        value: String,
+    ) {
+        val claimed = expected.copy(isSubmitting = true)
+        while (true) {
+            val state = _uiState.value
+            if (state.vaultPrompt != expected || expected.isSubmitting) return
+            if (_uiState.compareAndSet(state, state.copy(vaultPrompt = claimed))) break
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val accepted = wsClient.respondToServerRequest(claimed.binding, buildJsonObject { put("value", value) })
+            _uiState.update { state ->
+                if (state.vaultPrompt != claimed) {
+                    state
+                } else if (accepted) {
+                    state.copy(vaultPrompt = null)
+                } else {
+                    state.copy(
+                        vaultPrompt = claimed.copy(isSubmitting = false),
+                        errorMessage = privilegedFailureMessage(),
+                    )
+                }
+            }
+        }
     }
 
     private fun submitSudo(
