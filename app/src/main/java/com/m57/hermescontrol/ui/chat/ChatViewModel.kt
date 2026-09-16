@@ -3374,7 +3374,7 @@ class ChatViewModel(
         val acceptedRevision = repo.replacementGeneration(sessionId)
         viewModelScope.launch(Dispatchers.IO) {
             expected.serverRequestBinding?.let { serverBinding ->
-                val merged = expected.lockedAnswers + normalized
+                val merged = normalized + expected.lockedAnswers
                 val result =
                     if (expected.questions.isNotEmpty()) {
                         buildJsonObject {
@@ -3485,7 +3485,12 @@ class ChatViewModel(
                 request.connectionGeneration,
             ) ?: return
         when (request.method) {
-            "approval" ->
+            "approval" -> {
+                val duplicate =
+                    _uiState.value.messages.any {
+                        it.approvalInfo?.serverRequestBinding?.requestId == request.id
+                    }
+                if (duplicate) return
                 handleApprovalRequest(
                     WsEvent.ApprovalRequest(
                         command = request.params["command"] as? String,
@@ -3499,6 +3504,7 @@ class ChatViewModel(
                         serverRequestId = request.id,
                     ),
                 )
+            }
             "clarify" -> {
                 val locked =
                     (request.params["answers"] as? Map<*, *>)?.entries
@@ -3515,6 +3521,10 @@ class ChatViewModel(
                         )
                     }.orEmpty()
                 val first = questions.firstOrNull()
+                val current = _uiState.value.clarifyRequest
+                if (current?.serverRequestBinding?.requestId == request.id) {
+                    if (!request.replayed || current.questions.isNotEmpty()) return
+                }
                 handleWsEvent(
                     WsEvent.ClarifyRequest(
                         text = first?.question ?: request.params["question"] as? String,
@@ -3542,7 +3552,12 @@ class ChatViewModel(
                     state.copy(
                         messages =
                             state.messages.map { message ->
-                                if (message.approvalInfo?.serverRequestBinding?.requestId == event.id) {
+                                val binding = message.approvalInfo?.serverRequestBinding
+                                if (binding?.requestId == event.id &&
+                                    binding.runtimeSessionId == event.sessionId &&
+                                    binding.profileId == event.sourceProfileId &&
+                                    binding.connectionGeneration == event.connectionGeneration
+                                ) {
                                     message.copy(
                                         approvalInfo = null,
                                     )
@@ -3554,7 +3569,12 @@ class ChatViewModel(
                 }
             "clarify" ->
                 _uiState.update { state ->
-                    if (state.clarifyRequest?.serverRequestBinding?.requestId == event.id) {
+                    val binding = state.clarifyRequest?.serverRequestBinding
+                    if (binding?.requestId == event.id &&
+                        binding.runtimeSessionId == event.sessionId &&
+                        binding.profileId == event.sourceProfileId &&
+                        binding.connectionGeneration == event.connectionGeneration
+                    ) {
                         state.copy(
                             clarifyRequest = null,
                         )
