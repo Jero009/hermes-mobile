@@ -17,7 +17,9 @@ import io.mockk.unmockkAll
 import io.mockk.verify
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -562,6 +564,23 @@ class HermesWsClientTest {
 
             assertTrue(ping.await() >= 0L)
             assertTrue(HermesWsClient.isHealthy)
+        }
+
+    @Test
+    fun cancellingPingRemovesOwnedRequestAndTimeout() =
+        runBlocking {
+            val socket = mockk<WebSocket>(relaxed = true)
+            every { socket.send(any<String>()) } returns true
+            installActiveListener(socket)
+
+            val ping = launch(start = CoroutineStart.UNDISPATCHED) { HermesWsClient.ping(timeoutMs = 60_000) }
+            val pending = pendingCalls().values.single()!!
+            val timeoutJob = pendingTimeoutJob(pending)
+
+            ping.cancelAndJoin()
+
+            assertTrue("cancelled ping must remove its pending request", pendingCalls().isEmpty())
+            assertTrue("cancelled ping must cancel its timeout", timeoutJob.isCancelled)
         }
 
     // ── Privileged sends (hermes-agent d90045be2 / a77692158) ────────────
@@ -1119,6 +1138,12 @@ class HermesWsClientTest {
         field.isAccessible = true
         @Suppress("UNCHECKED_CAST")
         return field.get(HermesWsClient) as MutableMap<String, *>
+    }
+
+    private fun pendingTimeoutJob(pendingCall: Any): Job {
+        val field = pendingCall.javaClass.getDeclaredField("timeoutJob")
+        field.isAccessible = true
+        return field.get(pendingCall) as Job
     }
 
     private fun pendingPromptSessions(): MutableMap<*, *> {

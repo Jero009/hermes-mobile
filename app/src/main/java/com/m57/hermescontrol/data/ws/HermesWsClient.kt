@@ -211,7 +211,12 @@ object HermesWsClient {
 
     suspend fun ping(timeoutMs: Long = LIVENESS_PROBE_TIMEOUT_MS): Long {
         val start = monotonicTimeMs()
-        request(WsMethods.GATEWAY_PING, timeoutMs = timeoutMs).await()
+        val pendingRequest = request(WsMethods.GATEWAY_PING, timeoutMs = timeoutMs)
+        try {
+            pendingRequest.await()
+        } finally {
+            cancelPendingRequest(pendingRequest)
+        }
         val latency = (monotonicTimeMs() - start).coerceAtLeast(0L)
         lastPongTimestamp = monotonicTimeMs()
         return latency
@@ -815,6 +820,16 @@ object HermesWsClient {
         }
         disconnectIfIdleInBackground()
         return call
+    }
+
+    /** Remove a request abandoned by its owning coroutine and cancel its timeout. */
+    private fun cancelPendingRequest(deferred: CompletableDeferred<Any?>) {
+        val entry = pendingCalls.entries.firstOrNull { it.value.deferred === deferred } ?: return
+        if (pendingCalls.remove(entry.key, entry.value)) {
+            entry.value.timeoutJob?.cancel()
+            deferred.cancel()
+            disconnectIfIdleInBackground()
+        }
     }
 
     private val pendingReplayResponses = ConcurrentHashMap<String, ReplayAdmission>()
