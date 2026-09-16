@@ -301,8 +301,10 @@ private fun String?.isValidWebOrigin(): Boolean {
     val value = this ?: return false
     if (value.isBlank() || value != value.trim()) return false
     val uri = runCatching { java.net.URI(value) }.getOrNull() ?: return false
-    return (uri.scheme == "https" || uri.scheme == "http") &&
+    return (uri.scheme.equals("https", ignoreCase = true) || uri.scheme.equals("http", ignoreCase = true)) &&
         uri.host != null &&
+        uri.rawAuthority?.endsWith(":") == false &&
+        (uri.port == -1 || uri.port in 1..65535) &&
         uri.rawUserInfo == null &&
         uri.rawPath.isNullOrEmpty() &&
         uri.rawQuery == null &&

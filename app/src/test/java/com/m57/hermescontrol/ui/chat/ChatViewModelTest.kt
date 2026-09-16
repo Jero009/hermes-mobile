@@ -3990,6 +3990,33 @@ class ChatViewModelTest {
         }
 
     @Test
+    fun gatewayVault_originSchemeAndPortValidation() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val cases =
+                mapOf(
+                    "HTTPS://example.com" to true,
+                    "hTtP://example.com:1" to true,
+                    "https://example.com:65535" to true,
+                    "https://[::1]:443" to true,
+                    "https://example.com:" to false,
+                    "https://example.com:0" to false,
+                    "https://example.com:65536" to false,
+                    "https://example.com:-1" to false,
+                    "https://[::1]:" to false,
+                )
+            cases.entries.forEachIndexed { index, (origin, valid) ->
+                mockEventsFlow.emit(
+                    serverRequest("origin-$index", "vault.save_login", extra = mapOf("origin" to origin)),
+                )
+                runCurrent()
+                val prompt = requireNotNull(viewModel.uiState.value.vaultPrompt)
+                assertEquals(origin, prompt.requestedOrigin)
+                assertEquals(origin, valid, prompt.hasValidRequestedOrigin)
+            }
+        }
+
+    @Test
     fun gatewayVault_rejectedSendRetainsEnabledPromptAndDoubleSubmitWritesOnce() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
