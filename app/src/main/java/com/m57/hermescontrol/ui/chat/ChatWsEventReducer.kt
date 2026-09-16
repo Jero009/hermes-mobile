@@ -154,6 +154,12 @@ object ChatWsEventReducer {
             // A privileged frame the parser refused to bind. Never surfaced.
             is WsEvent.PrivilegedRequestRejected -> ReducerResult(state = state, streamingState = streamingState)
 
+            // Gateway server requests are translated/handled by the ViewModel.
+            is WsEvent.ServerRequest,
+            is WsEvent.ServerRequestCancelled,
+            is WsEvent.TranscriptResyncRequired,
+            -> ReducerResult(state = state, streamingState = streamingState)
+
             // ReactionEvent is handled by the ViewModel — purely cosmetic animation
             is WsEvent.ReactionEvent -> ReducerResult(state = state, streamingState = streamingState)
         }

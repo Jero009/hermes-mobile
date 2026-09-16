@@ -119,11 +119,12 @@ class ChatStreamingControllerTest {
         scope: CoroutineScope,
         uiState: MutableStateFlow<ChatUiState>,
         streamingState: MutableStateFlow<StreamingState>,
+        isTestEnvironment: () -> Boolean = { true },
     ) = ChatStreamingController(
         scope = scope,
         uiState = uiState,
         streamingState = streamingState,
         isCurrentSession = { true },
-        isTestEnvironment = { true },
+        isTestEnvironment = isTestEnvironment,
     )
 }

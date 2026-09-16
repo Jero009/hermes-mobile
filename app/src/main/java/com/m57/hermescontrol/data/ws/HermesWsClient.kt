@@ -30,6 +30,9 @@ import kotlinx.coroutines.flow.shareIn
 import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
@@ -71,6 +74,13 @@ class ConnectionBinding internal constructor(
     val profileId: String,
     val generation: Int,
     internal val socket: WebSocket,
+)
+
+data class ServerRequestBinding(
+    val requestId: String,
+    val runtimeSessionId: String,
+    val profileId: String,
+    val connectionGeneration: Int,
 )
 
 /**
@@ -656,6 +666,31 @@ object HermesWsClient {
             deferred
         }
 
+    /** Respond only on the socket/profile/session that originated this request. */
+    fun respondToServerRequest(
+        binding: ServerRequestBinding,
+        result: JsonElement,
+    ): Boolean =
+        synchronized(connectionLock) {
+            val ws = webSocket
+            if (!appInForeground.get() || !connected.get() || ws == null ||
+                binding.requestId.isBlank() || binding.runtimeSessionId.isBlank() ||
+                binding.connectionGeneration != activeConnectionGeneration ||
+                binding.profileId != activeConnectionProfileId ||
+                binding.profileId != AuthManager.getSelectedProfileId() ||
+                ActiveSessionHolder.activeSessionId.value != binding.runtimeSessionId
+            ) {
+                return@synchronized false
+            }
+            ws.send(
+                buildJsonObject {
+                    put("jsonrpc", "2.0")
+                    put("id", binding.requestId)
+                    put("result", result)
+                }.toString(),
+            )
+        }
+
     /** Capture the exact live profile/socket identity for a later bound request. */
     fun connectionBinding(expectedProfileId: String): ConnectionBinding? =
         synchronized(connectionLock) {
@@ -1237,6 +1272,8 @@ object HermesWsClient {
             // live request (or let a stale expiry clear a fresh dialog).
             val event =
                 when (parsedEvent) {
+                    is WsEvent.ServerRequest ->
+                        parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
                     is WsEvent.ApprovalRequest ->
                         parsedEvent.copy(sourceProfileId = profileId, connectionGeneration = eventSocketGeneration)
                     is WsEvent.SudoRequest ->

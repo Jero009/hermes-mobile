@@ -141,6 +141,8 @@ sealed class WsEvent {
         val questions: List<ClarifyQuestion> = emptyList(),
         val sourceProfileId: String? = null,
         val connectionGeneration: Int? = null,
+        val serverRequestId: String? = null,
+        val lockedAnswers: Map<String, String> = emptyMap(),
     ) : WsEvent()
 
     data class ClarifyExpire(
@@ -210,6 +212,7 @@ sealed class WsEvent {
         val timeoutSeconds: Double,
         val sourceProfileId: String? = null,
         val connectionGeneration: Int? = null,
+        val serverRequestId: String? = null,
     ) : WsEvent()
 
     // ── Sudo / secret requests ─────────────────────────────────────────
@@ -224,6 +227,7 @@ sealed class WsEvent {
         val sessionId: String?,
         val sourceProfileId: String? = null,
         val connectionGeneration: Int? = null,
+        val serverRequestId: String? = null,
     ) : WsEvent()
 
     data class SudoExpire(
@@ -245,6 +249,7 @@ sealed class WsEvent {
         val prompt: String? = null,
         val sourceProfileId: String? = null,
         val connectionGeneration: Int? = null,
+        val serverRequestId: String? = null,
     ) : WsEvent()
 
     data class SecretExpire(
@@ -252,6 +257,22 @@ sealed class WsEvent {
         val sessionId: String?,
         val sourceProfileId: String? = null,
         val connectionGeneration: Int? = null,
+    ) : WsEvent()
+
+    data class ServerRequest(
+        val id: String,
+        val method: String,
+        val params: Map<String, Any?> = emptyMap(),
+        val replayed: Boolean = false,
+        val sourceProfileId: String? = null,
+        val connectionGeneration: Int? = null,
+    ) : WsEvent()
+
+    data class ServerRequestCancelled(
+        val id: String,
+        val method: String,
+        val reason: String,
+        val sessionId: String? = null,
     ) : WsEvent()
 
     /**
