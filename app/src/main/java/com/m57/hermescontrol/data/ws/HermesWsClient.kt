@@ -116,6 +116,11 @@ object HermesWsClient {
 
     /** Keep a quiet socket alive across brief app switches. */
     private const val BACKGROUND_IDLE_GRACE_MS = 120_000L
+    private const val HEARTBEAT_INTERVAL_MS = 15_000L
+    private const val STALE_THRESHOLD_MS = 45_000L
+    private const val LIVENESS_PROBE_TIMEOUT_MS = 5_000L
+
+    private fun monotonicTimeMs(): Long = System.nanoTime() / 1_000_000L
 
     // ── Internal state (all access through synchronized / atomic) ────────
 
@@ -181,22 +186,35 @@ object HermesWsClient {
         private set
 
     val isHealthy: Boolean
-        get() = isConnected && (System.currentTimeMillis() - lastPongTimestamp < 60_000L)
+        get() = isConnected && (monotonicTimeMs() - lastPongTimestamp < STALE_THRESHOLD_MS)
 
     private var healthJob: Job? = null
 
     private fun startHealthTracking() {
         healthJob?.cancel()
-        lastPongTimestamp = System.currentTimeMillis()
+        lastPongTimestamp = monotonicTimeMs()
         healthJob =
             wsScope.launch {
                 while (connected.get()) {
-                    delay(30_000L)
-                    if (connected.get() && System.currentTimeMillis() - lastPongTimestamp > 60_000L) {
-                        Log.w(TAG, "WebSocket connection appears unhealthy (no frames received for > 60s)")
+                    delay(HEARTBEAT_INTERVAL_MS)
+                    if (!connected.get()) break
+                    val alive = runCatching { ping(LIVENESS_PROBE_TIMEOUT_MS) }.isSuccess
+                    if (!alive && monotonicTimeMs() - lastPongTimestamp > STALE_THRESHOLD_MS) {
+                        synchronized(connectionLock) {
+                            if (connected.get()) webSocket?.cancel()
+                        }
+                        break
                     }
                 }
             }
+    }
+
+    suspend fun ping(timeoutMs: Long = LIVENESS_PROBE_TIMEOUT_MS): Long {
+        val start = monotonicTimeMs()
+        request(WsMethods.GATEWAY_PING, timeoutMs = timeoutMs).await()
+        val latency = (monotonicTimeMs() - start).coerceAtLeast(0L)
+        lastPongTimestamp = monotonicTimeMs()
+        return latency
     }
 
     private fun stopHealthTracking() {
@@ -547,6 +565,7 @@ object HermesWsClient {
             if (clearPendingMessages) {
                 messageQueue.clear()
                 pendingPromptSessions.clear()
+                pendingReplayResponses.clear()
                 pendingReply = false
             }
             _connectionStatus.value = ConnectionStatus.DISCONNECTED
@@ -574,7 +593,15 @@ object HermesWsClient {
     private data class PendingCall(
         val method: String,
         val deferred: CompletableDeferred<Any?>,
+        val replayAdmission: ReplayAdmission? = null,
         var timeoutJob: Job? = null,
+    )
+
+    private data class ReplayAdmission(
+        val method: String,
+        val profileId: String,
+        val connectionGeneration: Int,
+        val runtimeSessionId: String,
     )
 
     /** Tracks in-flight [request] calls by their JSON-RPC id. */
@@ -599,7 +626,12 @@ object HermesWsClient {
             val deferred = CompletableDeferred<Any?>()
             val id =
                 send(method, params) { reqId ->
-                    pendingCalls[reqId] = PendingCall(method, deferred)
+                    pendingCalls[reqId] =
+                        PendingCall(
+                            method,
+                            deferred,
+                            replayAdmission = replayAdmission(method, params),
+                        )
                 }
             // Arm the per-request timeout (fires if the server never answers).
             pendingCalls[id]?.timeoutJob =
@@ -773,8 +805,8 @@ object HermesWsClient {
         id: String,
         result: Any?,
         error: JsonRpcError?,
-    ) {
-        val call = pendingCalls.remove(id) ?: return
+    ): PendingCall? {
+        val call = pendingCalls.remove(id) ?: return null
         call.timeoutJob?.cancel()
         if (error != null) {
             call.deferred.completeExceptionally(HermesRpcException(error.message))
@@ -782,7 +814,31 @@ object HermesWsClient {
             call.deferred.complete(result)
         }
         disconnectIfIdleInBackground()
+        return call
     }
+
+    private val pendingReplayResponses = ConcurrentHashMap<String, ReplayAdmission>()
+
+    private fun replayAdmission(
+        method: String,
+        params: Map<String, Any>,
+    ): ReplayAdmission? {
+        if (method != WsMethods.SESSION_RESUME) return null
+        val sessionId = (params["session_id"] as? String)?.takeIf { it.isNotBlank() } ?: return null
+        val profileId = activeConnectionProfileId ?: return null
+        if (!connected.get() || activeConnectionGeneration < 0) return null
+        return ReplayAdmission(method, profileId, activeConnectionGeneration, sessionId)
+    }
+
+    private fun ReplayAdmission.isCurrent(
+        profileId: String,
+        generation: Int,
+    ): Boolean =
+        method == WsMethods.SESSION_RESUME &&
+            this.profileId == profileId &&
+            connectionGeneration == generation &&
+            AuthManager.getSelectedProfileId() == profileId &&
+            ActiveSessionHolder.activeSessionId.value == runtimeSessionId
 
     /**
      * Fail and clear every in-flight [request]. Called on disconnect /
@@ -866,6 +922,9 @@ object HermesWsClient {
                 startConnectionLocked()
             }
             if (accepted) disconnectIfIdleInBackground()
+            if (accepted && !pendingCalls.containsKey(id)) {
+                replayAdmission(method, params)?.let { pendingReplayResponses[id] = it }
+            }
         }
         return id
     }
@@ -1297,7 +1356,7 @@ object HermesWsClient {
                     Log.d(TAG, "Ignoring stale WebSocket message after parsing")
                     return
                 }
-                lastPongTimestamp = System.currentTimeMillis()
+                lastPongTimestamp = monotonicTimeMs()
                 // A parsed gateway frame proves that the fresh ticket established
                 // a usable session. Do not reset on unknown/auth-noise frames: that
                 // could otherwise permit an immediate rejection loop.
@@ -1306,15 +1365,28 @@ object HermesWsClient {
                 }
                 when (event) {
                     is WsEvent.RpcResult -> {
-                        resolvePending(event.id, event.result, null)
+                        val replayAdmission =
+                            resolvePending(event.id, event.result, null)?.replayAdmission
+                                ?: pendingReplayResponses.remove(event.id)
+                        val admittedReplay =
+                            replayAdmission?.takeIf { admission ->
+                                profileId != null && admission.isCurrent(profileId, eventSocketGeneration)
+                            }
+                        val replaySessionId = admittedReplay?.runtimeSessionId
                         @Suppress("UNCHECKED_CAST")
                         val openRequests =
-                            (event.result as? Map<*, *>)?.get("open_requests") as? List<Map<*, *>>
+                            if (replaySessionId != null) {
+                                (event.result as? Map<*, *>)?.get("open_requests") as? List<Map<*, *>>
+                            } else {
+                                null
+                            }
                         openRequests?.forEach { openRequest ->
-                            val openId = openRequest["id"] as? String ?: return@forEach
-                            val method = openRequest["method"] as? String ?: return@forEach
+                            val openId = (openRequest["id"] as? String)?.takeIf { it.isNotBlank() } ?: return@forEach
+                            val method = (openRequest["method"] as? String)?.takeIf { it.isNotBlank() } ?: return@forEach
+
                             @Suppress("UNCHECKED_CAST")
-                            val params = openRequest["params"] as? Map<String, Any?> ?: emptyMap()
+                            val params = openRequest["params"] as? Map<String, Any?> ?: return@forEach
+                            if (params["session_id"] != replaySessionId) return@forEach
                             parsedEvents.tryEmit(
                                 SourcedWsEvent(
                                     event =
@@ -1334,6 +1406,7 @@ object HermesWsClient {
                     }
                     is WsEvent.RpcError -> {
                         pendingPromptSessions.remove(event.id)
+                        pendingReplayResponses.remove(event.id)
                         pendingReply = pendingPromptSessions.isNotEmpty()
                         resolvePending(event.id, null, event.error)
                     }

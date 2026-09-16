@@ -111,6 +111,28 @@ class EventParserTest {
     }
 
     @Test
+    fun testParseRequestCancel_rejectsMissingOrBlankIdentity() {
+        listOf(
+            mapOf("method" to "secret", "session_id" to "session-1"),
+            mapOf("id" to "", "method" to "secret", "session_id" to "session-1"),
+            mapOf("id" to "srq-1", "method" to "", "session_id" to "session-1"),
+            mapOf("id" to "srq-1", "method" to "secret"),
+        ).forEach { payload ->
+            val event =
+                EventParser.parse(
+                    createJsonRpcResponse(
+                        jsonrpc = "2.0",
+                        id = null,
+                        method = "event",
+                        params = mapOf("type" to "request.cancel", "payload" to payload),
+                    ),
+                )
+
+            assertTrue("Expected malformed cancellation to be unknown: $payload", event is WsEvent.Unknown)
+        }
+    }
+
+    @Test
     fun testParseRpcError_returnsRpcErrorEvent() {
         val error = JsonRpcError(code = -32600, message = "Invalid Request")
         val response =

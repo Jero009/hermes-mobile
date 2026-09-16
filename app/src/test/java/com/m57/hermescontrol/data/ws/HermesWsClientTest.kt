@@ -24,6 +24,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
@@ -380,8 +381,15 @@ class HermesWsClientTest {
         runBlocking {
             every { AuthManager.getSelectedProfileId() } returns "profile-a"
             val socket = mockk<WebSocket>(relaxed = true)
+            every { socket.send(any<String>()) } returns true
             val listener = installActiveListener(socket)
             val generation = activeConnectionGeneration()
+            ActiveSessionHolder.set("session-a")
+            val resumeId =
+                HermesWsClient.send(
+                    WsMethods.SESSION_RESUME,
+                    mapOf("session_id" to "session-a", "omit_messages" to true),
+                )
             val received =
                 async(start = CoroutineStart.UNDISPATCHED) {
                     withTimeout(5_000) {
@@ -391,7 +399,7 @@ class HermesWsClientTest {
 
             listener.onMessage(
                 socket,
-                """{"jsonrpc":"2.0","id":"resume-1","result":{"open_requests":[{"id":"srq-replay","method":"secret","params":{"session_id":"session-a"}}]}}""",
+                """{"jsonrpc":"2.0","id":"$resumeId","result":{"open_requests":[{"id":"srq-replay","method":"secret","params":{"session_id":"session-a"}}]}}""",
             )
             val event = received.await() as WsEvent.ServerRequest
 
@@ -399,6 +407,78 @@ class HermesWsClientTest {
             assertEquals("profile-a", event.sourceProfileId)
             assertEquals(generation, event.connectionGeneration)
             assertEquals("session-a", event.params["session_id"])
+        }
+
+    @Test
+    fun replayedOpenRequestsRejectUnknownUnrelatedDuplicateStaleAndMalformedResults() =
+        runBlocking {
+            every { AuthManager.getSelectedProfileId() } returns "profile-a"
+            val socket = mockk<WebSocket>(relaxed = true)
+            every { socket.send(any<String>()) } returns true
+            val listener = installActiveListener(socket)
+            ActiveSessionHolder.set("session-a")
+
+            suspend fun assertNoReplay(id: String, openRequest: String) {
+                val received =
+                    async(start = CoroutineStart.UNDISPATCHED) {
+                        withTimeoutOrNull(100) {
+                            HermesWsClient.events.first { it is WsEvent.ServerRequest && it.replayed }
+                        }
+                    }
+                listener.onMessage(
+                    socket,
+                    """{"jsonrpc":"2.0","id":"$id","result":{"open_requests":[$openRequest]}}""",
+                )
+                assertNull(received.await())
+            }
+
+            val valid =
+                """{"id":"srq","method":"secret","params":{"session_id":"session-a"}}"""
+            assertNoReplay("unknown", valid)
+
+            val unrelatedId = HermesWsClient.send(WsMethods.SESSION_LIST)
+            assertNoReplay(unrelatedId, valid)
+
+            val duplicateId =
+                HermesWsClient.send(WsMethods.SESSION_RESUME, mapOf("session_id" to "session-a"))
+            listener.onMessage(
+                socket,
+                """{"jsonrpc":"2.0","id":"$duplicateId","result":{"open_requests":[]}}""",
+            )
+            assertNoReplay(duplicateId, valid)
+
+            val staleId =
+                HermesWsClient.send(WsMethods.SESSION_RESUME, mapOf("session_id" to "session-a"))
+            ActiveSessionHolder.set("session-b")
+            assertNoReplay(staleId, valid)
+            ActiveSessionHolder.set("session-a")
+
+            val malformedId =
+                HermesWsClient.send(WsMethods.SESSION_RESUME, mapOf("session_id" to "session-a"))
+            assertNoReplay(malformedId, """{"id":"","method":"secret","params":{"session_id":"session-a"}}""")
+        }
+
+    @Test
+    fun pingUsesAwaitedGatewayRequest() =
+        runBlocking {
+            val socket = mockk<WebSocket>(relaxed = true)
+            val sent = mutableListOf<String>()
+            every { socket.send(any<String>()) } answers {
+                sent += invocation.args[0] as String
+                true
+            }
+            val listener = installActiveListener(socket)
+
+            val ping = async(start = CoroutineStart.UNDISPATCHED) { HermesWsClient.ping(timeoutMs = 1_000) }
+            val frame = Json.parseToJsonElement(sent.single()).jsonObject
+            assertEquals(WsMethods.GATEWAY_PING, frame["method"]?.jsonPrimitive?.content)
+            listener.onMessage(
+                socket,
+                """{"jsonrpc":"2.0","id":"${frame["id"]!!.jsonPrimitive.content}","result":{"ok":true}}""",
+            )
+
+            assertTrue(ping.await() >= 0L)
+            assertTrue(HermesWsClient.isHealthy)
         }
 
     // ── Privileged sends (hermes-agent d90045be2 / a77692158) ────────────
