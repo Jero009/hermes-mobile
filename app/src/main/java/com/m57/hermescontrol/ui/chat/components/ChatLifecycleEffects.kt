@@ -30,6 +30,7 @@ import com.m57.hermescontrol.ui.chat.ChatViewModel
 import com.m57.hermescontrol.ui.chat.ClarifyUi
 import com.m57.hermescontrol.ui.chat.SecretPromptUi
 import com.m57.hermescontrol.ui.chat.SudoPromptUi
+import com.m57.hermescontrol.ui.chat.VaultPromptUi
 
 @Composable
 fun ChatLifecycleEffects(
@@ -47,6 +48,7 @@ fun ChatLifecycleEffects(
     clarifyRequest: ClarifyUi?,
     sudoPrompt: SudoPromptUi?,
     secretPrompt: SecretPromptUi?,
+    vaultPrompt: VaultPromptUi?,
     listState: LazyListState,
     scrollController: ChatScrollController,
     snackbarHostState: SnackbarHostState,
@@ -163,9 +165,9 @@ fun ChatLifecycleEffects(
 
     // Sudo / secret prompt dialogs (issue #524)
     sudoPrompt?.let { prompt ->
-        key(prompt.binding) {
+        key(prompt.fullBinding) {
             SudoPromptDialog(
-                binding = prompt.binding,
+                binding = prompt.fullBinding,
                 onConfirm = viewModel::respondToSudo,
                 onCancel = viewModel::cancelSudo,
                 onDismiss = viewModel::dismissSudo,
@@ -175,15 +177,27 @@ fun ChatLifecycleEffects(
     }
 
     secretPrompt?.let { prompt ->
-        key(prompt.binding) {
+        key(prompt.fullBinding) {
             SecretPromptDialog(
-                binding = prompt.binding,
+                binding = prompt.fullBinding,
                 onConfirm = viewModel::respondToSecret,
                 onCancel = viewModel::cancelSecret,
                 onDismiss = viewModel::dismissSecret,
                 envVar = prompt.envVar,
                 prompt = prompt.prompt,
                 isSubmitting = prompt.isSubmitting,
+            )
+        }
+    }
+
+    vaultPrompt?.let { prompt ->
+        key(prompt.binding, prompt.method) {
+            VaultPromptDialog(
+                prompt = prompt,
+                onConfirm = viewModel::respondToVault,
+                onConfirmLogin = viewModel::respondToVaultLogin,
+                onCancel = viewModel::cancelVault,
+                onDismiss = viewModel::dismissVault,
             )
         }
     }

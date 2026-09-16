@@ -23,6 +23,7 @@ import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.JsonRpcError
 import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
+import com.m57.hermescontrol.data.ws.ServerRequestBinding
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
 import com.m57.hermescontrol.ui.chat.fakes.FakeChatMessageDao
@@ -53,6 +54,9 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -80,12 +84,14 @@ class ChatViewModelTest {
 
     /** Counter used to generate unique WS request IDs. */
     private var reqCount = 0
+    private val sentRequestIds = mutableMapOf<String, MutableList<String>>()
 
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
         val testMainDispatcher = Dispatchers.Main
         reqCount = 0
+        sentRequestIds.clear()
 
         mockkStatic(Log::class)
         every { Log.d(any(), any()) } returns 0
@@ -130,22 +136,24 @@ class ChatViewModelTest {
         every { HermesWsClient.send(any(), any(), any()) } answers {
             reqCount++
             val id = "req-id-$reqCount"
+            sentRequestIds.getOrPut(arg(0)) { mutableListOf() } += id
             arg<((String) -> Unit)?>(2)?.invoke(id)
             id
         }
-        every { HermesWsClient.sendMessage(any(), any(), any(), any()) } answers {
+        every { HermesWsClient.sendMessageForConnection(any(), any(), any(), any()) } answers {
             reqCount++
             val id = "req-msg-$reqCount"
-            arg<((String) -> Unit)?>(2)?.invoke(id)
-            id
+            arg<((String) -> Unit)?>(3)?.invoke(id)
+            true
         }
-        every { HermesWsClient.sendRedirect(any(), any(), any()) } answers {
+        every { HermesWsClient.sendRedirectForConnection(any(), any(), any(), any()) } answers {
             reqCount++
             val id = "req-redirect-$reqCount"
-            arg<((String) -> Unit)?>(2)?.invoke(id)
-            id
+            arg<((String) -> Unit)?>(3)?.invoke(id)
+            true
         }
         every { HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any()) } returns true
+        every { HermesWsClient.respondToServerRequest(any(), any()) } returns true
         every { HermesWsClient.request(WsMethods.CONFIG_SET, any(), any()) } returns
             CompletableDeferred<Any?>(mapOf("ok" to true))
         every { HermesWsClient.connectionBinding("profile-a") } returns mockk()
@@ -241,8 +249,8 @@ class ChatViewModelTest {
      * Create ViewModel, simulate GatewayReady, feed SESSION_CREATE result,
      * and return a Pair(viewModel, sessionId).
      *
-     * Request ID sequence: GatewayReady triggers loadSessions (req-id-1),
-     * fetchCommandCatalog (req-id-2), then createNewSession (req-id-3).
+     * Captures the real session.create ID so unrelated startup requests cannot
+     * make this helper accidentally resolve the wrong pending callback.
      */
     private suspend fun TestScope.createViewModelWithSession(
         startCleanup: Boolean = false,
@@ -254,16 +262,16 @@ class ChatViewModelTest {
         mockEventsFlow.emit(WsEvent.GatewayReady(null))
         advanceUntilIdle()
 
-        // Emit SESSION_CREATE result (req-id-3 — after loadSessions and fetchCommandCatalog)
-        mockEventsFlow.emit(WsEvent.RpcResult("req-id-3", mapOf("session_id" to "session-123")))
+        val createRequestId = sentRequestIds[WsMethods.SESSION_CREATE]?.lastOrNull()
+        checkNotNull(createRequestId) { "session.create was not sent" }
+        mockEventsFlow.emit(WsEvent.RpcResult(createRequestId, mapOf("session_id" to "session-123")))
         advanceUntilIdle()
 
         // Sanity check: confirm the session was actually set
         val session = viewModel.uiState.value.currentSessionId
         checkNotNull(session) {
             "createViewModelWithSession: session was not set — " +
-                "req-id-3 did not match SESSION_CREATE. " +
-                "If the req sequence changed, update the RpcResult id here."
+                "$createRequestId did not resolve SESSION_CREATE."
         }
 
         return Pair(viewModel, "session-123")
@@ -1475,7 +1483,21 @@ class ChatViewModelTest {
     @Test
     fun testModelPickerSelection_confirmsExpensiveModelBeforeUpdatingLabel() =
         runTest {
-            val (viewModel, _) = createViewModelWithSession()
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(
+                WsEvent.SessionUsage(
+                    data =
+                        mapOf(
+                            "usage" to
+                                mapOf(
+                                    "context_used" to 12_000L,
+                                    "context_max" to 272_000L,
+                                ),
+                        ),
+                    sessionId = sessionId,
+                ),
+            )
+            advanceUntilIdle()
             val calls = mutableListOf<Map<String, Any>>()
             every { HermesWsClient.request(WsMethods.CONFIG_SET, any(), any()) } answers {
                 val params = arg<Map<String, Any>>(1)
@@ -1511,6 +1533,8 @@ class ChatViewModelTest {
             advanceUntilIdle()
 
             assertEquals("openai/gpt-expensive", viewModel.uiState.value.currentSessionModel)
+            assertEquals(12_000L, viewModel.uiState.value.contextUsage?.usedTokens)
+            assertNull(viewModel.uiState.value.contextUsage?.maxTokens)
             assertNull(viewModel.uiState.value.modelSwitchConfirmation)
             assertEquals(true, calls.last()["confirm_expensive_model"])
         }
@@ -2376,10 +2400,10 @@ class ChatViewModelTest {
             assertTrue(viewModel.uiState.value.isAgentTyping)
 
             verify {
-                HermesWsClient.sendMessage(
+                HermesWsClient.sendMessageForConnection(
+                    any(),
                     sessionId,
                     "Hello Hermes",
-                    any(),
                     any(),
                 )
             }
@@ -2395,10 +2419,10 @@ class ChatViewModelTest {
             advanceUntilIdle()
             assertTrue(viewModel.uiState.value.isAgentTyping)
             verify {
-                HermesWsClient.sendMessage(
+                HermesWsClient.sendMessageForConnection(
+                    any(),
                     sessionId,
                     "Hello Hermes",
-                    any(),
                     any(),
                 )
             }
@@ -2407,7 +2431,7 @@ class ChatViewModelTest {
             viewModel.sendMessage("Wait, correction")
             advanceUntilIdle()
 
-            verify { HermesWsClient.sendRedirect(sessionId, "Wait, correction", any()) }
+            verify { HermesWsClient.sendRedirectForConnection(any(), sessionId, "Wait, correction", any()) }
         }
 
     @Test
@@ -2432,9 +2456,9 @@ class ChatViewModelTest {
             viewModel.sendMessage("with a file")
             advanceUntilIdle()
 
-            verify(exactly = 0) { HermesWsClient.sendRedirect(any(), any(), any()) }
+            verify(exactly = 0) { HermesWsClient.sendRedirectForConnection(any(), any(), any(), any()) }
             verify {
-                HermesWsClient.sendMessage(sessionId, any(), any(), any())
+                HermesWsClient.sendMessageForConnection(any(), sessionId, any(), any())
             }
         }
 
@@ -2446,15 +2470,15 @@ class ChatViewModelTest {
             viewModel.sendMessage("Hello Hermes")
             advanceUntilIdle()
 
-            every { HermesWsClient.sendRedirect(any(), any(), any()) } answers {
+            every { HermesWsClient.sendRedirectForConnection(any(), any(), any(), any()) } answers {
                 val id = "req-redirect-capture"
-                arg<((String) -> Unit)?>(2)?.invoke(id)
-                id
+                arg<((String) -> Unit)?>(3)?.invoke(id)
+                true
             }
 
             viewModel.sendMessage("Wait, correction")
             advanceUntilIdle()
-            verify { HermesWsClient.sendRedirect(sessionId, "Wait, correction", any()) }
+            verify { HermesWsClient.sendRedirectForConnection(any(), sessionId, "Wait, correction", any()) }
 
             // A gateway whose agent cannot steer answers 4010. The text must be
             // resent as a normal prompt, not surfaced as an error.
@@ -2467,10 +2491,10 @@ class ChatViewModelTest {
             advanceUntilIdle()
 
             verify {
-                HermesWsClient.sendMessage(
+                HermesWsClient.sendMessageForConnection(
+                    any(),
                     sessionId,
                     "Wait, correction",
-                    any(),
                     any(),
                 )
             }
@@ -2485,10 +2509,10 @@ class ChatViewModelTest {
             viewModel.sendMessage("Hello Hermes")
             advanceUntilIdle()
 
-            every { HermesWsClient.sendRedirect(any(), any(), any()) } answers {
+            every { HermesWsClient.sendRedirectForConnection(any(), any(), any(), any()) } answers {
                 val id = "req-redirect-other"
-                arg<((String) -> Unit)?>(2)?.invoke(id)
-                id
+                arg<((String) -> Unit)?>(3)?.invoke(id)
+                true
             }
 
             viewModel.sendMessage("Wait, correction")
@@ -2505,10 +2529,10 @@ class ChatViewModelTest {
             advanceUntilIdle()
 
             verify(exactly = 0) {
-                HermesWsClient.sendMessage(
+                HermesWsClient.sendMessageForConnection(
+                    any(),
                     sessionId,
                     "Wait, correction",
-                    any(),
                     any(),
                 )
             }
@@ -3882,6 +3906,355 @@ class ChatViewModelTest {
         cancelApproval(message.id, requireNotNull(message.approvalInfo).privilegedBinding)
     }
 
+    private fun serverRequest(
+        id: String,
+        method: String,
+        sessionId: String = "session-123",
+        replayed: Boolean = false,
+        generation: Int = 7,
+        extra: Map<String, Any?> = emptyMap(),
+    ) = WsEvent.ServerRequest(
+        id = id,
+        method = method,
+        params = mapOf("session_id" to sessionId) + extra,
+        replayed = replayed,
+        sourceProfileId = "profile-a",
+        connectionGeneration = generation,
+    )
+
+    // ── Gateway server-request regressions ─────────────────────────────────
+
+    @Test
+    fun gatewayVault_promptsUseExactIdsAndMethodSpecificStringValues() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val bindings = mutableListOf<ServerRequestBinding>()
+            val results = mutableListOf<JsonElement>()
+            every { HermesWsClient.respondToServerRequest(capture(bindings), capture(results)) } returns true
+
+            mockEventsFlow.emit(serverRequest("code-id", "vault.code"))
+            runCurrent()
+            viewModel.respondToVault("01A9")
+            runCurrent()
+            mockEventsFlow.emit(
+                serverRequest("login-id", "vault.save_login", extra = mapOf("origin" to "https://example.com")),
+            )
+            runCurrent()
+            viewModel.respondToVaultLogin("alice", "pw")
+            runCurrent()
+
+            assertEquals(listOf("code-id", "login-id"), bindings.map { it.requestId })
+            assertTrue(bindings.all { it.runtimeSessionId == sessionId })
+            assertEquals("{\"value\":\"01A9\"}", results[0].toString())
+            assertEquals(
+                "{\"value\":\"{\\\"identifier\\\":\\\"alice\\\",\\\"password\\\":\\\"pw\\\"}\"}",
+                results[1].toString(),
+            )
+        }
+
+    @Test
+    fun gatewayVault_saveLoginRetainsAndValidatesRequestedOrigin() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            every { HermesWsClient.respondToServerRequest(any(), any()) } returns true
+
+            mockEventsFlow.emit(
+                serverRequest(
+                    "valid",
+                    "vault.save_login",
+                    extra = mapOf("site" to "https://EXAMPLE.com:8443", "title" to "Misleading title"),
+                ),
+            )
+            runCurrent()
+            assertEquals("https://EXAMPLE.com:8443", viewModel.uiState.value.vaultPrompt?.requestedOrigin)
+            assertTrue(requireNotNull(viewModel.uiState.value.vaultPrompt).hasValidRequestedOrigin)
+
+            mockEventsFlow.emit(
+                serverRequest("missing", "vault.save_login", extra = mapOf("domain" to "example.com")),
+            )
+            runCurrent()
+            assertFalse(requireNotNull(viewModel.uiState.value.vaultPrompt).hasValidRequestedOrigin)
+            viewModel.respondToVaultLogin("alice", "pw")
+            runCurrent()
+            verify(exactly = 0) { HermesWsClient.respondToServerRequest(any(), any()) }
+
+            mockEventsFlow.emit(
+                serverRequest(
+                    "invalid",
+                    "vault.save_login",
+                    extra = mapOf("origin" to "https://user@example.com/path?query=1"),
+                ),
+            )
+            runCurrent()
+            assertFalse(requireNotNull(viewModel.uiState.value.vaultPrompt).hasValidRequestedOrigin)
+        }
+
+    @Test
+    fun gatewayVault_originSchemeAndPortValidation() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val cases =
+                mapOf(
+                    "HTTPS://example.com" to true,
+                    "hTtP://example.com:1" to true,
+                    "https://example.com:65535" to true,
+                    "https://[::1]:443" to true,
+                    "https://example.com:" to false,
+                    "https://example.com:0" to false,
+                    "https://example.com:65536" to false,
+                    "https://example.com:-1" to false,
+                    "https://[::1]:" to false,
+                )
+            cases.entries.forEachIndexed { index, (origin, valid) ->
+                mockEventsFlow.emit(
+                    serverRequest("origin-$index", "vault.save_login", extra = mapOf("origin" to origin)),
+                )
+                runCurrent()
+                val prompt = requireNotNull(viewModel.uiState.value.vaultPrompt)
+                assertEquals(origin, prompt.requestedOrigin)
+                assertEquals(origin, valid, prompt.hasValidRequestedOrigin)
+            }
+        }
+
+    @Test
+    fun gatewayVault_rejectedSendRetainsEnabledPromptAndDoubleSubmitWritesOnce() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            every { HermesWsClient.respondToServerRequest(any(), any()) } returns false
+            mockEventsFlow.emit(serverRequest("unlock-id", "vault.unlock_prompt"))
+            runCurrent()
+
+            viewModel.respondToVault("pw")
+            viewModel.respondToVault("pw")
+            runCurrent()
+
+            verify(exactly = 1) { HermesWsClient.respondToServerRequest(any(), any()) }
+            assertFalse(requireNotNull(viewModel.uiState.value.vaultPrompt).isSubmitting)
+        }
+
+    @Test
+    fun gatewayVault_replacementAndCancellationRequireFullIdentity() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(serverRequest("same", "vault.code"))
+            runCurrent()
+            val original = requireNotNull(viewModel.uiState.value.vaultPrompt)
+            mockEventsFlow.emit(serverRequest("same", "vault.code", replayed = true))
+            runCurrent()
+            assertEquals(original, viewModel.uiState.value.vaultPrompt)
+            mockEventsFlow.emit(serverRequest("replacement", "vault.code"))
+            runCurrent()
+            assertEquals("replacement", viewModel.uiState.value.vaultPrompt?.binding?.requestId)
+            mockEventsFlow.emit(
+                WsEvent.ServerRequestCancelled("replacement", "vault.code", "x", sessionId, "profile-a", 8),
+            )
+            runCurrent()
+            assertNotNull(viewModel.uiState.value.vaultPrompt)
+            mockEventsFlow.emit(
+                WsEvent.ServerRequestCancelled("replacement", "vault.code", "x", sessionId, "profile-a", 7),
+            )
+            runCurrent()
+            assertNull(viewModel.uiState.value.vaultPrompt)
+        }
+
+    @Test
+    fun gatewayApproval_answersTheExactServerIdWithoutMethodRpc() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val binding = slot<ServerRequestBinding>()
+            val result = slot<JsonElement>()
+            every { HermesWsClient.respondToServerRequest(capture(binding), capture(result)) } returns true
+
+            mockEventsFlow.emit(serverRequest("wire-approval-42", "approval", extra = mapOf("command" to "pwd")))
+            runCurrent()
+            viewModel.respondToApproval("approve")
+            runCurrent()
+
+            assertEquals("wire-approval-42", binding.captured.requestId)
+            assertEquals(sessionId, binding.captured.runtimeSessionId)
+            assertTrue(result.captured.toString().contains("\"choice\":\"once\""))
+            verify(exactly = 0) { HermesWsClient.privilegedRequest(any(), any(), any()) }
+            assertNull(viewModel.approvalMessage())
+        }
+
+    @Test
+    fun gatewayApproval_failedResponseRetainsCardAndPermanentChoicesStayBlocked() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            every { HermesWsClient.respondToServerRequest(any(), any()) } returns false
+            mockEventsFlow.emit(serverRequest("wire-approval-fail", "approval"))
+            runCurrent()
+
+            viewModel.respondToApproval("always")
+            viewModel.respondToApproval("session")
+            verify(exactly = 0) { HermesWsClient.respondToServerRequest(any(), any()) }
+            viewModel.respondToApproval("approve")
+            runCurrent()
+
+            assertNotNull(viewModel.approvalMessage())
+            assertFalse(viewModel.approvalMessage()!!.approvalInfo!!.isSubmitting)
+        }
+
+    @Test
+    fun gatewayClarify_mergesLockedAnswersWithoutOverwritingThem() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val result = slot<JsonElement>()
+            every { HermesWsClient.respondToServerRequest(any(), capture(result)) } returns true
+            mockEventsFlow.emit(
+                serverRequest(
+                    "wire-clarify-9",
+                    "clarify",
+                    extra =
+                        mapOf(
+                            "answers" to mapOf("q1" to "locked"),
+                            "questions" to
+                                listOf(
+                                    mapOf("qid" to "q1", "question" to "First?"),
+                                    mapOf("qid" to "q2", "question" to "Second?"),
+                                ),
+                        ),
+                ),
+            )
+            runCurrent()
+            val prompt = requireNotNull(viewModel.uiState.value.clarifyRequest)
+            viewModel.respondToClarifyBatch(prompt, mapOf("q1" to "overwrite", "q2" to "new"))
+            runCurrent()
+
+            assertTrue(result.captured.toString().contains("\"q1\":\"locked\""))
+            assertTrue(result.captured.toString().contains("\"q2\":\"new\""))
+        }
+
+    @Test
+    fun gatewayCancellation_requiresExactSessionProfileGenerationAndId() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(serverRequest("wire-cancel", "approval"))
+            runCurrent()
+
+            listOf(
+                WsEvent.ServerRequestCancelled("wire-cancel", "approval", "x", "other", "profile-a", 7),
+                WsEvent.ServerRequestCancelled("wire-cancel", "approval", "x", sessionId, "profile-a", 8),
+                WsEvent.ServerRequestCancelled("other", "approval", "x", sessionId, "profile-a", 7),
+            ).forEach {
+                mockEventsFlow.emit(it)
+                runCurrent()
+                assertNotNull(viewModel.approvalMessage())
+            }
+            mockEventsFlow.emit(
+                WsEvent.ServerRequestCancelled("wire-cancel", "approval", "x", sessionId, "profile-a", 7),
+            )
+            runCurrent()
+            assertNull(viewModel.approvalMessage())
+        }
+
+    @Test
+    fun gatewayReconnectReplay_deduplicatesApprovalCardButReusedIdWithNewBindingReplacesIt() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            mockEventsFlow.emit(serverRequest("wire-replay", "approval"))
+            mockEventsFlow.emit(serverRequest("wire-replay", "approval", replayed = true))
+            runCurrent()
+
+            assertEquals(1, viewModel.uiState.value.messages.count { it.approvalInfo != null })
+
+            mockEventsFlow.emit(serverRequest("wire-replay", "approval", generation = 8))
+            runCurrent()
+            val approvals = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            assertEquals(1, approvals.size)
+            assertEquals(8, approvals.single().approvalInfo?.serverRequestBinding?.connectionGeneration)
+        }
+
+    @Test
+    fun gatewayClarify_identicalReplayPreservesStateButReusedIdWithNewBindingReplacesIt() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val request = serverRequest("clarify-replay", "clarify", extra = mapOf("question" to "First?"))
+            mockEventsFlow.emit(request)
+            runCurrent()
+            val original = requireNotNull(viewModel.uiState.value.clarifyRequest)
+
+            mockEventsFlow.emit(request.copy(replayed = true))
+            runCurrent()
+            assertTrue(original === viewModel.uiState.value.clarifyRequest)
+
+            mockEventsFlow.emit(request.copy(connectionGeneration = 8))
+            runCurrent()
+            val replacement = requireNotNull(viewModel.uiState.value.clarifyRequest)
+            assertEquals(8, replacement.serverRequestBinding?.connectionGeneration)
+            assertFalse(original === replacement)
+        }
+
+    @Test
+    fun gatewaySudoAndSecret_answerExactServerIds_withoutLegacyMethods() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val bindings = mutableListOf<ServerRequestBinding>()
+            val results = mutableListOf<JsonElement>()
+            every { HermesWsClient.respondToServerRequest(capture(bindings), capture(results)) } returns true
+
+            mockEventsFlow.emit(serverRequest("wire-sudo", "sudo"))
+            runCurrent()
+            viewModel.respondToSudo("sudo-value")
+            runCurrent()
+            mockEventsFlow.emit(serverRequest("wire-secret", "secret"))
+            runCurrent()
+            viewModel.cancelSecret()
+            runCurrent()
+
+            assertEquals(listOf("wire-sudo", "wire-secret"), bindings.map { it.requestId })
+            assertTrue(bindings.all { it.runtimeSessionId == sessionId })
+            assertEquals(listOf("sudo-value", ""), results.map { it.jsonObject["value"]!!.jsonPrimitive.content })
+            verify(exactly = 0) { HermesWsClient.privilegedRequest(any(), any(), any()) }
+            assertNull(viewModel.uiState.value.sudoPrompt)
+            assertNull(viewModel.uiState.value.secretPrompt)
+        }
+
+    @Test
+    fun gatewaySecret_failedSendRetainsPrompt_andDoubleTapSendsOnce() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            every { HermesWsClient.respondToServerRequest(any(), any()) } returns false
+            mockEventsFlow.emit(serverRequest("wire-secret-fail", "secret"))
+            runCurrent()
+
+            viewModel.respondToSecret("hidden")
+            viewModel.respondToSecret("hidden")
+            runCurrent()
+
+            verify(exactly = 1) { HermesWsClient.respondToServerRequest(any(), any()) }
+            assertEquals("wire-secret-fail", viewModel.uiState.value.secretPrompt?.serverRequestBinding?.requestId)
+            assertFalse(viewModel.uiState.value.secretPrompt!!.isSubmitting)
+            assertEquals(PRIVILEGED_FAILURE_TEXT, viewModel.uiState.value.errorMessage)
+        }
+
+    @Test
+    fun gatewaySudo_duplicateRetainsBinding_replacementAndCancellationUseFullIdentity() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            mockEventsFlow.emit(serverRequest("same-id", "sudo"))
+            runCurrent()
+            val original = requireNotNull(viewModel.uiState.value.sudoPrompt)
+
+            mockEventsFlow.emit(serverRequest("same-id", "sudo", replayed = true))
+            runCurrent()
+            assertTrue(original === viewModel.uiState.value.sudoPrompt)
+
+            mockEventsFlow.emit(serverRequest("same-id", "sudo", generation = 8))
+            runCurrent()
+            val replacement = requireNotNull(viewModel.uiState.value.sudoPrompt)
+            assertEquals(8, replacement.serverRequestBinding?.connectionGeneration)
+
+            mockEventsFlow.emit(WsEvent.ServerRequestCancelled("same-id", "secret", "x", sessionId, "profile-a", 8))
+            mockEventsFlow.emit(WsEvent.ServerRequestCancelled("same-id", "sudo", "x", sessionId, "profile-a", 7))
+            runCurrent()
+            assertEquals(replacement, viewModel.uiState.value.sudoPrompt)
+
+            mockEventsFlow.emit(WsEvent.ServerRequestCancelled("same-id", "sudo", "x", sessionId, "profile-a", 8))
+            runCurrent()
+            assertNull(viewModel.uiState.value.sudoPrompt)
+        }
+
     // ── Approval flow ────────────────────────────────────────────────────────
 
     @Test
@@ -4714,6 +5087,42 @@ class ChatViewModelTest {
                 sessionId,
                 paramsSlot.captured["session_id"],
             )
+        }
+
+    @Test
+    fun testSendMessage_suspendedAttachmentDoesNotDispatchAfterSameSessionAba() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val attachmentResult = CompletableDeferred<Any?>()
+            every {
+                HermesWsClient.request(WsMethods.IMAGE_ATTACH_BYTES, any(), any())
+            } returns attachmentResult
+
+            mockkConstructor(android.util.Base64OutputStream::class)
+            every {
+                anyConstructed<android.util.Base64OutputStream>().write(any<ByteArray>(), any(), any())
+            } returns Unit
+            every { anyConstructed<android.util.Base64OutputStream>().close() } returns Unit
+            mockkStatic(Uri::class)
+            val mockUri = mockk<Uri>()
+            every { Uri.parse("content://suspended") } returns mockUri
+            val contentResolver = mockk<ContentResolver>()
+            every { app.contentResolver } returns contentResolver
+            every { contentResolver.openInputStream(any()) } returns
+                java.io.ByteArrayInputStream(byteArrayOf(1, 2, 3, 4))
+
+            viewModel.addAttachment("content://suspended", "test.png", "image/png", 4)
+            viewModel.sendMessage("stale prompt")
+            runCurrent()
+
+            viewModel.switchSession("other-session")
+            viewModel.switchSession(sessionId)
+            attachmentResult.complete(mapOf("attached" to true))
+            advanceUntilIdle()
+
+            verify(exactly = 0) {
+                HermesWsClient.sendMessage(any(), match { it.contains("stale prompt") }, any(), any())
+            }
         }
 
     // ── Pending request timeout + rejectAllPending (issue #526) ───────────

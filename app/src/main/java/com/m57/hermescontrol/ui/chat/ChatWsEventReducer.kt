@@ -154,6 +154,12 @@ object ChatWsEventReducer {
             // A privileged frame the parser refused to bind. Never surfaced.
             is WsEvent.PrivilegedRequestRejected -> ReducerResult(state = state, streamingState = streamingState)
 
+            // Gateway server requests are translated/handled by the ViewModel.
+            is WsEvent.ServerRequest,
+            is WsEvent.ServerRequestCancelled,
+            is WsEvent.TranscriptResyncRequired,
+            -> ReducerResult(state = state, streamingState = streamingState)
+
             // ReactionEvent is handled by the ViewModel — purely cosmetic animation
             is WsEvent.ReactionEvent -> ReducerResult(state = state, streamingState = streamingState)
         }
@@ -567,6 +573,20 @@ object ChatWsEventReducer {
                             sessionId = event.sessionId,
                             sourceProfileId = event.sourceProfileId,
                             connectionGeneration = event.connectionGeneration,
+                            serverRequestBinding =
+                                if (event.serverRequestId != null && event.sessionId != null &&
+                                    event.sourceProfileId != null && event.connectionGeneration != null
+                                ) {
+                                    com.m57.hermescontrol.data.ws.ServerRequestBinding(
+                                        event.serverRequestId,
+                                        event.sessionId,
+                                        event.sourceProfileId,
+                                        event.connectionGeneration,
+                                    )
+                                } else {
+                                    null
+                                },
+                            lockedAnswers = event.lockedAnswers,
                         ),
                     isAgentTyping = false,
                 ),

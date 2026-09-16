@@ -26,8 +26,90 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.m57.hermescontrol.R
-import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import com.m57.hermescontrol.theme.LocalHermesStatusColors
+import com.m57.hermescontrol.ui.chat.VaultPromptUi
+
+@Composable
+fun VaultPromptDialog(
+    prompt: VaultPromptUi,
+    onConfirm: (String) -> Unit,
+    onConfirmLogin: (String, String) -> Unit,
+    onCancel: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var value by remember(prompt.binding, prompt.method) { mutableStateOf("") }
+    var identifier by remember(prompt.binding, prompt.method) { mutableStateOf(prompt.identifier.orEmpty()) }
+    val saveLogin = prompt.method == "vault.save_login"
+    AlertDialog(
+        onDismissRequest = { if (!prompt.isSubmitting) onDismiss() },
+        title = {
+            Text(
+                prompt.title ?: when (prompt.method) {
+                    "vault.code" -> "Verification code required"
+                    "vault.unlock_prompt" -> "Unlock vault"
+                    else -> "Save login"
+                },
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                prompt.prompt?.takeIf(String::isNotBlank)?.let { Text(it) }
+                if (saveLogin) {
+                    Text(
+                        text = "Requested site: ${prompt.requestedOrigin ?: "Missing origin"}",
+                        modifier = Modifier.testTag("vault_requested_origin"),
+                    )
+                    if (prompt.hasValidRequestedOrigin) {
+                        OutlinedTextField(
+                            value = identifier,
+                            onValueChange = { identifier = it },
+                            label = { Text("Identifier") },
+                            modifier = Modifier.fillMaxWidth().testTag("vault_identifier_input"),
+                            enabled = !prompt.isSubmitting,
+                        )
+                    } else {
+                        Text("This request has no valid web origin. Cancel it without entering credentials.")
+                    }
+                }
+                if (!saveLogin || prompt.hasValidRequestedOrigin) {
+                    OutlinedTextField(
+                        value = value,
+                        onValueChange = { value = it },
+                        label = { Text(if (prompt.method == "vault.code") "Code" else "Password") },
+                        modifier = Modifier.fillMaxWidth().testTag("vault_secret_input"),
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions =
+                            KeyboardOptions(
+                                autoCorrectEnabled = false,
+                                keyboardType = KeyboardType.Password,
+                            ),
+                        enabled = !prompt.isSubmitting,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { if (saveLogin) onConfirmLogin(identifier, value) else onConfirm(value) },
+                enabled =
+                    value.isNotBlank() &&
+                        (!saveLogin || (prompt.hasValidRequestedOrigin && identifier.isNotBlank())) &&
+                        !prompt.isSubmitting,
+                modifier = Modifier.testTag("vault_send_button"),
+            ) { Text(stringResource(R.string.chat_send)) }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onCancel,
+                enabled = !prompt.isSubmitting,
+                modifier = Modifier.testTag("vault_cancel_button"),
+            ) {
+                Text(stringResource(R.string.chat_privileged_cancel))
+            }
+        },
+    )
+}
 
 /**
  * Secure password dialog for a pending `sudo.request` (issue #524).
@@ -41,7 +123,7 @@ import com.m57.hermescontrol.theme.LocalHermesStatusColors
  */
 @Composable
 fun SudoPromptDialog(
-    binding: PrivilegedRequestBinding,
+    binding: Any,
     onConfirm: (String) -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit,
@@ -104,7 +186,7 @@ fun SudoPromptDialog(
  */
 @Composable
 fun SecretPromptDialog(
-    binding: PrivilegedRequestBinding,
+    binding: Any,
     onConfirm: (String) -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit,

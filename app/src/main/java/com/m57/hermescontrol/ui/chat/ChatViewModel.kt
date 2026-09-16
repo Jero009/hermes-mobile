@@ -36,6 +36,7 @@ import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.JsonRpcError
 import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
+import com.m57.hermescontrol.data.ws.ServerRequestBinding
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
 import com.m57.hermescontrol.data.ws.toJsonElement
@@ -57,7 +58,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -96,6 +99,7 @@ private data class PendingRpcRequest(
     /** Session/text captured for a session.redirect so a 4010 rejection can resend. */
     val redirectSessionId: String? = null,
     val redirectText: String? = null,
+    val redirectConnectionBinding: ConnectionBinding? = null,
     /** Attempt generation for a session.create, used to fence retried answers. */
     val createGeneration: Long? = null,
 )
@@ -135,6 +139,7 @@ data class ChatUiState(
     // Sudo / secret prompts — surfaced as dialogs (issue #524)
     val sudoPrompt: SudoPromptUi? = null,
     val secretPrompt: SecretPromptUi? = null,
+    val vaultPrompt: VaultPromptUi? = null,
     val showSessionPicker: Boolean = false,
     // Search state
     val isSearchActive: Boolean = false,
@@ -212,6 +217,8 @@ data class ClarifyUi(
     val sessionId: String? = null,
     val sourceProfileId: String? = null,
     val connectionGeneration: Int? = null,
+    val serverRequestBinding: ServerRequestBinding? = null,
+    val lockedAnswers: Map<String, String> = emptyMap(),
 ) {
     val resolvedQuestions: List<ClarifyQuestionUi>
         get() =
@@ -253,9 +260,11 @@ private const val CLARIFY_DISMISS_RESPONSE = "The user cancelled — no answer p
  */
 data class SudoPromptUi(
     val binding: PrivilegedRequestBinding,
+    val serverRequestBinding: ServerRequestBinding? = null,
     val isSubmitting: Boolean = false,
 ) {
     val requestId: String get() = binding.requestId
+    val fullBinding: Any get() = serverRequestBinding ?: binding
 }
 
 /**
@@ -268,9 +277,38 @@ data class SecretPromptUi(
     val binding: PrivilegedRequestBinding,
     val envVar: String? = null,
     val prompt: String? = null,
+    val serverRequestBinding: ServerRequestBinding? = null,
     val isSubmitting: Boolean = false,
 ) {
+    val fullBinding: Any get() = serverRequestBinding ?: binding
     val requestId: String get() = binding.requestId
+}
+
+data class VaultPromptUi(
+    val binding: ServerRequestBinding,
+    val method: String,
+    val title: String? = null,
+    val prompt: String? = null,
+    val identifier: String? = null,
+    val requestedOrigin: String? = null,
+    val isSubmitting: Boolean = false,
+) {
+    val hasValidRequestedOrigin: Boolean
+        get() = method != "vault.save_login" || requestedOrigin.isValidWebOrigin()
+}
+
+private fun String?.isValidWebOrigin(): Boolean {
+    val value = this ?: return false
+    if (value.isBlank() || value != value.trim()) return false
+    val uri = runCatching { java.net.URI(value) }.getOrNull() ?: return false
+    return (uri.scheme.equals("https", ignoreCase = true) || uri.scheme.equals("http", ignoreCase = true)) &&
+        uri.host != null &&
+        uri.rawAuthority?.endsWith(":") == false &&
+        (uri.port == -1 || uri.port in 1..65535) &&
+        uri.rawUserInfo == null &&
+        uri.rawPath.isNullOrEmpty() &&
+        uri.rawQuery == null &&
+        uri.rawFragment == null
 }
 
 /** Expensive-model confirmation returned by the gateway's config.set RPC. */
@@ -643,6 +681,10 @@ class ChatViewModel(
 
         // Handle complex events that need ViewModel-specific context
         when (event) {
+            is WsEvent.ServerRequest -> handleServerRequest(event)
+
+            is WsEvent.ServerRequestCancelled -> handleServerRequestCancelled(event)
+
             is WsEvent.GatewayReady -> {
                 handleGatewayReady()
             }
@@ -1129,7 +1171,12 @@ class ChatViewModel(
         if (method == WsMethods.SESSION_REDIRECT) {
             val sessionId = request.redirectSessionId
             val text = request.redirectText
-            if (errorCode == REDIRECT_UNSUPPORTED_CODE && sessionId != null && !text.isNullOrBlank()) {
+            val connectionBinding = request.redirectConnectionBinding
+            if (errorCode == REDIRECT_UNSUPPORTED_CODE &&
+                sessionId != null &&
+                !text.isNullOrBlank() &&
+                connectionBinding != null
+            ) {
                 Log.d(TAG, "session.redirect unsupported — resending as prompt.submit")
                 // ChatWsEventReducer.onRpcError already ran for this event and
                 // parked a generic error banner. The rejection is recoverable,
@@ -1137,9 +1184,10 @@ class ChatViewModel(
                 // failure they cannot act on.
                 _uiState.update { it.copy(errorMessage = null) }
                 viewModelScope.launch(Dispatchers.IO) {
-                    wsClient.sendMessage(
-                        sessionId,
-                        text,
+                    wsClient.sendMessageForConnection(
+                        binding = connectionBinding,
+                        sessionId = sessionId,
+                        text = text,
                         onSent = { retryId -> trackRequest(retryId, WsMethods.PROMPT_SUBMIT) },
                     )
                 }
@@ -1177,6 +1225,8 @@ class ChatViewModel(
         if (text.isBlank() && state.pendingAttachments.isEmpty()) return false
         val storageSessionId = state.currentSessionId ?: return false
         val agentSessionId = runtimeSessionId ?: return false
+        val dispatchGeneration = conversationGeneration
+        val dispatchConnection = wsClient.connectionBinding(selectedProfileId()) ?: return false
 
         val trimmed = text.trim()
         if (trimmed.startsWith("/", ignoreCase = true)) {
@@ -1292,6 +1342,11 @@ class ChatViewModel(
                         if (text.isNotBlank()) "\n\n$text" else ""
                 }
 
+            // Attachment preparation can suspend while the active conversation
+            // changes. Fence by generation as well as ID so switching away and
+            // back to the same session cannot dispatch the stale prompt.
+            if (dispatchGeneration != conversationGeneration) return@launch
+
             // While a turn is still streaming and the prompt carries no
             // attachments, steer the in-flight turn via session.redirect
             // instead of queueing a second prompt.submit (issue #710).
@@ -1300,17 +1355,19 @@ class ChatViewModel(
             // handleRpcError re-sends the text as a normal prompt so the
             // typed message is never silently lost.
             if (wasStreaming && attachments.isEmpty()) {
-                wsClient.sendRedirect(
-                    agentSessionId,
-                    fullText,
+                wsClient.sendRedirectForConnection(
+                    binding = dispatchConnection,
+                    sessionId = agentSessionId,
+                    text = fullText,
                     onSent = { id ->
-                        trackRedirectRequest(id, agentSessionId, fullText)
+                        trackRedirectRequest(id, agentSessionId, fullText, dispatchConnection)
                     },
                 )
             } else {
-                wsClient.sendMessage(
-                    agentSessionId,
-                    fullText,
+                wsClient.sendMessageForConnection(
+                    binding = dispatchConnection,
+                    sessionId = agentSessionId,
+                    text = fullText,
                     onSent = { id -> trackRequest(id, WsMethods.PROMPT_SUBMIT) },
                 )
             }
@@ -2267,6 +2324,7 @@ class ChatViewModel(
                     if (runtimeSessionId != sessionId) return@update it
                     it.copy(
                         currentSessionModel = confirmedLabel ?: it.currentSessionModel,
+                        contextUsage = it.contextUsage?.copy(maxTokens = null),
                         modelSwitchConfirmation = null,
                     )
                 }
@@ -3304,6 +3362,14 @@ class ChatViewModel(
         val generation = expected.connectionGeneration ?: return
         if (expected.sessionId != runtimeId) return
         viewModelScope.launch(Dispatchers.IO) {
+            expected.serverRequestBinding?.let { serverBinding ->
+                if (wsClient.respondToServerRequest(serverBinding, buildJsonObject {})) {
+                    if (replaceClarifyIfCurrent(expected, null)) {
+                        addSystemMessage("Clarify dismissed — no answer sent", persist = true)
+                    }
+                }
+                return@launch
+            }
             val dismissedIds = mutableSetOf<String>()
             for (question in expected.resolvedQuestions) {
                 if (!clarifyRequestIsCurrent(expected, state.currentSessionId, runtimeId)) break
@@ -3356,6 +3422,25 @@ class ChatViewModel(
         val requestId = expected.clarifyId ?: return
         val acceptedRevision = repo.replacementGeneration(sessionId)
         viewModelScope.launch(Dispatchers.IO) {
+            expected.serverRequestBinding?.let { serverBinding ->
+                val merged = normalized + expected.lockedAnswers
+                val result =
+                    if (expected.questions.isNotEmpty()) {
+                        buildJsonObject {
+                            put("answers", buildJsonObject { merged.forEach { (id, answer) -> put(id, answer) } })
+                        }
+                    } else {
+                        buildJsonObject { put("answer", normalized.values.first()) }
+                    }
+                if (!wsClient.respondToServerRequest(serverBinding, result)) return@launch
+                val displayAnswer = normalized.values.joinToString("\n")
+                val userMessage = ChatMessage(role = MessageRole.USER, content = displayAnswer)
+                if (replaceClarifyIfCurrent(expected, null)) {
+                    _uiState.update { it.copy(messages = it.messages + userMessage, isAgentTyping = true) }
+                    repo.persistMessage(userMessage, sessionId, acceptedRevision)
+                }
+                return@launch
+            }
             val answeredIds = mutableSetOf<String>()
             for (question in questions) {
                 val answer = normalized[question.qid] ?: continue
@@ -3439,6 +3524,221 @@ class ChatViewModel(
 
     // ── Approval flow ───────────────────────────────────────────────────
 
+    private fun handleServerRequest(request: WsEvent.ServerRequest) {
+        val sessionId = request.params["session_id"] as? String ?: return
+        val binding =
+            privilegedBinding(
+                request.id,
+                sessionId,
+                request.sourceProfileId,
+                request.connectionGeneration,
+            ) ?: return
+        when (request.method) {
+            "sudo" -> {
+                val serverBinding =
+                    ServerRequestBinding(request.id, sessionId, binding.profileId, binding.connectionGeneration)
+                _uiState.update { state ->
+                    if (state.sudoPrompt?.serverRequestBinding == serverBinding) {
+                        state
+                    } else {
+                        state.copy(
+                            sudoPrompt = SudoPromptUi(binding = binding, serverRequestBinding = serverBinding),
+                            isAgentTyping = false,
+                        )
+                    }
+                }
+            }
+            "secret" -> {
+                val serverBinding =
+                    ServerRequestBinding(request.id, sessionId, binding.profileId, binding.connectionGeneration)
+                _uiState.update { state ->
+                    if (state.secretPrompt?.serverRequestBinding == serverBinding) {
+                        state
+                    } else {
+                        state.copy(
+                            secretPrompt =
+                                SecretPromptUi(
+                                    binding = binding,
+                                    envVar = request.params["env_var"] as? String,
+                                    prompt = request.params["prompt"] as? String,
+                                    serverRequestBinding = serverBinding,
+                                ),
+                            isAgentTyping = false,
+                        )
+                    }
+                }
+            }
+            "vault.code", "vault.unlock_prompt", "vault.save_login" -> {
+                val serverBinding =
+                    ServerRequestBinding(request.id, sessionId, binding.profileId, binding.connectionGeneration)
+                _uiState.update { state ->
+                    if (state.vaultPrompt?.binding == serverBinding && state.vaultPrompt.method == request.method) {
+                        state
+                    } else {
+                        state.copy(
+                            vaultPrompt =
+                                VaultPromptUi(
+                                    binding = serverBinding,
+                                    method = request.method,
+                                    title = request.params["title"] as? String,
+                                    prompt = request.params["prompt"] as? String,
+                                    identifier = request.params["identifier"] as? String,
+                                    requestedOrigin =
+                                        (request.params["origin"] as? String)
+                                            ?: (request.params["site"] as? String),
+                                ),
+                            isAgentTyping = false,
+                        )
+                    }
+                }
+            }
+            "approval" -> {
+                val serverBinding =
+                    ServerRequestBinding(request.id, sessionId, binding.profileId, binding.connectionGeneration)
+                val duplicate =
+                    _uiState.value.messages.any {
+                        it.approvalInfo?.serverRequestBinding == serverBinding
+                    }
+                if (duplicate) return
+                _uiState.update { state ->
+                    state.copy(
+                        messages =
+                            state.messages.filterNot {
+                                val prior = it.approvalInfo?.serverRequestBinding
+                                prior?.requestId == request.id && prior != serverBinding
+                            },
+                    )
+                }
+                handleApprovalRequest(
+                    WsEvent.ApprovalRequest(
+                        command = request.params["command"] as? String,
+                        description = request.params["description"] as? String,
+                        patternKeys = (request.params["pattern_keys"] as? List<*>)?.filterIsInstance<String>(),
+                        sessionId = sessionId,
+                        requestId = request.params["request_id"] as? String ?: request.id,
+                        timeoutSeconds = (request.params["timeout_seconds"] as? Number)?.toDouble() ?: 120.0,
+                        sourceProfileId = binding.profileId,
+                        connectionGeneration = binding.connectionGeneration,
+                        serverRequestId = request.id,
+                    ),
+                )
+            }
+            "clarify" -> {
+                val locked =
+                    (request.params["answers"] as? Map<*, *>)?.entries
+                        ?.mapNotNull { (k, v) -> if (k is String && v is String) k to v else null }?.toMap().orEmpty()
+                val questions =
+                    (request.params["questions"] as? List<*>)?.mapIndexedNotNull { index, raw ->
+                        val map = raw as? Map<*, *> ?: return@mapIndexedNotNull null
+                        val text = map["question"] as? String ?: return@mapIndexedNotNull null
+                        WsEvent.ClarifyQuestion(
+                            qid = map["qid"] as? String ?: "q$index",
+                            question = text,
+                            choices = (map["choices"] as? List<*>)?.filterIsInstance<String>().orEmpty(),
+                            multiSelect = map["multi_select"] as? Boolean ?: false,
+                        )
+                    }.orEmpty()
+                val first = questions.firstOrNull()
+                val current = _uiState.value.clarifyRequest
+                val serverBinding =
+                    ServerRequestBinding(request.id, sessionId, binding.profileId, binding.connectionGeneration)
+                if (current?.serverRequestBinding == serverBinding) {
+                    if (!request.replayed || current.questions.isNotEmpty()) return
+                }
+                handleWsEvent(
+                    WsEvent.ClarifyRequest(
+                        text = first?.question ?: request.params["question"] as? String,
+                        options = first?.choices ?: (request.params["choices"] as? List<*>)?.filterIsInstance<String>(),
+                        clarifyId = request.params["request_id"] as? String ?: request.id,
+                        sessionId = sessionId,
+                        questionId = first?.qid,
+                        multiSelect = first?.multiSelect ?: false,
+                        questions = questions,
+                        sourceProfileId = binding.profileId,
+                        connectionGeneration = binding.connectionGeneration,
+                        serverRequestId = request.id,
+                        lockedAnswers = locked,
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun handleServerRequestCancelled(event: WsEvent.ServerRequestCancelled) {
+        if (event.sourceProfileId != selectedProfileId() || event.connectionGeneration == null) return
+        when (event.method) {
+            "approval" ->
+                _uiState.update { state ->
+                    state.copy(
+                        messages =
+                            state.messages.map { message ->
+                                val binding = message.approvalInfo?.serverRequestBinding
+                                if (binding?.requestId == event.id &&
+                                    binding.runtimeSessionId == event.sessionId &&
+                                    binding.profileId == event.sourceProfileId &&
+                                    binding.connectionGeneration == event.connectionGeneration
+                                ) {
+                                    message.copy(
+                                        approvalInfo = null,
+                                    )
+                                } else {
+                                    message
+                                }
+                            },
+                    )
+                }
+            "clarify" ->
+                _uiState.update { state ->
+                    val binding = state.clarifyRequest?.serverRequestBinding
+                    if (binding?.requestId == event.id &&
+                        binding.runtimeSessionId == event.sessionId &&
+                        binding.profileId == event.sourceProfileId &&
+                        binding.connectionGeneration == event.connectionGeneration
+                    ) {
+                        state.copy(
+                            clarifyRequest = null,
+                        )
+                    } else {
+                        state
+                    }
+                }
+            "vault.code", "vault.unlock_prompt", "vault.save_login" ->
+                _uiState.update { state ->
+                    val prompt = state.vaultPrompt
+                    if (prompt?.method == event.method && serverCancellationMatches(prompt.binding, event)) {
+                        state.copy(vaultPrompt = null)
+                    } else {
+                        state
+                    }
+                }
+            "sudo" ->
+                _uiState.update { state ->
+                    if (serverCancellationMatches(state.sudoPrompt?.serverRequestBinding, event)) {
+                        state.copy(sudoPrompt = null)
+                    } else {
+                        state
+                    }
+                }
+            "secret" ->
+                _uiState.update { state ->
+                    if (serverCancellationMatches(state.secretPrompt?.serverRequestBinding, event)) {
+                        state.copy(secretPrompt = null)
+                    } else {
+                        state
+                    }
+                }
+        }
+    }
+
+    private fun serverCancellationMatches(
+        binding: ServerRequestBinding?,
+        event: WsEvent.ServerRequestCancelled,
+    ): Boolean =
+        binding?.requestId == event.id &&
+            binding.runtimeSessionId == event.sessionId &&
+            binding.profileId == event.sourceProfileId &&
+            binding.connectionGeneration == event.connectionGeneration
+
     private fun clearPrivilegedControls() {
         approvalExpiryJobs.values.forEach(Job::cancel)
         approvalExpiryJobs.clear()
@@ -3447,6 +3747,7 @@ class ChatViewModel(
                 messages = state.messages.map { message -> message.copy(approvalInfo = null) },
                 sudoPrompt = null,
                 secretPrompt = null,
+                vaultPrompt = null,
             )
         }
     }
@@ -3471,6 +3772,15 @@ class ChatViewModel(
                         description = event.description,
                         patternKeys = event.patternKeys,
                         privilegedBinding = binding,
+                        serverRequestBinding =
+                            event.serverRequestId?.let {
+                                ServerRequestBinding(
+                                    it,
+                                    binding.runtimeSessionId,
+                                    binding.profileId,
+                                    binding.connectionGeneration,
+                                )
+                            },
                     ),
             )
         _uiState.update { state ->
@@ -3537,13 +3847,38 @@ class ChatViewModel(
         if (!claimApprovalSubmission(messageId, binding)) return
 
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                wsClient.privilegedRequest(method = method, binding = binding, params = params).await()
-            }.onSuccess {
+            val serverBinding =
+                _uiState.value.messages.firstOrNull { it.id == messageId }
+                    ?.approvalInfo?.serverRequestBinding
+            var failureMessage: String? = null
+            val accepted =
+                if (serverBinding != null) {
+                    wsClient.respondToServerRequest(
+                        serverBinding,
+                        buildJsonObject {
+                            put(
+                                "choice",
+                                params["choice"] ?: if (method == WsMethods.APPROVAL_CANCEL) "deny" else "once",
+                            )
+                            put("all", false)
+                        },
+                    ).also { if (!it) failureMessage = "Request was not accepted" }
+                } else {
+                    runCatching {
+                        wsClient.privilegedRequest(method = method, binding = binding, params = params).await()
+                    }.fold(
+                        onSuccess = { true },
+                        onFailure = {
+                            failureMessage = it.message
+                            false
+                        },
+                    )
+                }
+            if (accepted) {
                 approvalExpiryJobs.remove(ApprovalTimerKey(messageId, binding))?.cancel()
                 clearApprovalControls(messageId, binding)
-            }.onFailure { error ->
-                restoreApprovalControls(messageId, binding, error.message)
+            } else {
+                restoreApprovalControls(messageId, binding, failureMessage)
             }
         }
     }
@@ -3689,6 +4024,66 @@ class ChatViewModel(
         submitSecret(prompt, WsMethods.SECRET_CANCEL, emptyMap())
     }
 
+    fun respondToVault(value: String) {
+        val prompt = _uiState.value.vaultPrompt ?: return
+        if (value.isBlank()) return
+        submitVault(prompt, value)
+    }
+
+    fun respondToVaultLogin(
+        identifier: String,
+        password: String,
+    ) {
+        val prompt = _uiState.value.vaultPrompt ?: return
+        if (prompt.method != "vault.save_login" ||
+            !prompt.hasValidRequestedOrigin ||
+            identifier.isBlank() ||
+            password.isBlank()
+        ) {
+            return
+        }
+        submitVault(
+            prompt,
+            buildJsonObject {
+                put("identifier", identifier)
+                put("password", password)
+            }.toString(),
+        )
+    }
+
+    fun cancelVault() {
+        _uiState.value.vaultPrompt?.let { submitVault(it, "") }
+    }
+
+    fun dismissVault() = Unit
+
+    private fun submitVault(
+        expected: VaultPromptUi,
+        value: String,
+    ) {
+        val claimed = expected.copy(isSubmitting = true)
+        while (true) {
+            val state = _uiState.value
+            if (state.vaultPrompt != expected || expected.isSubmitting) return
+            if (_uiState.compareAndSet(state, state.copy(vaultPrompt = claimed))) break
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val accepted = wsClient.respondToServerRequest(claimed.binding, buildJsonObject { put("value", value) })
+            _uiState.update { state ->
+                if (state.vaultPrompt != claimed) {
+                    state
+                } else if (accepted) {
+                    state.copy(vaultPrompt = null)
+                } else {
+                    state.copy(
+                        vaultPrompt = claimed.copy(isSubmitting = false),
+                        errorMessage = privilegedFailureMessage(),
+                    )
+                }
+            }
+        }
+    }
+
     private fun submitSudo(
         prompt: SudoPromptUi,
         method: String,
@@ -3696,11 +4091,18 @@ class ChatViewModel(
     ) {
         val claimed = claimSudoSubmission(prompt) ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
-            }.onSuccess {
+            val accepted =
+                claimed.serverRequestBinding?.let {
+                    wsClient.respondToServerRequest(
+                        it,
+                        buildJsonObject { put("value", params["password"].orEmpty()) },
+                    )
+                } ?: runCatching {
+                    wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
+                }.isSuccess
+            if (accepted) {
                 _uiState.update { if (it.sudoPrompt == claimed) it.copy(sudoPrompt = null) else it }
-            }.onFailure {
+            } else {
                 _uiState.update {
                     if (it.sudoPrompt == claimed) {
                         it.copy(
@@ -3731,11 +4133,18 @@ class ChatViewModel(
     ) {
         val claimed = claimSecretSubmission(prompt) ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
-            }.onSuccess {
+            val accepted =
+                claimed.serverRequestBinding?.let {
+                    wsClient.respondToServerRequest(
+                        it,
+                        buildJsonObject { put("value", params["value"].orEmpty()) },
+                    )
+                } ?: runCatching {
+                    wsClient.privilegedRequest(method = method, binding = claimed.binding, params = params).await()
+                }.isSuccess
+            if (accepted) {
                 _uiState.update { if (it.secretPrompt == claimed) it.copy(secretPrompt = null) else it }
-            }.onFailure {
+            } else {
                 _uiState.update {
                     if (it.secretPrompt == claimed) {
                         it.copy(
@@ -3936,12 +4345,14 @@ class ChatViewModel(
         id: String,
         sessionId: String,
         text: String,
+        connectionBinding: ConnectionBinding,
     ) {
         pendingRequests[id] =
             PendingRpcRequest(
                 method = WsMethods.SESSION_REDIRECT,
                 redirectSessionId = sessionId,
                 redirectText = text,
+                redirectConnectionBinding = connectionBinding,
             )
     }
 

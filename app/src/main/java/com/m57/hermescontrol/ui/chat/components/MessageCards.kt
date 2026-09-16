@@ -411,40 +411,50 @@ fun ClarifyBubble(
                     fontWeight = if (questions.size > 1) FontWeight.SemiBold else FontWeight.Normal,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                if (question.multiSelect) Text("Select all that apply", style = MaterialTheme.typography.labelSmall)
-                if (question.choices.isNotEmpty()) {
-                    FlowRow(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        question.choices.forEach { choice ->
-                            val values = selected[question.qid].orEmpty()
-                            val isSelected = choice in values
-                            FilterChip(
-                                modifier = Modifier.testTag("clarify_choice_${question.qid}_$choice"),
-                                selected = isSelected,
-                                onClick = {
-                                    val next =
-                                        if (question.multiSelect) {
-                                            if (isSelected) values - choice else values + choice
-                                        } else {
-                                            setOf(choice)
-                                        }
-                                    selected = selected + (question.qid to next)
-                                },
-                                label = { Text(choice) },
-                            )
+                val lockedAnswer = clarifyRequest.lockedAnswers[question.qid]
+                if (lockedAnswer != null) {
+                    Text(
+                        text = lockedAnswer,
+                        modifier = Modifier.fillMaxWidth().testTag("clarify_locked_${question.qid}"),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    if (question.multiSelect) Text("Select all that apply", style = MaterialTheme.typography.labelSmall)
+                    if (question.choices.isNotEmpty()) {
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            question.choices.forEach { choice ->
+                                val values = selected[question.qid].orEmpty()
+                                val isSelected = choice in values
+                                FilterChip(
+                                    modifier = Modifier.testTag("clarify_choice_${question.qid}_$choice"),
+                                    selected = isSelected,
+                                    onClick = {
+                                        val next =
+                                            if (question.multiSelect) {
+                                                if (isSelected) values - choice else values + choice
+                                            } else {
+                                                setOf(choice)
+                                            }
+                                        selected = selected + (question.qid to next)
+                                    },
+                                    label = { Text(choice) },
+                                )
+                            }
                         }
                     }
+                    OutlinedTextField(
+                        value = typed[question.qid].orEmpty(),
+                        onValueChange = { typed = typed + (question.qid to it) },
+                        label = { Text(if (question.choices.isEmpty()) "Your response" else "Other (optional)") },
+                        modifier = Modifier.fillMaxWidth().testTag("clarify_text_${question.qid}"),
+                        singleLine = true,
+                    )
                 }
-                OutlinedTextField(
-                    value = typed[question.qid].orEmpty(),
-                    onValueChange = { typed = typed + (question.qid to it) },
-                    label = { Text(if (question.choices.isEmpty()) "Your response" else "Other (optional)") },
-                    modifier = Modifier.fillMaxWidth().testTag("clarify_text_${question.qid}"),
-                    singleLine = true,
-                )
                 Spacer(Modifier.height(10.dp))
             }
             Spacer(Modifier.height(8.dp))

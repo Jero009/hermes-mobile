@@ -5,6 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotSelected
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assertTextContains
@@ -59,5 +60,24 @@ class ClarifyBubbleDraftTest {
                 .config[SemanticsProperties.EditableText]
                 .text
         assertEquals("", resetText)
+    }
+
+    @Test
+    fun lockedAnswerIsReadOnly() {
+        val request =
+            ClarifyUi(
+                text = "",
+                options = emptyList(),
+                clarifyId = "clarify-1",
+                questions = listOf(ClarifyQuestionUi("q1", "Already answered?", choices = listOf("Yes", "No"))),
+                lockedAnswers = mapOf("q1" to "Yes"),
+            )
+        composeTestRule.setContent {
+            ClarifyBubble(request, onSubmit = { _, _ -> }, onDismiss = {})
+        }
+
+        composeTestRule.onNodeWithTag("clarify_locked_q1").assertIsDisplayed().assertTextContains("Yes")
+        composeTestRule.onNodeWithTag("clarify_text_q1").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("clarify_choice_q1_Yes").assertDoesNotExist()
     }
 }
