@@ -36,6 +36,7 @@ import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.JsonRpcError
 import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
+import com.m57.hermescontrol.data.ws.ServerRequestBinding
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
 import com.m57.hermescontrol.data.ws.toJsonElement
@@ -57,7 +58,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -212,6 +215,8 @@ data class ClarifyUi(
     val sessionId: String? = null,
     val sourceProfileId: String? = null,
     val connectionGeneration: Int? = null,
+    val serverRequestBinding: ServerRequestBinding? = null,
+    val lockedAnswers: Map<String, String> = emptyMap(),
 ) {
     val resolvedQuestions: List<ClarifyQuestionUi>
         get() =
@@ -643,6 +648,10 @@ class ChatViewModel(
 
         // Handle complex events that need ViewModel-specific context
         when (event) {
+            is WsEvent.ServerRequest -> handleServerRequest(event)
+
+            is WsEvent.ServerRequestCancelled -> handleServerRequestCancelled(event)
+
             is WsEvent.GatewayReady -> {
                 handleGatewayReady()
             }
@@ -3304,6 +3313,14 @@ class ChatViewModel(
         val generation = expected.connectionGeneration ?: return
         if (expected.sessionId != runtimeId) return
         viewModelScope.launch(Dispatchers.IO) {
+            expected.serverRequestBinding?.let { serverBinding ->
+                if (wsClient.respondToServerRequest(serverBinding, buildJsonObject {})) {
+                    if (replaceClarifyIfCurrent(expected, null)) {
+                        addSystemMessage("Clarify dismissed — no answer sent", persist = true)
+                    }
+                }
+                return@launch
+            }
             val dismissedIds = mutableSetOf<String>()
             for (question in expected.resolvedQuestions) {
                 if (!clarifyRequestIsCurrent(expected, state.currentSessionId, runtimeId)) break
@@ -3356,6 +3373,25 @@ class ChatViewModel(
         val requestId = expected.clarifyId ?: return
         val acceptedRevision = repo.replacementGeneration(sessionId)
         viewModelScope.launch(Dispatchers.IO) {
+            expected.serverRequestBinding?.let { serverBinding ->
+                val merged = expected.lockedAnswers + normalized
+                val result =
+                    if (expected.questions.isNotEmpty()) {
+                        buildJsonObject {
+                            put("answers", buildJsonObject { merged.forEach { (id, answer) -> put(id, answer) } })
+                        }
+                    } else {
+                        buildJsonObject { put("answer", normalized.values.first()) }
+                    }
+                if (!wsClient.respondToServerRequest(serverBinding, result)) return@launch
+                val displayAnswer = normalized.values.joinToString("\n")
+                val userMessage = ChatMessage(role = MessageRole.USER, content = displayAnswer)
+                if (replaceClarifyIfCurrent(expected, null)) {
+                    _uiState.update { it.copy(messages = it.messages + userMessage, isAgentTyping = true) }
+                    repo.persistMessage(userMessage, sessionId, acceptedRevision)
+                }
+                return@launch
+            }
             val answeredIds = mutableSetOf<String>()
             for (question in questions) {
                 val answer = normalized[question.qid] ?: continue
@@ -3439,6 +3475,96 @@ class ChatViewModel(
 
     // ── Approval flow ───────────────────────────────────────────────────
 
+    private fun handleServerRequest(request: WsEvent.ServerRequest) {
+        val sessionId = request.params["session_id"] as? String ?: return
+        val binding =
+            privilegedBinding(
+                request.id,
+                sessionId,
+                request.sourceProfileId,
+                request.connectionGeneration,
+            ) ?: return
+        when (request.method) {
+            "approval" ->
+                handleApprovalRequest(
+                    WsEvent.ApprovalRequest(
+                        command = request.params["command"] as? String,
+                        description = request.params["description"] as? String,
+                        patternKeys = (request.params["pattern_keys"] as? List<*>)?.filterIsInstance<String>(),
+                        sessionId = sessionId,
+                        requestId = request.params["request_id"] as? String ?: request.id,
+                        timeoutSeconds = (request.params["timeout_seconds"] as? Number)?.toDouble() ?: 120.0,
+                        sourceProfileId = binding.profileId,
+                        connectionGeneration = binding.connectionGeneration,
+                        serverRequestId = request.id,
+                    ),
+                )
+            "clarify" -> {
+                val locked =
+                    (request.params["answers"] as? Map<*, *>)?.entries
+                        ?.mapNotNull { (k, v) -> if (k is String && v is String) k to v else null }?.toMap().orEmpty()
+                val questions =
+                    (request.params["questions"] as? List<*>)?.mapIndexedNotNull { index, raw ->
+                        val map = raw as? Map<*, *> ?: return@mapIndexedNotNull null
+                        val text = map["question"] as? String ?: return@mapIndexedNotNull null
+                        WsEvent.ClarifyQuestion(
+                            qid = map["qid"] as? String ?: "q$index",
+                            question = text,
+                            choices = (map["choices"] as? List<*>)?.filterIsInstance<String>().orEmpty(),
+                            multiSelect = map["multi_select"] as? Boolean ?: false,
+                        )
+                    }.orEmpty()
+                val first = questions.firstOrNull()
+                handleWsEvent(
+                    WsEvent.ClarifyRequest(
+                        text = first?.question ?: request.params["question"] as? String,
+                        options = first?.choices ?: (request.params["choices"] as? List<*>)?.filterIsInstance<String>(),
+                        clarifyId = request.params["request_id"] as? String ?: request.id,
+                        sessionId = sessionId,
+                        questionId = first?.qid,
+                        multiSelect = first?.multiSelect ?: false,
+                        questions = questions,
+                        sourceProfileId = binding.profileId,
+                        connectionGeneration = binding.connectionGeneration,
+                        serverRequestId = request.id,
+                        lockedAnswers = locked,
+                    ),
+                )
+            }
+        }
+    }
+
+    private fun handleServerRequestCancelled(event: WsEvent.ServerRequestCancelled) {
+        if (event.sourceProfileId != selectedProfileId() || event.connectionGeneration == null) return
+        when (event.method) {
+            "approval" ->
+                _uiState.update { state ->
+                    state.copy(
+                        messages =
+                            state.messages.map { message ->
+                                if (message.approvalInfo?.serverRequestBinding?.requestId == event.id) {
+                                    message.copy(
+                                        approvalInfo = null,
+                                    )
+                                } else {
+                                    message
+                                }
+                            },
+                    )
+                }
+            "clarify" ->
+                _uiState.update { state ->
+                    if (state.clarifyRequest?.serverRequestBinding?.requestId == event.id) {
+                        state.copy(
+                            clarifyRequest = null,
+                        )
+                    } else {
+                        state
+                    }
+                }
+        }
+    }
+
     private fun clearPrivilegedControls() {
         approvalExpiryJobs.values.forEach(Job::cancel)
         approvalExpiryJobs.clear()
@@ -3471,6 +3597,15 @@ class ChatViewModel(
                         description = event.description,
                         patternKeys = event.patternKeys,
                         privilegedBinding = binding,
+                        serverRequestBinding =
+                            event.serverRequestId?.let {
+                                ServerRequestBinding(
+                                    it,
+                                    binding.runtimeSessionId,
+                                    binding.profileId,
+                                    binding.connectionGeneration,
+                                )
+                            },
                     ),
             )
         _uiState.update { state ->
@@ -3537,13 +3672,38 @@ class ChatViewModel(
         if (!claimApprovalSubmission(messageId, binding)) return
 
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                wsClient.privilegedRequest(method = method, binding = binding, params = params).await()
-            }.onSuccess {
+            val serverBinding =
+                _uiState.value.messages.firstOrNull { it.id == messageId }
+                    ?.approvalInfo?.serverRequestBinding
+            var failureMessage: String? = null
+            val accepted =
+                if (serverBinding != null) {
+                    wsClient.respondToServerRequest(
+                        serverBinding,
+                        buildJsonObject {
+                            put(
+                                "choice",
+                                params["choice"] ?: if (method == WsMethods.APPROVAL_CANCEL) "deny" else "once",
+                            )
+                            put("all", false)
+                        },
+                    ).also { if (!it) failureMessage = "Request was not accepted" }
+                } else {
+                    runCatching {
+                        wsClient.privilegedRequest(method = method, binding = binding, params = params).await()
+                    }.fold(
+                        onSuccess = { true },
+                        onFailure = {
+                            failureMessage = it.message
+                            false
+                        },
+                    )
+                }
+            if (accepted) {
                 approvalExpiryJobs.remove(ApprovalTimerKey(messageId, binding))?.cancel()
                 clearApprovalControls(messageId, binding)
-            }.onFailure { error ->
-                restoreApprovalControls(messageId, binding, error.message)
+            } else {
+                restoreApprovalControls(messageId, binding, failureMessage)
             }
         }
     }

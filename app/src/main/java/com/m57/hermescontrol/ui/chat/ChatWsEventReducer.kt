@@ -573,6 +573,20 @@ object ChatWsEventReducer {
                             sessionId = event.sessionId,
                             sourceProfileId = event.sourceProfileId,
                             connectionGeneration = event.connectionGeneration,
+                            serverRequestBinding =
+                                if (event.serverRequestId != null && event.sessionId != null &&
+                                    event.sourceProfileId != null && event.connectionGeneration != null
+                                ) {
+                                    com.m57.hermescontrol.data.ws.ServerRequestBinding(
+                                        event.serverRequestId,
+                                        event.sessionId,
+                                        event.sourceProfileId,
+                                        event.connectionGeneration,
+                                    )
+                                } else {
+                                    null
+                                },
+                            lockedAnswers = event.lockedAnswers,
                         ),
                     isAgentTyping = false,
                 ),
