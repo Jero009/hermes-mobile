@@ -1085,6 +1085,76 @@ object HermesWsClient {
     }
 
     /**
+     * Submit a prompt only if the profile, runtime session, and concrete socket
+     * captured when the user accepted the send are still current. This path
+     * deliberately never queues or replays across a connection.
+     */
+    fun sendMessageForConnection(
+        binding: ConnectionBinding,
+        sessionId: String,
+        text: String,
+        onSent: ((String) -> Unit)? = null,
+    ): Boolean =
+        sendForConnection(
+            binding = binding,
+            runtimeSessionId = sessionId,
+            method = WsMethods.PROMPT_SUBMIT,
+            params = mapOf("session_id" to sessionId, "text" to text),
+            onSent = onSent,
+        )
+
+    /** Send an active-turn redirect on the same immutable transport binding. */
+    fun sendRedirectForConnection(
+        binding: ConnectionBinding,
+        sessionId: String,
+        text: String,
+        onSent: ((String) -> Unit)? = null,
+    ): Boolean =
+        sendForConnection(
+            binding = binding,
+            runtimeSessionId = sessionId,
+            method = WsMethods.SESSION_REDIRECT,
+            params = mapOf("session_id" to sessionId, "text" to text),
+            onSent = onSent,
+        )
+
+    private fun sendForConnection(
+        binding: ConnectionBinding,
+        runtimeSessionId: String,
+        method: String,
+        params: Map<String, Any>,
+        onSent: ((String) -> Unit)?,
+    ): Boolean =
+        synchronized(connectionLock) {
+            val ws = webSocket
+            if (!connected.get() ||
+                ws == null ||
+                ws !== binding.socket ||
+                activeConnectionProfileId != binding.profileId ||
+                activeConnectionGeneration != binding.generation ||
+                AuthManager.getSelectedProfileId() != binding.profileId ||
+                ActiveSessionHolder.activeSessionId.value != runtimeSessionId
+            ) {
+                return@synchronized false
+            }
+            val id = requestId.incrementAndGet().toString()
+            val request =
+                JsonRpcRequest(
+                    id = id,
+                    method = method,
+                    params = params.mapValues { it.value.toJsonElement() },
+                )
+            val json = OkHttpProvider.json.encodeToString(request)
+            if (!ws.send(json)) return@synchronized false
+            if (method == WsMethods.PROMPT_SUBMIT) {
+                pendingPromptSessions[id] = runtimeSessionId
+                pendingReply = true
+            }
+            onSent?.invoke(id)
+            true
+        }
+
+    /**
      * Convenience: steer the active model turn while it is still generating
      * (backend `session.redirect`).
      *

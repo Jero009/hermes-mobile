@@ -140,17 +140,17 @@ class ChatViewModelTest {
             arg<((String) -> Unit)?>(2)?.invoke(id)
             id
         }
-        every { HermesWsClient.sendMessage(any(), any(), any(), any()) } answers {
+        every { HermesWsClient.sendMessageForConnection(any(), any(), any(), any()) } answers {
             reqCount++
             val id = "req-msg-$reqCount"
-            arg<((String) -> Unit)?>(2)?.invoke(id)
-            id
+            arg<((String) -> Unit)?>(3)?.invoke(id)
+            true
         }
-        every { HermesWsClient.sendRedirect(any(), any(), any()) } answers {
+        every { HermesWsClient.sendRedirectForConnection(any(), any(), any(), any()) } answers {
             reqCount++
             val id = "req-redirect-$reqCount"
-            arg<((String) -> Unit)?>(2)?.invoke(id)
-            id
+            arg<((String) -> Unit)?>(3)?.invoke(id)
+            true
         }
         every { HermesWsClient.respondToClarify(any(), any(), any(), any(), any(), any()) } returns true
         every { HermesWsClient.respondToServerRequest(any(), any()) } returns true
@@ -2400,10 +2400,10 @@ class ChatViewModelTest {
             assertTrue(viewModel.uiState.value.isAgentTyping)
 
             verify {
-                HermesWsClient.sendMessage(
+                HermesWsClient.sendMessageForConnection(
+                    any(),
                     sessionId,
                     "Hello Hermes",
-                    any(),
                     any(),
                 )
             }
@@ -2419,10 +2419,10 @@ class ChatViewModelTest {
             advanceUntilIdle()
             assertTrue(viewModel.uiState.value.isAgentTyping)
             verify {
-                HermesWsClient.sendMessage(
+                HermesWsClient.sendMessageForConnection(
+                    any(),
                     sessionId,
                     "Hello Hermes",
-                    any(),
                     any(),
                 )
             }
@@ -2431,7 +2431,7 @@ class ChatViewModelTest {
             viewModel.sendMessage("Wait, correction")
             advanceUntilIdle()
 
-            verify { HermesWsClient.sendRedirect(sessionId, "Wait, correction", any()) }
+            verify { HermesWsClient.sendRedirectForConnection(any(), sessionId, "Wait, correction", any()) }
         }
 
     @Test
@@ -2456,9 +2456,9 @@ class ChatViewModelTest {
             viewModel.sendMessage("with a file")
             advanceUntilIdle()
 
-            verify(exactly = 0) { HermesWsClient.sendRedirect(any(), any(), any()) }
+            verify(exactly = 0) { HermesWsClient.sendRedirectForConnection(any(), any(), any(), any()) }
             verify {
-                HermesWsClient.sendMessage(sessionId, any(), any(), any())
+                HermesWsClient.sendMessageForConnection(any(), sessionId, any(), any())
             }
         }
 
@@ -2470,15 +2470,15 @@ class ChatViewModelTest {
             viewModel.sendMessage("Hello Hermes")
             advanceUntilIdle()
 
-            every { HermesWsClient.sendRedirect(any(), any(), any()) } answers {
+            every { HermesWsClient.sendRedirectForConnection(any(), any(), any(), any()) } answers {
                 val id = "req-redirect-capture"
-                arg<((String) -> Unit)?>(2)?.invoke(id)
-                id
+                arg<((String) -> Unit)?>(3)?.invoke(id)
+                true
             }
 
             viewModel.sendMessage("Wait, correction")
             advanceUntilIdle()
-            verify { HermesWsClient.sendRedirect(sessionId, "Wait, correction", any()) }
+            verify { HermesWsClient.sendRedirectForConnection(any(), sessionId, "Wait, correction", any()) }
 
             // A gateway whose agent cannot steer answers 4010. The text must be
             // resent as a normal prompt, not surfaced as an error.
@@ -2491,10 +2491,10 @@ class ChatViewModelTest {
             advanceUntilIdle()
 
             verify {
-                HermesWsClient.sendMessage(
+                HermesWsClient.sendMessageForConnection(
+                    any(),
                     sessionId,
                     "Wait, correction",
-                    any(),
                     any(),
                 )
             }
@@ -2509,10 +2509,10 @@ class ChatViewModelTest {
             viewModel.sendMessage("Hello Hermes")
             advanceUntilIdle()
 
-            every { HermesWsClient.sendRedirect(any(), any(), any()) } answers {
+            every { HermesWsClient.sendRedirectForConnection(any(), any(), any(), any()) } answers {
                 val id = "req-redirect-other"
-                arg<((String) -> Unit)?>(2)?.invoke(id)
-                id
+                arg<((String) -> Unit)?>(3)?.invoke(id)
+                true
             }
 
             viewModel.sendMessage("Wait, correction")
@@ -2529,10 +2529,10 @@ class ChatViewModelTest {
             advanceUntilIdle()
 
             verify(exactly = 0) {
-                HermesWsClient.sendMessage(
+                HermesWsClient.sendMessageForConnection(
+                    any(),
                     sessionId,
                     "Wait, correction",
-                    any(),
                     any(),
                 )
             }
@@ -4083,7 +4083,7 @@ class ChatViewModelTest {
         }
 
     @Test
-    fun gatewayReconnectReplay_deduplicatesApprovalCard() =
+    fun gatewayReconnectReplay_deduplicatesApprovalCardButReusedIdWithNewBindingReplacesIt() =
         runTest {
             val (viewModel, _) = createViewModelWithSession()
             mockEventsFlow.emit(serverRequest("wire-replay", "approval"))
@@ -4091,6 +4091,32 @@ class ChatViewModelTest {
             runCurrent()
 
             assertEquals(1, viewModel.uiState.value.messages.count { it.approvalInfo != null })
+
+            mockEventsFlow.emit(serverRequest("wire-replay", "approval", generation = 8))
+            runCurrent()
+            val approvals = viewModel.uiState.value.messages.filter { it.approvalInfo != null }
+            assertEquals(1, approvals.size)
+            assertEquals(8, approvals.single().approvalInfo?.serverRequestBinding?.connectionGeneration)
+        }
+
+    @Test
+    fun gatewayClarify_identicalReplayPreservesStateButReusedIdWithNewBindingReplacesIt() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val request = serverRequest("clarify-replay", "clarify", extra = mapOf("question" to "First?"))
+            mockEventsFlow.emit(request)
+            runCurrent()
+            val original = requireNotNull(viewModel.uiState.value.clarifyRequest)
+
+            mockEventsFlow.emit(request.copy(replayed = true))
+            runCurrent()
+            assertTrue(original === viewModel.uiState.value.clarifyRequest)
+
+            mockEventsFlow.emit(request.copy(connectionGeneration = 8))
+            runCurrent()
+            val replacement = requireNotNull(viewModel.uiState.value.clarifyRequest)
+            assertEquals(8, replacement.serverRequestBinding?.connectionGeneration)
+            assertFalse(original === replacement)
         }
 
     @Test

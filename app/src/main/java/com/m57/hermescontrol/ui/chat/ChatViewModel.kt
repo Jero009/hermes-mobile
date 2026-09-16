@@ -99,6 +99,7 @@ private data class PendingRpcRequest(
     /** Session/text captured for a session.redirect so a 4010 rejection can resend. */
     val redirectSessionId: String? = null,
     val redirectText: String? = null,
+    val redirectConnectionBinding: ConnectionBinding? = null,
     /** Attempt generation for a session.create, used to fence retried answers. */
     val createGeneration: Long? = null,
 )
@@ -1152,7 +1153,12 @@ class ChatViewModel(
         if (method == WsMethods.SESSION_REDIRECT) {
             val sessionId = request.redirectSessionId
             val text = request.redirectText
-            if (errorCode == REDIRECT_UNSUPPORTED_CODE && sessionId != null && !text.isNullOrBlank()) {
+            val connectionBinding = request.redirectConnectionBinding
+            if (errorCode == REDIRECT_UNSUPPORTED_CODE &&
+                sessionId != null &&
+                !text.isNullOrBlank() &&
+                connectionBinding != null
+            ) {
                 Log.d(TAG, "session.redirect unsupported — resending as prompt.submit")
                 // ChatWsEventReducer.onRpcError already ran for this event and
                 // parked a generic error banner. The rejection is recoverable,
@@ -1160,9 +1166,10 @@ class ChatViewModel(
                 // failure they cannot act on.
                 _uiState.update { it.copy(errorMessage = null) }
                 viewModelScope.launch(Dispatchers.IO) {
-                    wsClient.sendMessage(
-                        sessionId,
-                        text,
+                    wsClient.sendMessageForConnection(
+                        binding = connectionBinding,
+                        sessionId = sessionId,
+                        text = text,
                         onSent = { retryId -> trackRequest(retryId, WsMethods.PROMPT_SUBMIT) },
                     )
                 }
@@ -1201,6 +1208,7 @@ class ChatViewModel(
         val storageSessionId = state.currentSessionId ?: return false
         val agentSessionId = runtimeSessionId ?: return false
         val dispatchGeneration = conversationGeneration
+        val dispatchConnection = wsClient.connectionBinding(selectedProfileId()) ?: return false
 
         val trimmed = text.trim()
         if (trimmed.startsWith("/", ignoreCase = true)) {
@@ -1329,17 +1337,19 @@ class ChatViewModel(
             // handleRpcError re-sends the text as a normal prompt so the
             // typed message is never silently lost.
             if (wasStreaming && attachments.isEmpty()) {
-                wsClient.sendRedirect(
-                    agentSessionId,
-                    fullText,
+                wsClient.sendRedirectForConnection(
+                    binding = dispatchConnection,
+                    sessionId = agentSessionId,
+                    text = fullText,
                     onSent = { id ->
-                        trackRedirectRequest(id, agentSessionId, fullText)
+                        trackRedirectRequest(id, agentSessionId, fullText, dispatchConnection)
                     },
                 )
             } else {
-                wsClient.sendMessage(
-                    agentSessionId,
-                    fullText,
+                wsClient.sendMessageForConnection(
+                    binding = dispatchConnection,
+                    sessionId = agentSessionId,
+                    text = fullText,
                     onSent = { id -> trackRequest(id, WsMethods.PROMPT_SUBMIT) },
                 )
             }
@@ -3562,11 +3572,22 @@ class ChatViewModel(
                 }
             }
             "approval" -> {
+                val serverBinding =
+                    ServerRequestBinding(request.id, sessionId, binding.profileId, binding.connectionGeneration)
                 val duplicate =
                     _uiState.value.messages.any {
-                        it.approvalInfo?.serverRequestBinding?.requestId == request.id
+                        it.approvalInfo?.serverRequestBinding == serverBinding
                     }
                 if (duplicate) return
+                _uiState.update { state ->
+                    state.copy(
+                        messages =
+                            state.messages.filterNot {
+                                val prior = it.approvalInfo?.serverRequestBinding
+                                prior?.requestId == request.id && prior != serverBinding
+                            },
+                    )
+                }
                 handleApprovalRequest(
                     WsEvent.ApprovalRequest(
                         command = request.params["command"] as? String,
@@ -3598,7 +3619,9 @@ class ChatViewModel(
                     }.orEmpty()
                 val first = questions.firstOrNull()
                 val current = _uiState.value.clarifyRequest
-                if (current?.serverRequestBinding?.requestId == request.id) {
+                val serverBinding =
+                    ServerRequestBinding(request.id, sessionId, binding.profileId, binding.connectionGeneration)
+                if (current?.serverRequestBinding == serverBinding) {
                     if (!request.replayed || current.questions.isNotEmpty()) return
                 }
                 handleWsEvent(
@@ -4295,12 +4318,14 @@ class ChatViewModel(
         id: String,
         sessionId: String,
         text: String,
+        connectionBinding: ConnectionBinding,
     ) {
         pendingRequests[id] =
             PendingRpcRequest(
                 method = WsMethods.SESSION_REDIRECT,
                 redirectSessionId = sessionId,
                 redirectText = text,
+                redirectConnectionBinding = connectionBinding,
             )
     }
 
