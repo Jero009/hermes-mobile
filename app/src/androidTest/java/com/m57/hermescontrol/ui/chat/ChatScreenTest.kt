@@ -7,6 +7,7 @@ import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertHasClickAction
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.assertTextEquals
@@ -308,17 +309,42 @@ class ChatScreenTest {
 
     @Test
     fun vaultSaveLogin_parentRoutesBothFieldsAndMasksPassword() {
-        val state = promptState(vaultPrompt("vault.save_login", "save-1", identifier = "alice@example.com"))
+        val state =
+            promptState(
+                vaultPrompt(
+                    "vault.save_login",
+                    "save-1",
+                    identifier = "alice@example.com",
+                    requestedOrigin = "https://accounts.example.com:8443",
+                    title = "Save this password for a different site",
+                ),
+            )
         val viewModel = promptViewModel(state)
         composeTestRule.setContent { ChatScreen(sessionId = "session", viewModel = viewModel) }
 
-        composeTestRule.onNodeWithText("Save login").assertIsDisplayed()
+        composeTestRule.onNodeWithText("Save this password for a different site").assertIsDisplayed()
+        composeTestRule.onNodeWithText("Requested site: https://accounts.example.com:8443").assertIsDisplayed()
         composeTestRule.onNodeWithTag("vault_identifier_input").assertTextContains("alice@example.com")
         val passwordInput = composeTestRule.onNodeWithTag("vault_secret_input")
         passwordInput.performTextInput("password")
         passwordInput.assert(rawInputEquals("password")).assert(maskedEditableText())
         composeTestRule.onNodeWithTag("vault_send_button").performClick()
         verify { viewModel.respondToVaultLogin("alice@example.com", "password") }
+    }
+
+    @Test
+    fun vaultSaveLogin_parentRejectsMissingOriginWithoutCredentialEntry() {
+        val state = promptState(vaultPrompt("vault.save_login", "save-missing"))
+        val viewModel = promptViewModel(state)
+        composeTestRule.setContent { ChatScreen(sessionId = "session", viewModel = viewModel) }
+
+        composeTestRule.onNodeWithText("Requested site: Missing origin").assertIsDisplayed()
+        composeTestRule.onNodeWithText("This request has no valid web origin. Cancel it without entering credentials.")
+            .assertIsDisplayed()
+        composeTestRule.onNodeWithTag("vault_identifier_input").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("vault_secret_input").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("vault_send_button").assertIsNotEnabled()
+        composeTestRule.onNodeWithTag("vault_cancel_button").assertIsEnabled()
     }
 
     @Test
@@ -385,12 +411,16 @@ class ChatScreenTest {
         requestId: String,
         prompt: String? = null,
         identifier: String? = null,
+        requestedOrigin: String? = null,
+        title: String? = null,
         isSubmitting: Boolean = false,
     ) = VaultPromptUi(
         binding = ServerRequestBinding(requestId, "session", "profile", 1),
         method = method,
         prompt = prompt,
         identifier = identifier,
+        requestedOrigin = requestedOrigin,
+        title = title,
         isSubmitting = isSubmitting,
     )
 

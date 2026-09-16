@@ -290,8 +290,24 @@ data class VaultPromptUi(
     val title: String? = null,
     val prompt: String? = null,
     val identifier: String? = null,
+    val requestedOrigin: String? = null,
     val isSubmitting: Boolean = false,
-)
+) {
+    val hasValidRequestedOrigin: Boolean
+        get() = method != "vault.save_login" || requestedOrigin.isValidWebOrigin()
+}
+
+private fun String?.isValidWebOrigin(): Boolean {
+    val value = this ?: return false
+    if (value.isBlank() || value != value.trim()) return false
+    val uri = runCatching { java.net.URI(value) }.getOrNull() ?: return false
+    return (uri.scheme == "https" || uri.scheme == "http") &&
+        uri.host != null &&
+        uri.rawUserInfo == null &&
+        uri.rawPath.isNullOrEmpty() &&
+        uri.rawQuery == null &&
+        uri.rawFragment == null
+}
 
 /** Expensive-model confirmation returned by the gateway's config.set RPC. */
 data class ModelSwitchConfirmation(
@@ -3565,6 +3581,9 @@ class ChatViewModel(
                                     title = request.params["title"] as? String,
                                     prompt = request.params["prompt"] as? String,
                                     identifier = request.params["identifier"] as? String,
+                                    requestedOrigin =
+                                        (request.params["origin"] as? String)
+                                            ?: (request.params["site"] as? String),
                                 ),
                             isAgentTyping = false,
                         )
@@ -4014,7 +4033,13 @@ class ChatViewModel(
         password: String,
     ) {
         val prompt = _uiState.value.vaultPrompt ?: return
-        if (identifier.isBlank() || password.isBlank()) return
+        if (prompt.method != "vault.save_login" ||
+            !prompt.hasValidRequestedOrigin ||
+            identifier.isBlank() ||
+            password.isBlank()
+        ) {
+            return
+        }
         submitVault(
             prompt,
             buildJsonObject {

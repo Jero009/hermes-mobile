@@ -55,34 +55,47 @@ fun VaultPromptDialog(
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 prompt.prompt?.takeIf(String::isNotBlank)?.let { Text(it) }
                 if (saveLogin) {
+                    Text(
+                        text = "Requested site: ${prompt.requestedOrigin ?: "Missing origin"}",
+                        modifier = Modifier.testTag("vault_requested_origin"),
+                    )
+                    if (prompt.hasValidRequestedOrigin) {
+                        OutlinedTextField(
+                            value = identifier,
+                            onValueChange = { identifier = it },
+                            label = { Text("Identifier") },
+                            modifier = Modifier.fillMaxWidth().testTag("vault_identifier_input"),
+                            enabled = !prompt.isSubmitting,
+                        )
+                    } else {
+                        Text("This request has no valid web origin. Cancel it without entering credentials.")
+                    }
+                }
+                if (!saveLogin || prompt.hasValidRequestedOrigin) {
                     OutlinedTextField(
-                        value = identifier,
-                        onValueChange = { identifier = it },
-                        label = { Text("Identifier") },
-                        modifier = Modifier.fillMaxWidth().testTag("vault_identifier_input"),
+                        value = value,
+                        onValueChange = { value = it },
+                        label = { Text(if (prompt.method == "vault.code") "Code" else "Password") },
+                        modifier = Modifier.fillMaxWidth().testTag("vault_secret_input"),
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions =
+                            KeyboardOptions(
+                                autoCorrectEnabled = false,
+                                keyboardType = KeyboardType.Password,
+                            ),
                         enabled = !prompt.isSubmitting,
                     )
                 }
-                OutlinedTextField(
-                    value = value,
-                    onValueChange = { value = it },
-                    label = { Text(if (prompt.method == "vault.code") "Code" else "Password") },
-                    modifier = Modifier.fillMaxWidth().testTag("vault_secret_input"),
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions =
-                        KeyboardOptions(
-                            autoCorrectEnabled = false,
-                            keyboardType = KeyboardType.Password,
-                        ),
-                    enabled = !prompt.isSubmitting,
-                )
             }
         },
         confirmButton = {
             TextButton(
                 onClick = { if (saveLogin) onConfirmLogin(identifier, value) else onConfirm(value) },
-                enabled = value.isNotBlank() && (!saveLogin || identifier.isNotBlank()) && !prompt.isSubmitting,
+                enabled =
+                    value.isNotBlank() &&
+                        (!saveLogin || (prompt.hasValidRequestedOrigin && identifier.isNotBlank())) &&
+                        !prompt.isSubmitting,
                 modifier = Modifier.testTag("vault_send_button"),
             ) { Text(stringResource(R.string.chat_send)) }
         },

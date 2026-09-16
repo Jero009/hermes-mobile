@@ -3936,7 +3936,9 @@ class ChatViewModelTest {
             runCurrent()
             viewModel.respondToVault("01A9")
             runCurrent()
-            mockEventsFlow.emit(serverRequest("login-id", "vault.save_login"))
+            mockEventsFlow.emit(
+                serverRequest("login-id", "vault.save_login", extra = mapOf("origin" to "https://example.com")),
+            )
             runCurrent()
             viewModel.respondToVaultLogin("alice", "pw")
             runCurrent()
@@ -3948,6 +3950,43 @@ class ChatViewModelTest {
                 "{\"value\":\"{\\\"identifier\\\":\\\"alice\\\",\\\"password\\\":\\\"pw\\\"}\"}",
                 results[1].toString(),
             )
+        }
+
+    @Test
+    fun gatewayVault_saveLoginRetainsAndValidatesRequestedOrigin() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            every { HermesWsClient.respondToServerRequest(any(), any()) } returns true
+
+            mockEventsFlow.emit(
+                serverRequest(
+                    "valid",
+                    "vault.save_login",
+                    extra = mapOf("site" to "https://EXAMPLE.com:8443", "title" to "Misleading title"),
+                ),
+            )
+            runCurrent()
+            assertEquals("https://EXAMPLE.com:8443", viewModel.uiState.value.vaultPrompt?.requestedOrigin)
+            assertTrue(requireNotNull(viewModel.uiState.value.vaultPrompt).hasValidRequestedOrigin)
+
+            mockEventsFlow.emit(
+                serverRequest("missing", "vault.save_login", extra = mapOf("domain" to "example.com")),
+            )
+            runCurrent()
+            assertFalse(requireNotNull(viewModel.uiState.value.vaultPrompt).hasValidRequestedOrigin)
+            viewModel.respondToVaultLogin("alice", "pw")
+            runCurrent()
+            verify(exactly = 0) { HermesWsClient.respondToServerRequest(any(), any()) }
+
+            mockEventsFlow.emit(
+                serverRequest(
+                    "invalid",
+                    "vault.save_login",
+                    extra = mapOf("origin" to "https://user@example.com/path?query=1"),
+                ),
+            )
+            runCurrent()
+            assertFalse(requireNotNull(viewModel.uiState.value.vaultPrompt).hasValidRequestedOrigin)
         }
 
     @Test
