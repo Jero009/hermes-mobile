@@ -521,6 +521,8 @@
     <string name="sessions_search_played_at">播放于 %1$s</string>
     <string name="sessions_search_match_label">匹配</string>
     <string name="sessions_search_model_label">模型</string>
+    <string name="sessions_live_status_working">工作中</string>
+    <string name="sessions_live_status_waiting">等待中</string>
     <string name="sessions_stat_total">总计</string>
     <string name="sessions_stat_messages">消息</string>
     <string name="sessions_action_prune">清理</string>

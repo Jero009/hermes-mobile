@@ -66,6 +66,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -94,6 +95,7 @@ import com.m57.hermescontrol.NavigationController
 import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.model.SessionInfo
+import com.m57.hermescontrol.data.model.SessionLiveStatus
 import com.m57.hermescontrol.data.model.SessionSearchResult
 import com.m57.hermescontrol.data.model.SessionTreeItem
 import com.m57.hermescontrol.data.model.flattenSessionTree
@@ -363,6 +365,10 @@ fun SessionsScreen(
         screenViewModel.loadSessions()
         screenViewModel.loadStats()
     }
+    DisposableEffect(screenViewModel) {
+        screenViewModel.startLiveStatusTracking()
+        onDispose { screenViewModel.stopLiveStatusTracking() }
+    }
 
     // Toast effect
     ToastEffect(
@@ -609,6 +615,7 @@ fun SessionsScreen(
                                                 val session = item.session
                                                 SearchResultCard(
                                                     session = session,
+                                                    liveStatus = state.liveStatuses[session.id],
                                                     query = state.searchQuery,
                                                     isSelecting = state.isSelecting,
                                                     isSelected = session.id in state.selectedIds,
@@ -786,6 +793,7 @@ fun SessionsScreen(
                                 val session = item.session
                                 SessionCard(
                                     session = session,
+                                    liveStatus = state.liveStatuses[session.id],
                                     displayTitle = item.displayTitle,
                                     isFork = item.isFork,
                                     forkDepth = item.forkDepth,
@@ -1155,6 +1163,7 @@ private fun SessionPinButton(
 @Composable
 private fun SessionCard(
     session: com.m57.hermescontrol.data.model.SessionInfo,
+    liveStatus: SessionLiveStatus?,
     displayTitle: String,
     isFork: Boolean,
     forkDepth: Int,
@@ -1173,7 +1182,10 @@ private fun SessionCard(
 ) {
     val spacing = LocalSpacing.current
     val statusColors = LocalHermesStatusColors.current
-    val isActive = session.status?.lowercase() == "active" || session.status?.lowercase() == "streaming"
+    val isActive =
+        liveStatus != null ||
+            session.status?.lowercase() == "active" ||
+            session.status?.lowercase() == "streaming"
     val srcIcon = sourceIcon(session.source)
 
     Card(
@@ -1276,6 +1288,10 @@ private fun SessionCard(
                             status = if (isActive) StatusBadgeType.SUCCESS else StatusBadgeType.NEUTRAL,
                         )
                     }
+                    if (liveStatus != null) {
+                        Spacer(modifier = Modifier.width(spacing.sm))
+                        LiveStatusBadge(liveStatus)
+                    }
                 }
             }
 
@@ -1312,6 +1328,25 @@ private fun SessionCard(
     }
 }
 
+@Composable
+private fun LiveStatusBadge(status: SessionLiveStatus) {
+    val label =
+        stringResource(
+            when (status) {
+                SessionLiveStatus.WORKING -> R.string.sessions_live_status_working
+                SessionLiveStatus.WAITING -> R.string.sessions_live_status_waiting
+            },
+        )
+    StatusBadge(
+        text = label,
+        status =
+            when (status) {
+                SessionLiveStatus.WORKING -> StatusBadgeType.SUCCESS
+                SessionLiveStatus.WAITING -> StatusBadgeType.INFO
+            },
+    )
+}
+
 /**
  * Search-result card. The backend search payload has no session title, so this card is
  * honest about it: it shows a "Match" label + the highlighted snippet as the body, plus
@@ -1321,6 +1356,7 @@ private fun SessionCard(
 @Composable
 private fun SearchResultCard(
     session: com.m57.hermescontrol.data.model.SessionInfo,
+    liveStatus: SessionLiveStatus?,
     query: String,
     isSelecting: Boolean,
     isSelected: Boolean,
@@ -1356,6 +1392,8 @@ private fun SearchResultCard(
         border =
             if (isSelected) {
                 BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
+            } else if (liveStatus != null) {
+                BorderStroke(2.dp, statusColors.success)
             } else {
                 null
             },
@@ -1423,6 +1461,9 @@ private fun SearchResultCard(
                     horizontalArrangement = Arrangement.spacedBy(spacing.xs),
                     verticalArrangement = Arrangement.spacedBy(spacing.xs),
                 ) {
+                    if (liveStatus != null) {
+                        LiveStatusBadge(liveStatus)
+                    }
                     session.source?.let { src ->
                         StatusBadge(
                             text = sourceLabel(src),

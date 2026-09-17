@@ -521,6 +521,8 @@
     <string name="sessions_search_played_at">%1$s에 재생됨</string>
     <string name="sessions_search_match_label">일치 항목</string>
     <string name="sessions_search_model_label">모델</string>
+    <string name="sessions_live_status_working">작업 중</string>
+    <string name="sessions_live_status_waiting">대기 중</string>
     <string name="sessions_stat_total">전체</string>
     <string name="sessions_stat_messages">메시지</string>
     <string name="sessions_action_prune">정리</string>

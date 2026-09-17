@@ -16,6 +16,14 @@ data class SessionLiveTrackingState(
  * Pure reducer managing live active session transitions.
  */
 object SessionLiveStatusReducer {
+    fun isLiveStatusEvent(event: WsEvent): Boolean =
+        event is WsEvent.SessionInfo ||
+            event is WsEvent.MessageStart ||
+            event is WsEvent.MessageComplete ||
+            event is WsEvent.MessageDone ||
+            event is WsEvent.ApprovalRequest ||
+            event is WsEvent.ClarifyRequest
+
     fun applySnapshot(
         state: SessionLiveTrackingState,
         snapshot: LiveSessionSnapshot,
@@ -47,7 +55,9 @@ object SessionLiveStatusReducer {
     ): SessionLiveTrackingState {
         val data = event.data ?: return state
         val storedId = (data["stored_session_id"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
-        val runtimeId = (data["session_id"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+        val runtimeId =
+            event.sessionId?.trim()?.takeIf { it.isNotEmpty() }
+                ?: (data["session_id"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
         val running = data["running"] as? Boolean
 
         val targetStoredId = storedId ?: runtimeId?.let { state.storedIdByRuntimeId[it] }

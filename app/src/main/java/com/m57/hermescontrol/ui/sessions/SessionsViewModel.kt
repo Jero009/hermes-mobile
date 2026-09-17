@@ -694,11 +694,12 @@ class SessionsViewModel(
                         ) {
                             return@collect
                         }
-                        liveEventRevision++
+                        val isLiveStatusEvent = SessionLiveStatusReducer.isLiveStatusEvent(sourced.event)
+                        if (isLiveStatusEvent) liveEventRevision++
                         liveTrackingState =
                             SessionLiveStatusReducer.applyWsEvent(liveTrackingState, sourced.event)
                         publishLiveStatuses()
-                        if (liveRefreshInFlight) liveRefreshPending = true
+                        if (isLiveStatusEvent && liveRefreshInFlight) liveRefreshPending = true
                     }
                 }
                 launch {

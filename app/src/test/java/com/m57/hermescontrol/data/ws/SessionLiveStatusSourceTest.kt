@@ -122,10 +122,12 @@ class SessionLiveStatusSourceTest {
         runBlocking {
             var capturedMethod: String? = null
             var capturedParams: Map<String, Any>? = null
+            var capturedConnection: SessionLiveConnection? = null
 
             val source =
                 HermesSessionLiveStatusSource(
-                    rpcRequest = { method, params ->
+                    boundRpcRequest = { connection, method, params ->
+                        capturedConnection = connection
                         capturedMethod = method
                         capturedParams = params
                         mapOf(
@@ -148,6 +150,7 @@ class SessionLiveStatusSourceTest {
 
             assertEquals(WsMethods.SESSION_ACTIVE_LIST, capturedMethod)
             assertTrue(capturedParams!!.isEmpty())
+            assertEquals(SessionLiveConnection("profile-a", 1), capturedConnection)
             assertNotNull(snapshot)
             assertEquals(SessionLiveStatus.WORKING, snapshot!!.statusByStoredId["st-1"])
         }
@@ -157,7 +160,7 @@ class SessionLiveStatusSourceTest {
         runBlocking {
             val source =
                 HermesSessionLiveStatusSource(
-                    rpcRequest = { _, _ -> throw RuntimeException("RPC error") },
+                    boundRpcRequest = { _, _, _ -> throw RuntimeException("RPC error") },
                     sourcedEventsProvider = { MutableSharedFlow() },
                     connectionStatusProvider = { MutableStateFlow(ConnectionStatus.CONNECTED) },
                     isConnectionCurrent = { true },

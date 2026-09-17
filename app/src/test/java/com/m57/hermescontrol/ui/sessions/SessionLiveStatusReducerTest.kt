@@ -10,6 +10,25 @@ import org.junit.Test
 
 class SessionLiveStatusReducerTest {
     @Test
+    fun `session info uses canonical event session id when payload omits it`() {
+        val state =
+            SessionLiveStatusReducer.applyWsEvent(
+                SessionLiveTrackingState(),
+                WsEvent.SessionInfo(
+                    data =
+                        mapOf(
+                            "stored_session_id" to "stored-a",
+                            "running" to true,
+                        ),
+                    sessionId = "runtime-a",
+                ),
+            )
+
+        assertEquals("stored-a", state.storedIdByRuntimeId["runtime-a"])
+        assertEquals(SessionLiveStatus.WORKING, state.liveStatuses["stored-a"])
+    }
+
+    @Test
     fun `snapshot replacement seeds WORKING and WAITING by stored ID`() {
         val snapshot =
             LiveSessionSnapshot(

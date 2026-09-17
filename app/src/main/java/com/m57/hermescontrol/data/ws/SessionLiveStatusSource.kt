@@ -164,9 +164,15 @@ object SessionLiveStatusDecoder {
  * Production implementation of [SessionLiveStatusSource] backed by [HermesWsClient].
  */
 class HermesSessionLiveStatusSource(
-    private val rpcRequest: suspend (method: String, params: Map<String, Any>) -> Any? = { method, params ->
-        HermesWsClient.request(method, params).await()
-    },
+    private val boundRpcRequest:
+        suspend (connection: SessionLiveConnection, method: String, params: Map<String, Any>) -> Any? =
+        { connection, method, params ->
+            val binding =
+                HermesWsClient.connectionBinding(connection.profileId)
+                    ?.takeIf { it.generation == connection.generation }
+                    ?: throw HermesWsClient.HermesRpcException("WebSocket binding changed — request cancelled")
+            HermesWsClient.requestForProfileConnection(binding, method, params).await()
+        },
     sourcedEventsProvider: () -> Flow<SourcedSessionLiveEvent> = {
         HermesWsClient.sourcedEvents.map { sourced ->
             SourcedSessionLiveEvent(sourced.event, sourced.profileId, sourced.connectionGeneration)
@@ -190,7 +196,7 @@ class HermesSessionLiveStatusSource(
     override suspend fun fetchActiveSessionsSnapshot(connection: SessionLiveConnection): LiveSessionSnapshot? =
         try {
             if (!isConnectionCurrent(connection)) return null
-            val raw = rpcRequest(WsMethods.SESSION_ACTIVE_LIST, emptyMap())
+            val raw = boundRpcRequest(connection, WsMethods.SESSION_ACTIVE_LIST, emptyMap())
             if (!isConnectionCurrent(connection)) null else SessionLiveStatusDecoder.decodeSnapshot(raw)
         } catch (e: CancellationException) {
             throw e

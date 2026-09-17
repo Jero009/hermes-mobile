@@ -97,6 +97,65 @@ class SessionsLiveStatusViewModelTest {
     }
 
     @Test
+    fun `stream deltas during snapshot do not invalidate it or schedule refresh`() {
+        val source = FakeLiveStatusSource()
+        val suspendedSnapshot = CompletableDeferred<LiveSessionSnapshot?>()
+        source.snapshots.add(suspendedSnapshot)
+        source.connections["profile-a"] = SessionLiveConnection("profile-a", 7)
+        val viewModel = testViewModel(source)
+
+        viewModel.startLiveStatusTracking()
+        source.profiles.value = "profile-a"
+        dispatcher.scheduler.runCurrent()
+        source.status.value = ConnectionStatus.CONNECTED
+        dispatcher.scheduler.runCurrent()
+        source.events.tryEmit(sourced(WsEvent.MessageToken("token", "runtime-a")))
+        source.events.tryEmit(sourced(WsEvent.ThinkingDelta("thinking", "runtime-a")))
+        source.events.tryEmit(sourced(WsEvent.ReasoningDelta("reasoning", "runtime-a")))
+        dispatcher.scheduler.runCurrent()
+        suspendedSnapshot.complete(snapshot("runtime-a", "stored-a", SessionLiveStatus.WORKING))
+        dispatcher.scheduler.runCurrent()
+
+        assertEquals(SessionLiveStatus.WORKING, viewModel.uiState.value.liveStatuses["stored-a"])
+        assertEquals(1, source.requestedConnections.size)
+    }
+
+    @Test
+    fun `repeated live transition during snapshot still schedules one refresh`() {
+        val source = FakeLiveStatusSource()
+        val suspendedSnapshot = CompletableDeferred<LiveSessionSnapshot?>()
+        source.snapshots.add(CompletableDeferred(snapshot("runtime-a", "stored-a", SessionLiveStatus.WORKING)))
+        source.snapshots.add(suspendedSnapshot)
+        source.snapshots.add(CompletableDeferred(snapshot("runtime-a", "stored-a", SessionLiveStatus.WORKING)))
+        source.connections["profile-a"] = SessionLiveConnection("profile-a", 7)
+        val viewModel = testViewModel(source)
+
+        viewModel.startLiveStatusTracking()
+        source.profiles.value = "profile-a"
+        source.status.value = ConnectionStatus.CONNECTED
+        dispatcher.scheduler.runCurrent()
+        viewModel.refreshLiveStatuses()
+        dispatcher.scheduler.runCurrent()
+        source.events.tryEmit(
+            sourced(
+                WsEvent.SessionInfo(
+                    mapOf(
+                        "session_id" to "runtime-a",
+                        "stored_session_id" to "stored-a",
+                        "running" to true,
+                    ),
+                ),
+            ),
+        )
+        dispatcher.scheduler.runCurrent()
+        suspendedSnapshot.complete(snapshot("runtime-a", "stored-a", SessionLiveStatus.WAITING))
+        dispatcher.scheduler.runCurrent()
+
+        assertEquals(SessionLiveStatus.WORKING, viewModel.uiState.value.liveStatuses["stored-a"])
+        assertEquals(3, source.requestedConnections.size)
+    }
+
+    @Test
     fun `wrong profile or connection generation event is ignored`() {
         val source = FakeLiveStatusSource()
         source.snapshots.add(CompletableDeferred(snapshot("runtime-a", "stored-a", SessionLiveStatus.WORKING)))
@@ -147,6 +206,13 @@ class SessionsLiveStatusViewModelTest {
         storedId: String,
         status: SessionLiveStatus,
     ) = LiveSessionSnapshot(mapOf(storedId to status), mapOf(runtimeId to storedId))
+
+    private fun sourced(event: WsEvent) =
+        SourcedSessionLiveEvent(
+            event = event,
+            profileId = "profile-a",
+            connectionGeneration = 7,
+        )
 
     private fun testViewModel(source: SessionLiveStatusSource) =
         SessionsViewModel(
