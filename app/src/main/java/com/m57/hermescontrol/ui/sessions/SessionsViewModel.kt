@@ -76,6 +76,7 @@ data class SessionsUiState(
     val searchResults: List<SessionSearchResult> = emptyList(),
     val searchError: String? = null,
     val liveStatuses: Map<String, SessionLiveStatus> = emptyMap(),
+    val liveStatusesAuthoritative: Boolean = false,
 ) {
     val hasMore: Boolean get() = !paginationExhausted && total > serverOffset
     val isSearchMode: Boolean get() = searchQuery.isNotBlank()
@@ -101,6 +102,7 @@ class SessionsViewModel(
     private var statsJob: Job? = null
     private var hydratePinsJob: Job? = null
     private var liveTrackingJob: Job? = null
+    private var liveSnapshotJob: Job? = null
     private var liveTrackingGeneration = 0L
     private var liveEventRevision = 0L
     private var liveTrackingState = SessionLiveTrackingState()
@@ -108,6 +110,7 @@ class SessionsViewModel(
     private var activeLiveConnection: SessionLiveConnection? = null
     private var liveRefreshInFlight = false
     private var liveRefreshPending = false
+    private var hasAuthoritativeLiveSnapshot = false
 
     /** Page size matches the desktop sidebar while staying below the server cap. */
     private companion object {
@@ -694,10 +697,12 @@ class SessionsViewModel(
                         ) {
                             return@collect
                         }
-                        val isLiveStatusEvent = SessionLiveStatusReducer.isLiveStatusEvent(sourced.event)
+                        val previousState = liveTrackingState
+                        val nextState = SessionLiveStatusReducer.applyWsEvent(previousState, sourced.event)
+                        val isLiveStatusEvent =
+                            SessionLiveStatusReducer.isLiveStatusEvent(sourced.event) || nextState != previousState
                         if (isLiveStatusEvent) liveEventRevision++
-                        liveTrackingState =
-                            SessionLiveStatusReducer.applyWsEvent(liveTrackingState, sourced.event)
+                        liveTrackingState = nextState
                         publishLiveStatuses()
                         if (isLiveStatusEvent && liveRefreshInFlight) liveRefreshPending = true
                     }
@@ -736,9 +741,12 @@ class SessionsViewModel(
     private fun resetLiveTracking() {
         liveTrackingGeneration++
         liveEventRevision++
+        liveSnapshotJob?.cancel()
+        liveSnapshotJob = null
         activeLiveConnection = null
         liveRefreshInFlight = false
         liveRefreshPending = false
+        hasAuthoritativeLiveSnapshot = false
         liveTrackingState = SessionLiveStatusReducer.clear()
         publishLiveStatuses()
     }
@@ -757,32 +765,40 @@ class SessionsViewModel(
         liveRefreshInFlight = true
         val generation = liveTrackingGeneration
         val eventRevision = liveEventRevision
-        viewModelScope.launch {
-            try {
-                val snapshot = liveStatusSource.fetchActiveSessionsSnapshot(connection)
-                if (snapshot != null &&
-                    generation == liveTrackingGeneration &&
-                    eventRevision == liveEventRevision &&
-                    connection == activeLiveConnection &&
-                    liveStatusSource.connectionStatus.value == ConnectionStatus.CONNECTED
-                ) {
-                    liveTrackingState = SessionLiveStatusReducer.applySnapshot(liveTrackingState, snapshot)
-                    publishLiveStatuses()
-                }
-            } finally {
-                if (generation == liveTrackingGeneration && connection == activeLiveConnection) {
-                    liveRefreshInFlight = false
-                    if (liveRefreshPending) {
-                        liveRefreshPending = false
-                        requestLiveStatusSnapshot()
+        liveSnapshotJob =
+            viewModelScope.launch {
+                try {
+                    val snapshot = liveStatusSource.fetchActiveSessionsSnapshot(connection)
+                    if (snapshot != null &&
+                        generation == liveTrackingGeneration &&
+                        eventRevision == liveEventRevision &&
+                        connection == activeLiveConnection &&
+                        liveStatusSource.connectionStatus.value == ConnectionStatus.CONNECTED
+                    ) {
+                        liveTrackingState = SessionLiveStatusReducer.applySnapshot(liveTrackingState, snapshot)
+                        hasAuthoritativeLiveSnapshot = true
+                        publishLiveStatuses()
+                    }
+                } finally {
+                    if (generation == liveTrackingGeneration && connection == activeLiveConnection) {
+                        liveSnapshotJob = null
+                        liveRefreshInFlight = false
+                        if (liveRefreshPending) {
+                            liveRefreshPending = false
+                            requestLiveStatusSnapshot()
+                        }
                     }
                 }
             }
-        }
     }
 
     private fun publishLiveStatuses() {
-        _uiState.update { it.copy(liveStatuses = liveTrackingState.liveStatuses) }
+        _uiState.update {
+            it.copy(
+                liveStatuses = liveTrackingState.liveStatuses,
+                liveStatusesAuthoritative = hasAuthoritativeLiveSnapshot,
+            )
+        }
     }
 
     override fun onCleared() {

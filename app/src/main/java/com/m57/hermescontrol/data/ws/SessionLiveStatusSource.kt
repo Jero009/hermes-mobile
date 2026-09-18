@@ -171,7 +171,7 @@ class HermesSessionLiveStatusSource(
                 HermesWsClient.connectionBinding(connection.profileId)
                     ?.takeIf { it.generation == connection.generation }
                     ?: throw HermesWsClient.HermesRpcException("WebSocket binding changed — request cancelled")
-            HermesWsClient.requestForProfileConnection(binding, method, params).await()
+            HermesWsClient.requestForProfileConnectionAwaited(binding, method, params)
         },
     sourcedEventsProvider: () -> Flow<SourcedSessionLiveEvent> = {
         HermesWsClient.sourcedEvents.map { sourced ->
@@ -184,7 +184,8 @@ class HermesSessionLiveStatusSource(
         HermesWsClient.connectionBinding(profileId)?.let { SessionLiveConnection(it.profileId, it.generation) }
     },
     private val isConnectionCurrent: (SessionLiveConnection) -> Boolean = { connection ->
-        HermesWsClient.connectionBinding(connection.profileId)?.generation == connection.generation
+        AuthManager.getSelectedProfileId() == connection.profileId &&
+            HermesWsClient.connectionBinding(connection.profileId)?.generation == connection.generation
     },
 ) : SessionLiveStatusSource {
     override val sourcedEvents: Flow<SourcedSessionLiveEvent> by lazy { sourcedEventsProvider() }

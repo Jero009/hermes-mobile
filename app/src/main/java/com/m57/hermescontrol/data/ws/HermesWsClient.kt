@@ -855,6 +855,20 @@ object HermesWsClient {
             deferred
         }
 
+    suspend fun requestForProfileConnectionAwaited(
+        binding: ConnectionBinding,
+        method: String,
+        params: Map<String, Any> = emptyMap(),
+        timeoutMs: Long = REQUEST_TIMEOUT_MS,
+    ): Any? {
+        val pendingRequest = requestForProfileConnection(binding, method, params, timeoutMs)
+        return try {
+            pendingRequest.await()
+        } finally {
+            cancelPendingRequest(pendingRequest)
+        }
+    }
+
     /** Complete (or fail) a single pending call and cancel its timer. */
     private fun resolvePending(
         id: String,

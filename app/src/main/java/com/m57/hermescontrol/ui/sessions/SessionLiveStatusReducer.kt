@@ -22,7 +22,8 @@ object SessionLiveStatusReducer {
             event is WsEvent.MessageComplete ||
             event is WsEvent.MessageDone ||
             event is WsEvent.ApprovalRequest ||
-            event is WsEvent.ClarifyRequest
+            event is WsEvent.ClarifyRequest ||
+            event is WsEvent.ClarifyExpire
 
     fun applySnapshot(
         state: SessionLiveTrackingState,
@@ -44,6 +45,12 @@ object SessionLiveStatusReducer {
             is WsEvent.MessageDone -> reduceMessageDone(state, event)
             is WsEvent.ApprovalRequest -> reduceApprovalRequest(state, event)
             is WsEvent.ClarifyRequest -> reduceClarifyRequest(state, event)
+            is WsEvent.ClarifyExpire -> reduceResumedOutput(state, event.sessionId)
+            is WsEvent.MessageToken -> reduceResumedOutput(state, event.sessionId)
+            is WsEvent.ThinkingDelta -> reduceResumedOutput(state, event.sessionId)
+            is WsEvent.ReasoningDelta -> reduceResumedOutput(state, event.sessionId)
+            is WsEvent.ToolStart -> reduceResumedOutput(state, event.sessionId)
+            is WsEvent.ToolProgress -> reduceResumedOutput(state, event.sessionId)
             else -> state
         }
 
@@ -158,6 +165,18 @@ object SessionLiveStatusReducer {
         val storedId = state.storedIdByRuntimeId[runtimeId] ?: return state
         return state.copy(
             liveStatuses = state.liveStatuses + (storedId to SessionLiveStatus.WAITING),
+        )
+    }
+
+    private fun reduceResumedOutput(
+        state: SessionLiveTrackingState,
+        runtimeSessionId: String?,
+    ): SessionLiveTrackingState {
+        val runtimeId = runtimeSessionId?.trim()?.takeIf { it.isNotEmpty() } ?: return state
+        val storedId = state.storedIdByRuntimeId[runtimeId] ?: return state
+        if (state.liveStatuses[storedId] != SessionLiveStatus.WAITING) return state
+        return state.copy(
+            liveStatuses = state.liveStatuses + (storedId to SessionLiveStatus.WORKING),
         )
     }
 }

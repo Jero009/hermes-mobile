@@ -191,6 +191,7 @@ class SessionsLiveStatusViewModelTest {
         source.status.value = ConnectionStatus.CONNECTED
         dispatcher.scheduler.runCurrent()
         assertEquals(SessionLiveStatus.WAITING, viewModel.uiState.value.liveStatuses["stored-a"])
+        assertEquals(true, viewModel.uiState.value.liveStatusesAuthoritative)
 
         viewModel.refreshLiveStatuses()
         dispatcher.scheduler.runCurrent()
@@ -199,6 +200,25 @@ class SessionsLiveStatusViewModelTest {
         source.status.value = ConnectionStatus.DISCONNECTED
         dispatcher.scheduler.runCurrent()
         assertEquals(emptyMap<String, SessionLiveStatus>(), viewModel.uiState.value.liveStatuses)
+        assertEquals(false, viewModel.uiState.value.liveStatusesAuthoritative)
+    }
+
+    @Test
+    fun `stopping live tracking cancels an in-flight snapshot`() {
+        val source = FakeLiveStatusSource()
+        source.snapshots.add(CompletableDeferred())
+        source.connections["profile-a"] = SessionLiveConnection("profile-a", 4)
+        val viewModel = testViewModel(source)
+
+        viewModel.startLiveStatusTracking()
+        source.profiles.value = "profile-a"
+        source.status.value = ConnectionStatus.CONNECTED
+        dispatcher.scheduler.runCurrent()
+
+        viewModel.stopLiveStatusTracking()
+        dispatcher.scheduler.runCurrent()
+
+        assertEquals(1, source.cancelledRequests)
     }
 
     private fun snapshot(
@@ -233,6 +253,7 @@ class SessionsLiveStatusViewModelTest {
         val connections = mutableMapOf<String, SessionLiveConnection>()
         val snapshots = ArrayDeque<CompletableDeferred<LiveSessionSnapshot?>>()
         val requestedConnections = mutableListOf<SessionLiveConnection>()
+        var cancelledRequests = 0
 
         override val sourcedEvents: Flow<SourcedSessionLiveEvent> = events
         override val connectionStatus: StateFlow<ConnectionStatus> = status
@@ -242,7 +263,12 @@ class SessionsLiveStatusViewModelTest {
 
         override suspend fun fetchActiveSessionsSnapshot(connection: SessionLiveConnection): LiveSessionSnapshot? {
             requestedConnections += connection
-            return snapshots.removeFirstOrNull()?.await()
+            return try {
+                snapshots.removeFirstOrNull()?.await()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                cancelledRequests++
+                throw e
+            }
         }
     }
 }

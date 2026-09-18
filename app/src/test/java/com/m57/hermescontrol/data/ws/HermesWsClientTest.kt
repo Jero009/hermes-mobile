@@ -988,6 +988,29 @@ class HermesWsClientTest {
         }
 
     @Test
+    fun testCancelledAwaitedProfileRequestRemovesPendingCall() =
+        runBlocking {
+            val socket = mockk<WebSocket>(relaxed = true)
+            every { socket.send(any<String>()) } returns true
+            every { AuthManager.getSelectedProfileId() } returns "profile-a"
+            installActiveListener(socket)
+            val binding = requireNotNull(HermesWsClient.connectionBinding("profile-a"))
+
+            val request =
+                launch(start = CoroutineStart.UNDISPATCHED) {
+                    HermesWsClient.requestForProfileConnectionAwaited(
+                        binding,
+                        WsMethods.SESSION_ACTIVE_LIST,
+                    )
+                }
+            assertEquals(1, pendingCalls().size)
+
+            request.cancelAndJoin()
+
+            assertTrue(pendingCalls().isEmpty())
+        }
+
+    @Test
     fun testProfileBoundRequestRefusesReplacementSocketBeforeWrite() =
         runBlocking {
             supervisorScope {

@@ -169,4 +169,22 @@ class SessionLiveStatusSourceTest {
             val snapshot = source.fetchActiveSessionsSnapshot(SessionLiveConnection("profile-a", 1))
             assertNull(snapshot)
         }
+
+    @Test
+    fun `HermesSessionLiveStatusSource rejects snapshot when connection becomes stale during RPC`() =
+        runBlocking {
+            var fenceChecks = 0
+            val source =
+                HermesSessionLiveStatusSource(
+                    boundRpcRequest = { _, _, _ -> mapOf("sessions" to emptyList<Map<String, Any>>()) },
+                    sourcedEventsProvider = { MutableSharedFlow() },
+                    connectionStatusProvider = { MutableStateFlow(ConnectionStatus.CONNECTED) },
+                    isConnectionCurrent = { fenceChecks++ == 0 },
+                )
+
+            val snapshot = source.fetchActiveSessionsSnapshot(SessionLiveConnection("profile-a", 1))
+
+            assertNull(snapshot)
+            assertEquals(2, fenceChecks)
+        }
 }

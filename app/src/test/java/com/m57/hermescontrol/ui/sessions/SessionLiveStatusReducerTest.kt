@@ -220,6 +220,43 @@ class SessionLiveStatusReducerTest {
     }
 
     @Test
+    fun `clarification expiry and resumed output move WAITING back to WORKING`() {
+        val waiting =
+            SessionLiveTrackingState(
+                liveStatuses = mapOf("stored-1" to SessionLiveStatus.WAITING),
+                storedIdByRuntimeId = mapOf("rt-1" to "stored-1"),
+            )
+
+        val expired =
+            SessionLiveStatusReducer.applyWsEvent(
+                waiting,
+                WsEvent.ClarifyExpire(clarifyId = "clarify-1", sessionId = "rt-1"),
+            )
+        assertEquals(SessionLiveStatus.WORKING, expired.liveStatuses["stored-1"])
+
+        val resumed =
+            SessionLiveStatusReducer.applyWsEvent(
+                waiting,
+                WsEvent.MessageToken(token = "continued", sessionId = "rt-1"),
+            )
+        assertEquals(SessionLiveStatus.WORKING, resumed.liveStatuses["stored-1"])
+
+        val toolStarted =
+            SessionLiveStatusReducer.applyWsEvent(
+                waiting,
+                WsEvent.ToolStart(name = "search", data = null, sessionId = "rt-1"),
+            )
+        assertEquals(SessionLiveStatus.WORKING, toolStarted.liveStatuses["stored-1"])
+    }
+
+    @Test
+    fun `REST active status is fallback only before an authoritative snapshot`() {
+        assertTrue(isSessionActive(null, false, "active"))
+        assertTrue(isSessionActive(SessionLiveStatus.WORKING, true, null))
+        assertTrue(!isSessionActive(null, true, "active"))
+    }
+
+    @Test
     fun `unknown or missing IDs never mutate another session`() {
         val initial =
             SessionLiveTrackingState(

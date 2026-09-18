@@ -794,6 +794,7 @@ fun SessionsScreen(
                                 SessionCard(
                                     session = session,
                                     liveStatus = state.liveStatuses[session.id],
+                                    liveStatusesAuthoritative = state.liveStatusesAuthoritative,
                                     displayTitle = item.displayTitle,
                                     isFork = item.isFork,
                                     forkDepth = item.forkDepth,
@@ -1159,11 +1160,23 @@ private fun SessionPinButton(
     }
 }
 
+internal fun isSessionActive(
+    liveStatus: SessionLiveStatus?,
+    liveStatusesAuthoritative: Boolean,
+    persistedStatus: String?,
+): Boolean {
+    if (liveStatus != null) return true
+    if (liveStatusesAuthoritative) return false
+    return persistedStatus.equals("active", ignoreCase = true) ||
+        persistedStatus.equals("streaming", ignoreCase = true)
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SessionCard(
     session: com.m57.hermescontrol.data.model.SessionInfo,
     liveStatus: SessionLiveStatus?,
+    liveStatusesAuthoritative: Boolean,
     displayTitle: String,
     isFork: Boolean,
     forkDepth: Int,
@@ -1182,10 +1195,7 @@ private fun SessionCard(
 ) {
     val spacing = LocalSpacing.current
     val statusColors = LocalHermesStatusColors.current
-    val isActive =
-        liveStatus != null ||
-            session.status?.lowercase() == "active" ||
-            session.status?.lowercase() == "streaming"
+    val isActive = isSessionActive(liveStatus, liveStatusesAuthoritative, session.status)
     val srcIcon = sourceIcon(session.source)
 
     Card(
@@ -1203,7 +1213,10 @@ private fun SessionCard(
             ),
         border =
             if (isActive && !isSelecting) {
-                BorderStroke(2.dp, statusColors.success)
+                BorderStroke(
+                    2.dp,
+                    if (liveStatus == SessionLiveStatus.WAITING) statusColors.info else statusColors.success,
+                )
             } else if (isSelected) {
                 BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
             } else {
@@ -1393,7 +1406,10 @@ private fun SearchResultCard(
             if (isSelected) {
                 BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
             } else if (liveStatus != null) {
-                BorderStroke(2.dp, statusColors.success)
+                BorderStroke(
+                    2.dp,
+                    if (liveStatus == SessionLiveStatus.WAITING) statusColors.info else statusColors.success,
+                )
             } else {
                 null
             },
