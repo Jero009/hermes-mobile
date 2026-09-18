@@ -528,6 +528,8 @@
     <string name="sessions_search_played_at">Played %1$s</string>
     <string name="sessions_search_match_label">Match</string>
     <string name="sessions_search_model_label">Model</string>
+    <string name="sessions_live_status_working">Working</string>
+    <string name="sessions_live_status_waiting">Waiting</string>
     <string name="sessions_stat_total">Total</string>
     <string name="sessions_stat_messages">Messages</string>
     <string name="sessions_action_prune">Prune</string>

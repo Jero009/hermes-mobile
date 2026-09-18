@@ -961,6 +961,85 @@ class HermesWsClientTest {
         }
 
     @Test
+    fun testProfileBoundRequestDoesNotRequireActiveChatSession() =
+        runBlocking {
+            val socket = mockk<WebSocket>(relaxed = true)
+            var sentPayload = ""
+            every { socket.send(any<String>()) } answers {
+                sentPayload = firstArg()
+                true
+            }
+            every { AuthManager.getSelectedProfileId() } returns "profile-a"
+            ActiveSessionHolder.clear()
+            val listener = installActiveListener(socket)
+            val binding = requireNotNull(HermesWsClient.connectionBinding("profile-a"))
+
+            val deferred =
+                HermesWsClient.requestForProfileConnection(
+                    binding,
+                    WsMethods.SESSION_ACTIVE_LIST,
+                )
+            val id = Regex("\\\"id\\\":\\\"([^\\\"]+)\\\"").find(sentPayload)!!.groupValues[1]
+            listener.onMessage(socket, """{"jsonrpc":"2.0","id":"$id","result":{"sessions":[]}}""")
+
+            assertEquals(mapOf("sessions" to emptyList<Any>()), deferred.await())
+            verify(exactly = 1) { socket.send(any<String>()) }
+            assertTrue(pendingCalls().isEmpty())
+        }
+
+    @Test
+    fun testCancelledAwaitedProfileRequestRemovesPendingCall() =
+        runBlocking {
+            val socket = mockk<WebSocket>(relaxed = true)
+            every { socket.send(any<String>()) } returns true
+            every { AuthManager.getSelectedProfileId() } returns "profile-a"
+            installActiveListener(socket)
+            val binding = requireNotNull(HermesWsClient.connectionBinding("profile-a"))
+
+            val request =
+                launch(start = CoroutineStart.UNDISPATCHED) {
+                    HermesWsClient.requestForProfileConnectionAwaited(
+                        binding,
+                        WsMethods.SESSION_ACTIVE_LIST,
+                    )
+                }
+            assertEquals(1, pendingCalls().size)
+
+            request.cancelAndJoin()
+
+            assertTrue(pendingCalls().isEmpty())
+        }
+
+    @Test
+    fun testProfileBoundRequestRefusesReplacementSocketBeforeWrite() =
+        runBlocking {
+            supervisorScope {
+                val originalSocket = mockk<WebSocket>(relaxed = true)
+                every { originalSocket.send(any<String>()) } returns true
+                installActiveListener(originalSocket)
+                val binding = requireNotNull(HermesWsClient.connectionBinding("profile-a"))
+                val request =
+                    async(start = CoroutineStart.LAZY) {
+                        HermesWsClient
+                            .requestForProfileConnection(binding, WsMethods.SESSION_ACTIVE_LIST)
+                            .await()
+                    }
+
+                incrementConnectionGeneration()
+                val replacementSocket = mockk<WebSocket>(relaxed = true)
+                every { replacementSocket.send(any<String>()) } returns true
+                installActiveListener(replacementSocket)
+
+                val failure = runCatching { request.await() }.exceptionOrNull()
+
+                assertTrue(failure is HermesWsClient.HermesRpcException)
+                verify(exactly = 0) { originalSocket.send(any<String>()) }
+                verify(exactly = 0) { replacementSocket.send(any<String>()) }
+                assertTrue(pendingCalls().isEmpty())
+            }
+        }
+
+    @Test
     fun testConnectionBoundRequestRejectsInBackgroundWithoutSocketWrite() {
         val socket = mockk<WebSocket>(relaxed = true)
         every { socket.send(any<String>()) } returns true

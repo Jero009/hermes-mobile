@@ -805,6 +805,70 @@ object HermesWsClient {
             deferred
         }
 
+    /**
+     * Atomically send an awaited profile-scoped request on an exact live socket.
+     *
+     * Unlike [requestForConnection], this path does not require an active chat
+     * session. It is for profile-level reads such as `session.active_list` and
+     * still fails closed across profile, generation, or socket changes.
+     */
+    fun requestForProfileConnection(
+        binding: ConnectionBinding,
+        method: String,
+        params: Map<String, Any> = emptyMap(),
+        timeoutMs: Long = REQUEST_TIMEOUT_MS,
+    ): CompletableDeferred<Any?> =
+        synchronized(connectionLock) {
+            val deferred = CompletableDeferred<Any?>()
+            if (!appInForeground.get() ||
+                !connected.get() ||
+                webSocket !== binding.socket ||
+                activeConnectionProfileId != binding.profileId ||
+                activeConnectionGeneration != binding.generation ||
+                AuthManager.getSelectedProfileId() != binding.profileId
+            ) {
+                deferred.completeExceptionally(
+                    HermesRpcException("WebSocket binding changed — request cancelled"),
+                )
+                return@synchronized deferred
+            }
+
+            val id = requestId.incrementAndGet().toString()
+            val request =
+                JsonRpcRequest(
+                    id = id,
+                    method = method,
+                    params = params.mapValues { it.value.toJsonElement() },
+                )
+            val pending = PendingCall(method, deferred)
+            pendingCalls[id] = pending
+            if (!binding.socket.send(OkHttpProvider.json.encodeToString(request))) {
+                pendingCalls.remove(id)
+                deferred.completeExceptionally(HermesRpcException("Bound request was not sent"))
+            } else {
+                pending.timeoutJob =
+                    wsScope.launch {
+                        delay(timeoutMs)
+                        resolvePending(id, null, JsonRpcError(-1, "Request timed out: $method"))
+                    }
+            }
+            deferred
+        }
+
+    suspend fun requestForProfileConnectionAwaited(
+        binding: ConnectionBinding,
+        method: String,
+        params: Map<String, Any> = emptyMap(),
+        timeoutMs: Long = REQUEST_TIMEOUT_MS,
+    ): Any? {
+        val pendingRequest = requestForProfileConnection(binding, method, params, timeoutMs)
+        return try {
+            pendingRequest.await()
+        } finally {
+            cancelPendingRequest(pendingRequest)
+        }
+    }
+
     /** Complete (or fail) a single pending call and cancel its timer. */
     private fun resolvePending(
         id: String,
