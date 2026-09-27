@@ -53,10 +53,10 @@ this fork has not taken.
 - The macOS `aapt2` artifact is now pinned (checked against Google Maven) so
   the verified build also runs on Apple silicon hosts.
 
-Not applicable: `304a9018`, `a567c911`, `7290b300`, `e539d650`, and
-`1ab30f1e` patch upstream's `ui/chat/tool/` engine, which does not exist
-here; the downstream skill renderer already orders its success branch
-correctly. The `sqlcipher` 4.19.0 and Coil 3.x bumps, the scoped-route
+The wholesale patches from `304a9018` and `1ab30f1e` target upstream's
+`ui/chat/tool/` engine, which does not exist here. The process-output and
+skill-result subset previously called not applicable is adapted below.
+The `sqlcipher` 4.19.0 and Coil 3.x bumps, the scoped-route
 expansion in `303019b9`, and all feature work remain for owner review.
 
 ## Reliability and scope correction (2026-09-27)
@@ -81,6 +81,23 @@ with it restored. Real Retrofit/MockWebServer tests also reproduce the wrong
 scope on management reads and reverse-proxied writes, then pass after removal;
 explicit profile queries remain unchanged. These focused results are not a
 substitute for the full release validation matrix.
+
+## Process-card output adaptation (2026-09-27)
+
+- `7290b300ab9de05102f85c89b56e6104e25cfc15`: `output_preview` fallback
+  for process polls; retain nonempty `output` precedence in the downstream
+  `ChatBubble` parser, including the `process_manage` tool alias.
+- `e539d650cf35d88d4da694bf9afa0a2986292975`: show a separate warning
+  for positive, exact integral `output_cut` values representable as `Long`.
+  Missing, zero, negative, fractional, string, and overflow values show no
+  omission notice. No upstream ToolView engine was imported.
+- `a567c91132dfcfd3f7a9b00ff00b1bef921713ce`: narrow skill-result
+  correction: only a literal JSON boolean true produces a success indicator;
+  absent or invalid success fails closed. Downstream branch ordering already
+  handled explicit false, so no wholesale renderer port.
+
+These commits are beyond the contiguous `UPSTREAM.json` reviewed range;
+`reviewed_through` and its entries are intentionally unchanged.
 
 ## Validation and release boundary
 
