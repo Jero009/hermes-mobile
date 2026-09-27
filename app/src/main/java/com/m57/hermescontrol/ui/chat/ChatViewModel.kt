@@ -39,6 +39,7 @@ import com.m57.hermescontrol.data.ws.PrivilegedRequestBinding
 import com.m57.hermescontrol.data.ws.ServerRequestBinding
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
+import com.m57.hermescontrol.data.ws.toAny
 import com.m57.hermescontrol.data.ws.toJsonElement
 import com.m57.hermescontrol.ui.common.SecureGatewayMediaRequest
 import com.m57.hermescontrol.ui.common.SecureMediaOpenRoute
@@ -58,6 +59,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.put
@@ -1288,7 +1290,7 @@ class ChatViewModel(
                         // (a fire-and-forget send raced prompt.submit and the
                         // image was dropped). Requires session_id or the gateway
                         // 4001s "session not found" (desktop passes it too).
-                        val result =
+                        val response =
                             sendRpcAndAwait(
                                 method = WsMethods.IMAGE_ATTACH_BYTES,
                                 params =
@@ -1299,9 +1301,9 @@ class ChatViewModel(
                                         "ext" to attachment.fileExtension,
                                     ),
                             )
-                        if (result != null) {
-                            @Suppress("UNCHECKED_CAST")
-                            val ok = (result as? Map<String, Any?>)?.get("attached") as? Boolean
+                        if (response != null) {
+                            val result = if (response is JsonElement) response.toAny() else response
+                            val ok = (result as? Map<*, *>)?.get("attached") as? Boolean
                             if (ok != true) {
                                 Log.w(TAG, "Image attachment request failed")
                             }
@@ -1318,10 +1320,9 @@ class ChatViewModel(
                                     "data_url" to "data:${attachment.mimeType};base64,$b64",
                                     "name" to attachment.name,
                                 ),
-                        )?.let { result ->
-                            @Suppress("UNCHECKED_CAST")
-                            val refText =
-                                (result as? Map<String, Any?>)?.get("ref_text") as? String
+                        )?.let { response ->
+                            val result = if (response is JsonElement) response.toAny() else response
+                            val refText = (result as? Map<*, *>)?.get("ref_text") as? String
                             if (!refText.isNullOrBlank()) fileRefs.add(refText)
                         }
                     }
