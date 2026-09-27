@@ -196,6 +196,86 @@ class ChatWsEventReducerTest {
     }
 
     @Test
+    fun progressAndGeneratingTargetExactConcurrentToolId() {
+        val first =
+            ChatMessage(
+                role = MessageRole.TOOL,
+                content = "",
+                toolName = "terminal",
+                toolCallId = "a",
+                toolStatus = ToolStatus.RUNNING,
+                progressPreview = "first",
+            )
+        val second = first.copy(toolCallId = "b", progressPreview = "second")
+        val state = ChatUiState(messages = listOf(first, second), currentSessionId = "session-1")
+        val progress =
+            ChatWsEventReducer.reduce(
+                state,
+                StreamingState(),
+                WsEvent.ToolProgress("terminal", "updated", "session-1", "a"),
+                "session-1",
+            )
+        assertEquals(listOf("updated", "second"), progress.state.messages.map { it.progressPreview })
+        val generating =
+            ChatWsEventReducer.reduce(
+                progress.state,
+                StreamingState(),
+                WsEvent.ToolGenerating("terminal", "session-1", "a"),
+                "session-1",
+            )
+        assertEquals(listOf("", "second"), generating.state.messages.map { it.progressPreview })
+
+        val unknown =
+            ChatWsEventReducer.reduce(
+                state,
+                StreamingState(),
+                WsEvent.ToolProgress("terminal", "wrong", "session-1", "unknown"),
+                "session-1",
+            )
+        assertEquals(state.messages, unknown.state.messages)
+        val conflicting =
+            ChatWsEventReducer.reduce(
+                state,
+                StreamingState(),
+                WsEvent.ToolGenerating("other", "session-1", "a"),
+                "session-1",
+            )
+        assertEquals(state.messages, conflicting.state.messages)
+        val ambiguous =
+            ChatWsEventReducer.reduce(
+                state,
+                StreamingState(),
+                WsEvent.ToolProgress("terminal", "wrong", "session-1"),
+                "session-1",
+            )
+        assertEquals(state.messages, ambiguous.state.messages)
+        val stale =
+            ChatWsEventReducer.reduce(
+                state,
+                StreamingState(),
+                WsEvent.ToolProgress("terminal", "wrong", "old-session", "a"),
+                "session-1",
+            )
+        assertEquals(state.messages, stale.state.messages)
+    }
+
+    @Test
+    fun missingIdMatchesOnlyOneRunningTool() {
+        val running =
+            ChatMessage(role = MessageRole.TOOL, content = "", toolName = "terminal", toolStatus = ToolStatus.RUNNING)
+        val completed = running.copy(toolStatus = ToolStatus.COMPLETED)
+        val state = ChatUiState(messages = listOf(completed, running), currentSessionId = "session-1")
+        val result =
+            ChatWsEventReducer.reduce(
+                state,
+                StreamingState(),
+                WsEvent.ToolProgress("terminal", "legacy", "session-1"),
+                "session-1",
+            )
+        assertEquals(listOf(null, "legacy"), result.state.messages.map { it.progressPreview })
+    }
+
+    @Test
     fun testSubagentEvent_appendsToSubagentIndicators() {
         val state =
             ChatUiState(

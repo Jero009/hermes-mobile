@@ -97,6 +97,7 @@ sealed class WsEvent {
         val name: String? = null,
         val preview: String? = null,
         val sessionId: String? = null,
+        val toolId: String? = null,
     ) : WsEvent()
 
     /**
@@ -108,6 +109,7 @@ sealed class WsEvent {
     data class ToolGenerating(
         val name: String? = null,
         val sessionId: String? = null,
+        val toolId: String? = null,
     ) : WsEvent()
 
     /**

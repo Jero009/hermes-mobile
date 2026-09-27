@@ -688,12 +688,7 @@ object ChatWsEventReducer {
         event: WsEvent.ToolProgress,
     ): ReducerResult {
         val messages = state.messages.toMutableList()
-        val toolIdx =
-            messages.indexOfLast {
-                it.role == MessageRole.TOOL &&
-                    it.toolName == event.name &&
-                    it.toolStatus == ToolStatus.RUNNING
-            }
+        val toolIdx = findRunningToolIndex(messages, event.name, event.toolId)
         if (toolIdx < 0) return ReducerResult(state = state, streamingState = streamingState)
 
         messages[toolIdx] = messages[toolIdx].copy(progressPreview = event.preview ?: "")
@@ -709,12 +704,7 @@ object ChatWsEventReducer {
         event: WsEvent.ToolGenerating,
     ): ReducerResult {
         val messages = state.messages.toMutableList()
-        val toolIdx =
-            messages.indexOfLast {
-                it.role == MessageRole.TOOL &&
-                    it.toolName == event.name &&
-                    it.toolStatus == ToolStatus.RUNNING
-            }
+        val toolIdx = findRunningToolIndex(messages, event.name, event.toolId)
         if (toolIdx < 0) return ReducerResult(state = state, streamingState = streamingState)
 
         messages[toolIdx] = messages[toolIdx].copy(progressPreview = "")
@@ -722,6 +712,27 @@ object ChatWsEventReducer {
             state = state.copy(messages = messages),
             streamingState = streamingState,
         )
+    }
+
+    /** An explicit ID never falls back to a name; legacy name-only events need a unique running match. */
+    private fun findRunningToolIndex(
+        messages: List<ChatMessage>,
+        name: String?,
+        toolId: String?,
+    ): Int {
+        if (toolId != null) {
+            return messages.indexOfLast {
+                it.role == MessageRole.TOOL && it.toolStatus == ToolStatus.RUNNING &&
+                    it.toolCallId == toolId && (name == null || it.toolName == name)
+            }
+        }
+        if (name == null) return -1
+        val matches =
+            messages.indices.filter {
+                messages[it].role == MessageRole.TOOL && messages[it].toolStatus == ToolStatus.RUNNING &&
+                    messages[it].toolName == name
+            }
+        return matches.singleOrNull() ?: -1
     }
 
     private fun onSubagentEvent(
