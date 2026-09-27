@@ -1138,7 +1138,7 @@ fun parseToolOutput(
             val errorMsg = dataSource.get("error")?.takeIf { !it.isJsonNull }?.asString
             val success =
                 dataSource.get("success")?.takeIf {
-                    it.isJsonPrimitive && it.asJsonPrimitive.isBoolean
+                    it is JsonPrimitive && !it.isString && it.content in setOf("true", "false")
                 }?.asBoolean == true
             val msg = dataSource.get("message")?.takeIf { !it.isJsonNull }?.asString
 
@@ -1384,7 +1384,9 @@ fun parseToolOutput(
                 if (isRunning) {
                     null
                 } else {
-                    dataSource.get("output_cut")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }
+                    dataSource.get("output_cut")?.takeIf {
+                        it is JsonPrimitive && !it.isString && it.content.toLongOrNull() != null
+                    }
                         ?.asString?.toLongOrNull()?.takeIf { it > 0 }
                 }
             val processesArr = dataSource.get("processes")?.takeIf { !it.isJsonNull && it.isJsonArray }?.asJsonArray
