@@ -6,6 +6,9 @@ import com.m57.hermescontrol.data.config.ServerStoreState
 import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.local.AuthSessionState
 import com.m57.hermescontrol.data.model.ConfigUpdateRequest
+import com.m57.hermescontrol.data.remote.NetworkError.AuthExpired
+import com.m57.hermescontrol.data.remote.NetworkResult.Failure
+import okhttp3.Request
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import io.mockk.every
@@ -34,7 +37,12 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
-/** Disposable protocol peer, not a production dashboard. Only credential providers/storage are synthetic. */
+/**
+ * Disposable protocol peer, not a production dashboard. The peer's status/config bodies,
+ * allowlisted profile, login cookie, and single-use tickets are synthetic; only the real
+ * Retrofit/OkHttp transport, cookie jar, auth recovery, and WebSocket client are exercised.
+ * No production credentials, storage, or server are involved.
+ */
 class AuthenticatedDisposableFixtureTest {
     private lateinit var server: MockWebServer
     private lateinit var endpoint: ServerEndpoint
@@ -79,8 +87,17 @@ class AuthenticatedDisposableFixtureTest {
                             })
                         }
                     }
-                    "/dashboard/api/config" -> MockResponse().setResponseCode(403)
-                        .setBody("{\"error\":\"explicit profile required\"}")
+                    "/dashboard/api/status" -> MockResponse().setBody("{\"version\":\"fixture\",\"auth_required\":true}")
+                    "/dashboard/api/config" -> {
+                        // No implicit default: only the allowlisted, caller-supplied profile can read or write.
+                        if (request.requestUrl!!.queryParameter("profile") != "default" ||
+                            request.requestUrl!!.queryParameterNames != setOf("profile")
+                        ) MockResponse().setResponseCode(403)
+                            .setBody("{\"error\":\"explicit recognized profile required\"}")
+                        else if (request.method == "GET") MockResponse().setBody("{\"fixture\":true}")
+                        else if (request.method == "PUT") MockResponse().setBody("{}")
+                        else MockResponse().setResponseCode(405)
+                    }
                     else -> MockResponse().setResponseCode(404)
                 }
             }
@@ -126,18 +143,38 @@ class AuthenticatedDisposableFixtureTest {
 
     @Test
     fun loginCookieAndFreshTicketOnEachConnection() = runBlocking {
-        assertEquals(401, ApiClient.hermesApi.getConfig().code())
+        // Retrofit's real gated transport maps a 401 into the app-wide sign-in recovery latch.
+        assertEquals(Failure(AuthExpired()), safeApiCall(retries = 0) { ApiClient.hermesApi.getStatus() })
+        assertTrue(AuthSessionState.signInRequired.value)
         assertEquals(200, OkHttpProvider.probe.newCall(
             okhttp3.Request.Builder().url(endpoint.resolve("api/auth/login"))
                 .post("{}".toRequestBody()).build(),
         ).execute().use { it.code })
+        AuthSessionState.markAuthenticated() // successful login clears the recovery latch
+        assertEquals(false, AuthSessionState.signInRequired.value)
+        assertEquals("fixture", ApiClient.hermesApi.getStatus().body()?.version)
         assertEquals(403, ApiClient.hermesApi.getConfig().code())
         assertEquals(403, ApiClient.hermesApi.updateConfig(ConfigUpdateRequest(config = emptyMap())).code())
+        // Config has no explicit scope argument on this service revision. Use the production
+        // OkHttp gated client with a caller-built URL; do not rely on unfinished global interception.
+        fun scoped(method: String, profile: String): Int {
+            val url = endpoint.resolve("api/config").newBuilder()
+                .addQueryParameter("profile", profile).build()
+            val builder = Request.Builder().url(url)
+            if (method == "PUT") builder.put("{\"config\":{}}".toRequestBody())
+            return OkHttpProvider.probe.newCall(builder.build()).execute().use { it.code }
+        }
+        assertEquals(200, scoped("GET", "default"))
+        assertEquals(200, scoped("PUT", "default"))
+        assertEquals(403, scoped("GET", "unknown"))
+        assertEquals(403, scoped("PUT", "unknown"))
+        assertEquals(false, AuthSessionState.signInRequired.value)
         val mutations = requests.filter { it.method == "PUT" }
-        assertEquals(1, mutations.size)
-        assertNull(mutations.single().requestUrl!!.queryParameter("profile"))
-        assertEquals("session=fixture", mutations.single().getHeader("Cookie"))
-        assertNull(mutations.single().getHeader("Authorization"))
+        assertEquals(3, mutations.size)
+        assertEquals(1, mutations.count { it.requestUrl!!.queryParameter("profile") == "default" })
+        assertEquals(1, mutations.count { it.requestUrl!!.queryParameter("profile") == "unknown" })
+        assertEquals(1, mutations.count { it.requestUrl!!.queryParameter("profile") == null })
+        assertTrue(mutations.all { it.getHeader("Cookie") == "session=fixture" && it.getHeader("Authorization") == null })
         assertEquals(0, requests.count { it.requestUrl!!.encodedPath.contains("refresh") })
         assertEquals("session=fixture", requests.last { it.requestUrl!!.encodedPath == "/dashboard/api/config" }.getHeader("Cookie"))
         HermesWsClient.connect()
