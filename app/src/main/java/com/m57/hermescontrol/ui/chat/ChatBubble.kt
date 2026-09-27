@@ -676,6 +676,8 @@ data class ParsedToolData(
     val summaryText: String? = null,
     val durationSec: Double? = null,
     val mainOutput: String? = null,
+    /** Positive backend-reported count of omitted process-output characters. */
+    val outputCut: Long? = null,
     val extraFields: Map<String, String> = emptyMap(),
     val isRunning: Boolean = false,
     val diffOutput: String? = null,
@@ -1134,7 +1136,10 @@ fun parseToolOutput(
             val name = argsObj?.get("name")?.takeIf { !it.isJsonNull }?.asString
             val category = argsObj?.get("category")?.takeIf { !it.isJsonNull }?.asString
             val errorMsg = dataSource.get("error")?.takeIf { !it.isJsonNull }?.asString
-            val success = dataSource.get("success")?.takeIf { !it.isJsonNull }?.asBoolean ?: true
+            val success =
+                dataSource.get("success")?.takeIf {
+                    it is JsonPrimitive && !it.isString && it.content in setOf("true", "false")
+                }?.asBoolean == true
             val msg = dataSource.get("message")?.takeIf { !it.isJsonNull }?.asString
 
             val summaryText =
@@ -1153,7 +1158,7 @@ fun parseToolOutput(
             val mainOutput =
                 when {
                     errorMsg != null -> "❌ $errorMsg"
-                    !success -> "❌ Skill operation failed"
+                    !success -> "❌ ${msg ?: "Skill operation failed"}"
                     msg != null -> "✅ $msg"
                     name != null -> "✅ Skill '$name' $action succeeded${category?.let { " [$it]" } ?: ""}"
                     else -> "✅ Skill $action done"
@@ -1363,12 +1368,27 @@ fun parseToolOutput(
         }
 
         // ── Process-specific formatting ──
-        if (resolvedToolName == "process") {
+        if (resolvedToolName == "process" || resolvedToolName == "process_manage") {
             val action = argsObj?.get("action")?.takeIf { !it.isJsonNull }?.asString ?: ""
             val procId = argsObj?.get("session_id")?.takeIf { !it.isJsonNull }?.asString
             val errorMsg = dataSource.get("error")?.takeIf { !it.isJsonNull }?.asString
             val status = dataSource.get("status")?.takeIf { !it.isJsonNull }?.asString
-            val outputText = dataSource.get("output")?.takeIf { !it.isJsonNull }?.asString
+            val outputText =
+                (
+                    dataSource.get(
+                        "output",
+                    )?.takeIf { it.isJsonPrimitive && !it.isJsonNull && it.asString.isNotEmpty() }
+                        ?: dataSource.get("output_preview")?.takeIf { it.isJsonPrimitive && !it.isJsonNull }
+                )?.asString
+            val outputCut =
+                if (isRunning) {
+                    null
+                } else {
+                    dataSource.get("output_cut")?.takeIf {
+                        it is JsonPrimitive && !it.isString && it.content.toLongOrNull() != null
+                    }
+                        ?.asString?.toLongOrNull()?.takeIf { it > 0 }
+                }
             val processesArr = dataSource.get("processes")?.takeIf { !it.isJsonNull && it.isJsonArray }?.asJsonArray
 
             val summaryText = "⚙️ $action${procId?.let { ": $it" } ?: ""}"
@@ -1418,6 +1438,7 @@ fun parseToolOutput(
                 result = dataSource.entrySet().associate { it.key to it.value.toString() },
                 summaryText = summaryText,
                 mainOutput = mainOutput,
+                outputCut = outputCut,
                 durationSec = duration,
                 isRunning = isRunning,
             )
@@ -2123,6 +2144,14 @@ private fun ExpandedToolContent(
                                 fontSize = 12.sp,
                             ),
                     )
+                }
+                if (parsed.toolName == "process" || parsed.toolName == "process_manage") {
+                    parsed.outputCut?.let { omitted ->
+                        Text(
+                            text = stringResource(R.string.chat_tool_output_omitted, omitted),
+                            style = MaterialTheme.typography.labelSmall.copy(color = statusColors.warning),
+                        )
+                    }
                 }
                 parsed.extraFields.forEach { (key, value) ->
                     Row(
