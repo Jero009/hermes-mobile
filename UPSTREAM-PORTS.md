@@ -59,6 +59,29 @@ here; the downstream skill renderer already orders its success branch
 correctly. The `sqlcipher` 4.19.0 and Coil 3.x bumps, the scoped-route
 expansion in `303019b9`, and all feature work remain for owner review.
 
+## Reliability and scope correction (2026-09-27)
+
+- `83b2a8fa9b5900905038b1dbc48c96dccfaabba1`: adapt only attachment-result
+  normalization in `ChatViewModel`. Raw JSON and Kotlin map results both retain
+  file references and image acknowledgements. The current downstream parser
+  normally emits maps; this is defensive wire-result compatibility, not proof
+  of a currently reproducible file-loss incident. History hydration changes
+  from that upstream commit are not included.
+- `303019b9a5d5daeabb9362aa32638e0a17f9357b`: do not port the route expansion.
+  Downstream's old interceptor used the local connection ID as a backend
+  profile name. Remove that incorrect inference and preserve explicit caller
+  scopes. Full management-profile selection remains unimplemented; it needs a
+  separate validated identity bound to the connection and backend contract.
+- `98c417ae8420f5d4ff6243896b426e3a8c8f6529`: the bulk-completion guard is not
+  applicable to this fork's current single-task Kanban workflow. No bulk API,
+  selection, or evidence dialog was introduced by this batch.
+
+The two attachment regressions fail with the normalization removed and pass
+with it restored. Real Retrofit/MockWebServer tests also reproduce the wrong
+scope on management reads and reverse-proxied writes, then pass after removal;
+explicit profile queries remain unchanged. These focused results are not a
+substitute for the full release validation matrix.
+
 ## Validation and release boundary
 
 Independent specification and code-quality reviews were completed, including

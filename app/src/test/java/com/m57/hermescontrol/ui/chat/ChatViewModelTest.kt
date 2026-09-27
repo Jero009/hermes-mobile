@@ -5162,7 +5162,10 @@ class ChatViewModelTest {
             assertTrue(results.isEmpty())
             verify(exactly = 1) {
                 HermesWsClient.sendMessageForConnection(
-                    any(), sessionId, "@file:json-ref\n@file:map-ref\n\nhello", any(),
+                    any(),
+                    sessionId,
+                    "@file:json-ref\n@file:map-ref\n\nhello",
+                    any(),
                 )
             }
         }
