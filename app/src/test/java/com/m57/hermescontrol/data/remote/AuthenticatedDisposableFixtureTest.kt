@@ -29,6 +29,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -39,6 +40,8 @@ class AuthenticatedDisposableFixtureTest {
     private lateinit var endpoint: ServerEndpoint
     private val jar = buildFakePersistentCookieJar()
     private val tickets = AtomicInteger()
+    private val issued = ConcurrentHashMap.newKeySet<String>()
+    private val consumed = ConcurrentHashMap.newKeySet<String>()
     private val accepted = LinkedBlockingQueue<String>()
     private val frames = LinkedBlockingQueue<String>()
     private val requests = LinkedBlockingQueue<RecordedRequest>()
@@ -58,12 +61,17 @@ class AuthenticatedDisposableFixtureTest {
                     return MockResponse().setResponseCode(401)
                 }
                 return when (path) {
-                    "/dashboard/api/auth/ws-ticket" -> MockResponse().setBody("{\"ticket\":\"ticket-${tickets.incrementAndGet()}\"}")
+                    "/dashboard/api/auth/ws-ticket" -> {
+                        val ticket = "ticket-${tickets.incrementAndGet()}"
+                        issued.add(ticket)
+                        MockResponse().setBody("{\"ticket\":\"$ticket\"}")
+                    }
                     "/dashboard/api/ws" -> {
                         val ticket = request.requestUrl!!.queryParameter("ticket")
-                        if (ticket != "ticket-${tickets.get()}" || !accepted.offer(ticket)) {
+                        if (ticket == null || !issued.contains(ticket) || !consumed.add(ticket)) {
                             MockResponse().setResponseCode(401)
                         } else {
+                            accepted.offer(ticket)
                             MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
                                 override fun onMessage(webSocket: WebSocket, text: String) {
                                     frames.offer(text)
@@ -123,22 +131,40 @@ class AuthenticatedDisposableFixtureTest {
             okhttp3.Request.Builder().url(endpoint.resolve("api/auth/login"))
                 .post("{}".toRequestBody()).build(),
         ).execute().use { it.code })
-        assertTrue(ApiClient.hermesApi.getConfig().code() == 403)
+        assertEquals(403, ApiClient.hermesApi.getConfig().code())
         assertEquals(403, ApiClient.hermesApi.updateConfig(ConfigUpdateRequest(config = emptyMap())).code())
         val mutations = requests.filter { it.method == "PUT" }
         assertEquals(1, mutations.size)
         assertNull(mutations.single().requestUrl!!.queryParameter("profile"))
+        assertEquals("session=fixture", mutations.single().getHeader("Cookie"))
+        assertNull(mutations.single().getHeader("Authorization"))
+        assertEquals(0, requests.count { it.requestUrl!!.encodedPath.contains("refresh") })
         assertEquals("session=fixture", requests.last { it.requestUrl!!.encodedPath == "/dashboard/api/config" }.getHeader("Cookie"))
         HermesWsClient.connect()
         withTimeout(5000) { HermesWsClient.connectionStatus.first { it == ConnectionStatus.CONNECTED } }
         assertEquals("ticket-1", accepted.poll(5, TimeUnit.SECONDS))
+        assertEquals(401, replay("ticket-1"))
+        assertEquals(401, replay("never-issued"))
+        assertEquals(setOf("ticket-1"), consumed.toSet())
+        assertTrue(accepted.isEmpty())
         HermesWsClient.sendMessage("runtime-session", "fixture prompt")
-        assertTrue(frames.poll(5, TimeUnit.SECONDS).contains("fixture prompt"))
+        assertTrue("WebSocket frame not received", frames.poll(5, TimeUnit.SECONDS)?.contains("fixture prompt") == true)
         HermesWsClient.disconnect(clearPendingMessages = true)
         HermesWsClient.connect()
         withTimeout(5000) { HermesWsClient.connectionStatus.first { it == ConnectionStatus.CONNECTED } }
         assertEquals("ticket-2", accepted.poll(5, TimeUnit.SECONDS))
         assertEquals(2, tickets.get())
-        assertNull(requests.first { it.requestUrl!!.encodedPath == "/dashboard/api/auth/ws-ticket" }.getHeader("Authorization"))
+        assertEquals(setOf("ticket-1", "ticket-2"), consumed.toSet())
+        assertEquals(2, issued.size)
+        val ticketRequests = requests.filter { it.requestUrl!!.encodedPath == "/dashboard/api/auth/ws-ticket" }
+        assertEquals(2, ticketRequests.size)
+        assertTrue(ticketRequests.all { it.getHeader("Cookie") == "session=fixture" && it.getHeader("Authorization") == null })
+        assertTrue(requests.filter { it.requestUrl!!.encodedPath == "/dashboard/api/ws" }
+            .all { it.getHeader("Cookie") == "session=fixture" && it.getHeader("Authorization") == null })
     }
+
+    private fun replay(ticket: String): Int =
+        OkHttpProvider.probe.newCall(
+            okhttp3.Request.Builder().url(endpoint.webSocketUrl("ticket", ticket)).build(),
+        ).execute().use { it.code }
 }
