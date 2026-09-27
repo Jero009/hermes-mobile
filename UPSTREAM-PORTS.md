@@ -37,6 +37,28 @@ The Coil migration remains owner-deferred. Kanban expansion, plugin catalog
 installation, composer redesign, and broad upstream refactors are not included.
 Live subagent/session visibility is a separate authorized follow-up batch.
 
+## Low-risk maintenance batch (2026-09-26)
+
+Reviewed against upstream `e4004decb4acd18273a19fca2b2f8d12b829ce8e`
+(v1.30.0). `reviewed_through` is unchanged: most of the 156 intervening
+commits build on upstream's tool-display and ChatViewModel refactors, which
+this fork has not taken.
+
+- `8c5a3a061f5207ead6b36b2d026a159a7f69a53b`: syntax highlighting for code
+  cards moves off the main thread; applied to the downstream `CodeBlockCard`.
+- `399892618f0359296eac6e7a9650ce5207666be4`: fixed-width embedded Git SHA for
+  reproducible APKs, without the F-Droid rationale.
+- `a2c9a025` and `f3023c74`: KSP 2.3.12 and LaTeX 1.5.5. New verification
+  hashes were checked against Maven Central `.sha256` sidecars.
+- The macOS `aapt2` artifact is now pinned (checked against Google Maven) so
+  the verified build also runs on Apple silicon hosts.
+
+Not applicable: `304a9018`, `a567c911`, `7290b300`, `e539d650`, and
+`1ab30f1e` patch upstream's `ui/chat/tool/` engine, which does not exist
+here; the downstream skill renderer already orders its success branch
+correctly. The `sqlcipher` 4.19.0 and Coil 3.x bumps, the scoped-route
+expansion in `303019b9`, and all feature work remain for owner review.
+
 ## Validation and release boundary
 
 Independent specification and code-quality reviews were completed, including
