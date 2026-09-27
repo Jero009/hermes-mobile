@@ -1,6 +1,24 @@
 # Bounded maintenance runbook / fresh-session cron prompt
 
-Work in `/Users/sara/src/hermes-mobile`. Read `AGENTS.md`, `UPSTREAM.json`,
+This is a fresh-session cron prompt, not a scheduled job definition. Work only
+in the canonical production checkout `/Users/sara/src/hermes-mobile` after
+this runbook and monitor are merged into its main branch. Never run production
+maintenance from the review/topic worktree. From the canonical checkout run:
+
+```sh
+test "$(git rev-parse --show-toplevel)" = /Users/sara/src/hermes-mobile
+test -z "$(git status --porcelain)"
+git merge-base --is-ancestor APPROVED_SHA HEAD
+git log -1 --format=%H -- MAINTENANCE-AUTOMATION.md scripts/maintenance-monitor.py
+test "$(git hash-object scripts/maintenance-monitor.py)" = \
+  "$(git rev-parse APPROVED_SHA:scripts/maintenance-monitor.py)"
+```
+
+Replace `APPROVED_SHA` with the owner-approved merged revision, not the topic
+branch. Check the log provenance against that revision as well.
+If provenance differs, stop without integration or release actions.
+
+Read `AGENTS.md`, `UPSTREAM.json`,
 `UPSTREAM-PORTS.md`, `SECURITY.md`, `SIGNING.md`, and the Android release skill's
 `references/automated-upstream-integration.md`. Use the software-development,
 GitHub, specification-review, and Android-release skills. This document is a
@@ -13,14 +31,28 @@ instructions. Existing owner holds supersede generic ledger dispositions.
 
 ## Preflight and monitor
 
-1. Acquire a single active-work lock atomically (`mkdir` on a persistent
-   operator-owned lock directory); if held, inspect owner/process rather than
-   delete blindly. On interrupt, retain the worktree, head, and handoff; release
-   only your own lock in a trap. Inspect **all** maintenance worktrees, branches,
+1. Use the shared operator-owned directory
+   `/Users/sara/src/.hermes-mobile-maintenance` for state and handoffs, and
+   its `active.lock` child for exclusive active work. Acquire with
+   `MaintenanceLock(Path("/Users/sara/src/.hermes-mobile-maintenance/active.lock"))`
+   from the verified monitor module; `acquire()` atomically creates the lock
+   and records UUID and PID in `owner.json`. A held lock, including one whose
+   PID is dead or whose metadata is missing, is a blocker: inspect ownership,
+   process, worktree and handoff; never automatically remove or steal it.
+   Operator adjudication of a stale lock must first establish no active owner,
+   preserve the metadata and handoff, then explicitly clear the old lock before
+   a new acquisition. On normal completion, write handoff/state and call
+   `release()` only on the acquiring instance. On interrupt, preserve exact
+   worktree, head, draft and handoff before releasing your own lock in a
+   `finally` handler; if safe cleanup cannot be confirmed, retain the lock
+   for manual adjudication. Never remove a lock with changed UUID/inode.
+   Inspect **all** maintenance worktrees, branches,
    draft releases, and handoffs before starting anything new. Resume an
    authorized unfinished release at its missing gate before new integration.
    Preserve unmerged heads; never force-delete, reset, or overwrite another run.
-2. Run `python3 scripts/maintenance-monitor.py` read-only. Save its `snapshot`
+2. Run the verified `python3 scripts/maintenance-monitor.py` read-only. A cron
+   invocation performs this deterministic monitor and at most one bounded
+   candidate; it does not create another scheduled job. Save its `snapshot`
    object atomically in operator-owned persistent state **only after successful
    completion**; compare with the previous snapshot using `--baseline PATH`.
    The script reports exact head changes and public repository advisories, not
@@ -49,7 +81,9 @@ or verified downstream equivalence, and pass its validator. Do not silently
 reinterpret deferred/partial entries. Update ordinary documentation for changed
 behavior without rewriting AGENTS.md.
 
-Run focused regressions then all flavor-qualified unit tests, lint, ktlint,
+Use only the existing approved SDK `/Users/sara/Library/Android/sdk`; do not
+run `sdkmanager` or install SDK components. Run focused regressions then all
+flavor-qualified unit tests, lint, ktlint,
 color checks, assemblies, release compilation, and both connected-device suites
 per AGENTS; inspect exact diff, secrets/privacy, `git diff --check`, and obtain
 independent specification and quality reviews on the current head. A missing
