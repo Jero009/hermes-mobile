@@ -54,6 +54,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -5122,6 +5123,87 @@ class ChatViewModelTest {
 
             verify(exactly = 0) {
                 HermesWsClient.sendMessage(any(), match { it.contains("stale prompt") }, any(), any())
+            }
+        }
+
+    @Test
+    fun testSendMessage_fileAttachResultsPreserveReferencesForJsonAndMap() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val results =
+                ArrayDeque<Any?>(
+                    listOf(
+                        Json.parseToJsonElement("""{"ref_text":"@file:json-ref"}"""),
+                        mapOf("ref_text" to "@file:map-ref"),
+                    ),
+                )
+            every { HermesWsClient.request(WsMethods.FILE_ATTACH, any(), any()) } answers {
+                CompletableDeferred(results.removeFirst())
+            }
+            mockkConstructor(android.util.Base64OutputStream::class)
+            every {
+                anyConstructed<android.util.Base64OutputStream>().write(any<ByteArray>(), any(), any())
+            } returns Unit
+            every { anyConstructed<android.util.Base64OutputStream>().close() } returns Unit
+            mockkStatic(Uri::class)
+            every { Uri.parse(any<String>()) } returns mockk()
+            val resolver = mockk<ContentResolver>()
+            every { app.contentResolver } returns resolver
+            every { resolver.openInputStream(any()) } answers {
+                java.io.ByteArrayInputStream(byteArrayOf(1, 2, 3))
+            }
+
+            viewModel.addAttachment("content://first", "first.txt", "text/plain", 3)
+            viewModel.addAttachment("content://second", "second.txt", "text/plain", 3)
+            advanceUntilIdle()
+            assertTrue(viewModel.sendMessage("hello"))
+            advanceUntilIdle()
+
+            assertTrue(results.isEmpty())
+            verify(exactly = 1) {
+                HermesWsClient.sendMessageForConnection(
+                    any(),
+                    sessionId,
+                    "@file:json-ref\n@file:map-ref\n\nhello",
+                    any(),
+                )
+            }
+        }
+
+    @Test
+    fun testSendMessage_imageAttachResultsRecognizeJsonAndMapAcknowledgements() =
+        runTest {
+            val (viewModel, sessionId) = createViewModelWithSession()
+            val results =
+                ArrayDeque<Any?>(
+                    listOf(Json.parseToJsonElement("""{"attached":true}"""), mapOf("attached" to true)),
+                )
+            every { HermesWsClient.request(WsMethods.IMAGE_ATTACH_BYTES, any(), any()) } answers {
+                CompletableDeferred(results.removeFirst())
+            }
+            mockkConstructor(android.util.Base64OutputStream::class)
+            every {
+                anyConstructed<android.util.Base64OutputStream>().write(any<ByteArray>(), any(), any())
+            } returns Unit
+            every { anyConstructed<android.util.Base64OutputStream>().close() } returns Unit
+            mockkStatic(Uri::class)
+            every { Uri.parse(any<String>()) } returns mockk()
+            val resolver = mockk<ContentResolver>()
+            every { app.contentResolver } returns resolver
+            every { resolver.openInputStream(any()) } answers {
+                java.io.ByteArrayInputStream(byteArrayOf(1, 2, 3))
+            }
+
+            viewModel.addAttachment("content://first", "first.png", "image/png", 3)
+            viewModel.addAttachment("content://second", "second.png", "image/png", 3)
+            advanceUntilIdle()
+            assertTrue(viewModel.sendMessage("hello"))
+            advanceUntilIdle()
+
+            assertTrue(results.isEmpty())
+            verify(exactly = 0) { Log.w(any(), "Image attachment request failed") }
+            verify(exactly = 1) {
+                HermesWsClient.sendMessageForConnection(any(), sessionId, "hello", any())
             }
         }
 
