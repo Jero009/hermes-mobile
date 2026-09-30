@@ -1,6 +1,8 @@
 package com.m57.hermescontrol.ui.chat
 
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.LayoutDirection
 import com.m57.hermescontrol.theme.HermesStatusColors
 import com.m57.hermescontrol.theme.StatusBlue
@@ -701,6 +703,66 @@ class MarkdownTextFeatureTest {
         assertTrue(block.code.contains("still inner"))
     }
 
+    @Test(timeout = 5000)
+    fun testUnequalBacktickRuns_haveBoundedParsingCost() {
+        val input = (1..2000).joinToString("x") { "`".repeat(it) }
+        val parsed = parseInline(input, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+        assertEquals(input, parsed.text)
+        assertTrue(parsed.spanStyles.none { it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace })
+    }
+
+    @Test
+    fun testNestedEmphasis_bothDirectionsAndOpaqueCode() {
+        listOf(
+            "*outer **bold** tail*" to "outer bold tail",
+            "**outer *bold* tail**" to "outer bold tail",
+            "*outer **bold***" to "outer bold",
+            "**outer *bold***" to "outer bold",
+            "*outer `**opaque**` **bold** tail*" to "outer **opaque** bold tail",
+            "**outer `*opaque*` *bold* tail**" to "outer *opaque* bold tail",
+        ).forEach { (input, expected) ->
+            val parsed = parseInline(input, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+            assertEquals(input, expected, parsed.text)
+            val start = parsed.text.lastIndexOf("bold")
+            assertTrue(
+                parsed.spanStyles.any {
+                    it.start <= start && it.end >= start + 4 && it.item.fontWeight == FontWeight.Bold
+                },
+            )
+            assertTrue(
+                parsed.spanStyles.any {
+                    it.start <= start && it.end >= start + 4 && it.item.fontStyle == FontStyle.Italic
+                },
+            )
+        }
+    }
+
+    @Test
+    fun testRtlRecursiveSnippets_isolateWholeSlashIdentifierAndKeepAnnotations() {
+        listOf("**foo/bar**", "*foo/bar*", "[**foo/bar**](https://example.com)").forEach { markup ->
+            val parsed =
+                parseInline("مرحبا $markup نهاية", Color.Black, "foo/bar", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+            assertEquals("مرحبا ${BidiUtils.LRI}foo/bar${BidiUtils.PDI} نهاية", parsed.text)
+            val start = parsed.text.indexOf("foo/bar")
+            assertTrue(
+                parsed.spanStyles.any {
+                    it.start <= start && it.end >= start + 7 &&
+                        (it.item.fontWeight == FontWeight.Bold || it.item.fontStyle == FontStyle.Italic)
+                },
+            )
+            assertTrue(
+                parsed.spanStyles.any {
+                    it.start == start - 1 && it.end == start + 8 &&
+                        it.item.background == DEFAULT_HIGHLIGHTS.searchBackground
+                },
+            )
+            if (markup.startsWith("[")) {
+                val link = parsed.getLinkAnnotations(start, start + 7).single()
+                assertEquals("https://example.com", (link.item as androidx.compose.ui.text.LinkAnnotation.Url).url)
+            }
+        }
+    }
+
     // 25. ARABIC BIDI MIXED TEXT (issue #1044)
     @Test
     fun testArabicMixedWithInlineCode_wrapsWithLtrIsolate() {
@@ -785,6 +847,8 @@ class MarkdownTextFeatureTest {
         val highlightStart = parsed.indexOf(highlightedText)
         val highlightEnd = highlightStart + highlightedText.length
 
+        assertEquals(8, highlightStart)
+        assertEquals(17, highlightEnd)
         assertTrue("English query should remain LTR-isolated", highlightStart >= 0)
         assertTrue(
             "isolated English query should retain its search highlight",

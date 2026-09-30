@@ -1366,6 +1366,69 @@ internal fun parseInline(
         isRtl = isRtl,
     )
 
+private fun AnnotatedString.isolateLtrSnippet(isRtl: Boolean): AnnotatedString =
+    if (isRtl && BidiUtils.isLtrSnippet(text)) {
+        buildAnnotatedString {
+            append(BidiUtils.LRI)
+            append(this@isolateLtrSnippet)
+            append(BidiUtils.PDI)
+        }
+    } else {
+        this
+    }
+
+// Index exact backtick runs once; unmatched runs must not repeatedly scan the suffix.
+private fun nextCodeRuns(text: String): Map<Int, Int> {
+    val runs = mutableListOf<Pair<Int, Int>>()
+    var index = 0
+    while (index < text.length) {
+        if (text[index] != '`') {
+            index++
+            continue
+        }
+        val start = index
+        while (index < text.length && text[index] == '`') index++
+        runs.add(start to index - start)
+    }
+    val nextByLength = mutableMapOf<Int, Int>()
+    val next = mutableMapOf<Int, Int>()
+    for ((start, length) in runs.asReversed()) {
+        nextByLength[length]?.let { next[start] = it }
+        nextByLength[length] = start
+    }
+    return next
+}
+
+// Other emphasis runs nest inside this delimiter; matched code is opaque.
+private fun emphasisEnd(
+    text: String,
+    start: Int,
+    length: Int,
+    codeRuns: Map<Int, Int>,
+): Int {
+    var index = start + length
+    val innerLength = if (length == 1) 2 else 1
+    var innerOpen = false
+    while (index < text.length) {
+        if (text[index] == '`') {
+            var runEnd = index
+            while (runEnd < text.length && text[runEnd] == '`') runEnd++
+            index = codeRuns[index]?.plus(runEnd - index) ?: runEnd
+        } else if (text[index] == '*') {
+            var runEnd = index
+            while (runEnd < text.length && text[runEnd] == '*') runEnd++
+            val runLength = runEnd - index
+            if (innerOpen && runLength >= innerLength + length) return index + innerLength
+            if (runLength == length && !innerOpen) return index
+            if (runLength == innerLength) innerOpen = !innerOpen
+            index = runEnd
+        } else {
+            index++
+        }
+    }
+    return -1
+}
+
 private fun parseInlineSource(
     text: String,
     textColor: Color,
@@ -1378,6 +1441,7 @@ private fun parseInlineSource(
     return buildAnnotatedString {
         var i = 0
         val src = text
+        val codeRuns = nextCodeRuns(src)
 
         while (i < src.length) {
             // Cheap prefix gate: URL_PATTERN only matches at "http(s)://", so skip the regex elsewhere.
@@ -1389,21 +1453,7 @@ private fun parseInlineSource(
                     var runEnd = i
                     while (runEnd < src.length && src[runEnd] == '`') runEnd++
                     val runLength = runEnd - i
-                    var end = runEnd
-                    var matchingEnd = -1
-                    while (end < src.length) {
-                        if (src[end] == '`') {
-                            var candidateEnd = end
-                            while (candidateEnd < src.length && src[candidateEnd] == '`') candidateEnd++
-                            if (candidateEnd - end == runLength) {
-                                matchingEnd = end
-                                break
-                            }
-                            end = candidateEnd
-                        } else {
-                            end++
-                        }
-                    }
+                    val matchingEnd = codeRuns[i] ?: -1
                     if (matchingEnd >= 0) {
                         val raw = src.substring(runEnd, matchingEnd)
                         val content = if (isRtl) BidiUtils.wrapInlineCodeLtrIsolate(raw) else raw
@@ -1440,12 +1490,7 @@ private fun parseInlineSource(
                 }
 
                 src.startsWith("**", i) -> {
-                    var end = src.indexOf("**", i + 2)
-                    if (end >= 0 && src.startsWith("***", end) &&
-                        src.substring(i + 2, end).count { it == '*' } % 2 == 1
-                    ) {
-                        end++ // Inner italic closes with the first star of the trailing run.
-                    }
+                    val end = emphasisEnd(src, i, 2, codeRuns)
                     if (end != -1) {
                         val raw = src.substring(i + 2, end)
                         val nested =
@@ -1456,8 +1501,8 @@ private fun parseInlineSource(
                                 isCurrentMatch,
                                 linkColor,
                                 highlights,
-                                isRtl,
-                            )
+                                isRtl && !BidiUtils.isLtrSnippet(raw),
+                            ).isolateLtrSnippet(isRtl)
                         withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(nested) }
                         i = end + 2
                     } else {
@@ -1484,7 +1529,7 @@ private fun parseInlineSource(
 
                 // *italic*; bold spans keep their styles while nested text is appended.
                 src.startsWith("*", i) -> {
-                    val close = src.indexOf('*', i + 1)
+                    val close = emphasisEnd(src, i, 1, codeRuns)
                     if (close > i + 1) {
                         val raw = src.substring(i + 1, close)
                         val italic = SpanStyle(fontStyle = FontStyle.Italic)
@@ -1496,8 +1541,8 @@ private fun parseInlineSource(
                                 isCurrentMatch,
                                 linkColor,
                                 highlights,
-                                isRtl,
-                            )
+                                isRtl && !BidiUtils.isLtrSnippet(raw),
+                            ).isolateLtrSnippet(isRtl)
                         withStyle(italic) { append(nested) }
                         i = close + 1
                     } else {
@@ -1609,8 +1654,8 @@ private fun parseInlineSource(
                                     isCurrentMatch,
                                     linkColor,
                                     highlights,
-                                    isRtl,
-                                )
+                                    isRtl && !BidiUtils.isLtrSnippet(label),
+                                ).isolateLtrSnippet(isRtl)
                             withStyle(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline)) {
                                 append(labelText)
                             }
@@ -1707,7 +1752,10 @@ internal fun AnnotatedString.withSearchHighlights(
         while (true) {
             val hit = text.indexOf(query, from, ignoreCase = true)
             if (hit < 0) break
-            addStyle(SpanStyle(background = bg, color = fg), hit, hit + query.length)
+            val start = if (hit > 0 && text[hit - 1] == BidiUtils.LRI.single()) hit - 1 else hit
+            val end = hit + query.length
+            val isolatedEnd = if (end < text.length && text[end] == BidiUtils.PDI.single()) end + 1 else end
+            addStyle(SpanStyle(background = bg, color = fg), start, isolatedEnd)
             from = hit + query.length
         }
     }
