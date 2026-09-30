@@ -276,7 +276,7 @@ private fun JsonElement.searchText(): String? =
 private fun displayedSessions(state: SessionsUiState): List<SessionTreeItem> =
     if (state.isSearchMode) {
         state.searchResults.map { searchResult ->
-            val session = searchResult.toSessionInfo()
+            val session = searchResult.toSessionInfo().copy(title = state.searchTitles[searchResult.session_id])
             SessionTreeItem(
                 session = session,
                 depth = 0,
@@ -432,6 +432,7 @@ fun SessionsScreen(
                 .find { it.id == sessionToDelete }
                 ?.title
                 ?.takeIf { it.isNotBlank() }
+                ?: state.searchTitles[sessionToDelete]?.takeIf(String::isNotBlank)
                 ?: state.searchResults
                     .find { it.session_id == sessionToDelete }
                     ?.snippet
@@ -1460,6 +1461,17 @@ private fun SearchResultCard(
                 }
 
                 Spacer(modifier = Modifier.height(spacing.xs))
+
+                // Locally confirmed renames are titles; legacy snippets remain excerpts.
+                session.title?.takeIf(String::isNotBlank)?.let { title ->
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(modifier = Modifier.height(spacing.xs))
+                }
 
                 // The matched snippet, highlighted — shown as the body, NOT as a title.
                 Text(
