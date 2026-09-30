@@ -589,7 +589,7 @@ private fun MarkdownInlineText(
             inlineContent
         }
     val parsed =
-        remember(markup.source, searchQuery, isCurrentMatch, textColor, linkColor, highlights) {
+        remember(markup.source, searchQuery, isCurrentMatch, textColor, linkColor, highlights, isRtl) {
             parseInlineSource(markup.source, textColor, searchQuery, isCurrentMatch, linkColor, highlights, isRtl)
         }
     val byMarker = remember(markup) { markup.math.associateBy(InlineMathPlaceholder::marker) }

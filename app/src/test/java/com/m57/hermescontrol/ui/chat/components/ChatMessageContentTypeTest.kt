@@ -9,9 +9,10 @@ import org.junit.Test
 class ChatMessageContentTypeTest {
     @Test
     fun `different message roles use distinct reusable layouts`() {
-        val types = MessageRole.entries.map { role ->
-            chatMessageContentType(ChatMessage(role = role, content = "text"))
-        }
+        val types =
+            MessageRole.entries.map { role ->
+                chatMessageContentType(ChatMessage(role = role, content = "text"))
+            }
         assertEquals(MessageRole.entries.size, types.toSet().size)
     }
 
