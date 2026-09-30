@@ -48,6 +48,46 @@ private val DEFAULT_HIGHLIGHTS =
  */
 class MarkdownTextFeatureTest {
     @Test
+    fun unmatchedInnerEmphasisDoesNotSuppressOuterBold() {
+        val parsed = parseInline("**foo * bar**", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+        assertEquals("foo * bar", parsed.text)
+        assertTrue(parsed.spanStyles.any { it.start == 0 && it.end == 9 && it.item.fontWeight == FontWeight.Bold })
+    }
+
+    @Test
+    fun linkDestinationStarsAreOpaqueToOuterEmphasis() {
+        val source = "**[foo](https://example.com/a*b)**"
+        val parsed = parseInline(source, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+        assertEquals("foo", parsed.text)
+        assertTrue(parsed.spanStyles.any { it.start == 0 && it.end == 3 && it.item.fontWeight == FontWeight.Bold })
+        assertEquals(
+            "https://example.com/a*b",
+            (parsed.getLinkAnnotations(0, 3).single().item as androidx.compose.ui.text.LinkAnnotation.Url).url,
+        )
+    }
+
+    @Test
+    fun tripleEmphasisRecursivelyRendersOpaqueCode() {
+        val parsed = parseInline("***outer `***` tail***", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+        assertEquals("outer *** tail", parsed.text)
+        assertTrue(parsed.spanStyles.any {
+            it.start == 0 && it.end == parsed.length &&
+                it.item.fontWeight == FontWeight.Bold && it.item.fontStyle == FontStyle.Italic
+        })
+        assertTrue(parsed.spanStyles.any {
+            it.start == 6 && it.end == 9 && it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace
+        })
+    }
+
+    @Test(timeout = 5000)
+    fun emphasisIndexHandlesManyUnmatchedRunsWithoutSuffixRescans() {
+        val source = "***x **y *z ".repeat(10000)
+        emphasisPairs(source, emptyMap())
+        val nested = "**a *b ".repeat(1000) + "tail" + "* **".repeat(1000)
+        parseInline(nested, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+    }
+
+    @Test
     fun styledSearchHitsKeepTheirFormatting() {
         listOf(
             "***Needle***",

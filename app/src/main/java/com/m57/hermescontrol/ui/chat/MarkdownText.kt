@@ -1399,34 +1399,64 @@ private fun nextCodeRuns(text: String): Map<Int, Int> {
     return next
 }
 
-// Other emphasis runs nest inside this delimiter; matched code is opaque.
-private fun emphasisEnd(
-    text: String,
-    start: Int,
-    length: Int,
-    codeRuns: Map<Int, Int>,
-): Int {
-    var index = start + length
-    val innerLength = if (length == 1) 2 else 1
-    var innerOpen = false
-    while (index < text.length) {
-        if (text[index] == '`') {
-            var runEnd = index
-            while (runEnd < text.length && text[runEnd] == '`') runEnd++
-            index = codeRuns[index]?.plus(runEnd - index) ?: runEnd
-        } else if (text[index] == '*') {
-            var runEnd = index
-            while (runEnd < text.length && text[runEnd] == '*') runEnd++
-            val runLength = runEnd - index
-            if (innerOpen && runLength >= innerLength + length) return index + innerLength
-            if (runLength == length && !innerOpen) return index
-            if (runLength == innerLength) innerOpen = !innerOpen
-            index = runEnd
+// Pair runs once, discarding unmatched inner openers instead of hiding an outer close.
+// Each opener is pushed/popped at most once; code and link destinations are opaque.
+internal fun emphasisPairs(text: String, codeRuns: Map<Int, Int>): Map<Int, Int> {
+    val pairs = mutableMapOf<Int, Int>()
+    val starts = mutableListOf<Int>()
+    val widths = mutableListOf<Int>()
+    val byWidth = Array(4) { mutableListOf<Int>() }
+    val nextParen = IntArray(text.length + 1) { -1 }
+    for (index in text.indices.reversed()) {
+        nextParen[index] = if (text[index] == ')') index else nextParen[index + 1]
+    }
+    fun consume(start: Int, width: Int) {
+        val match = byWidth[width].lastOrNull()
+        if (match == null) {
+            byWidth[width].add(starts.size)
+            starts.add(start)
+            widths.add(width)
         } else {
-            index++
+            pairs[starts[match]] = start
+            while (starts.size > match) {
+                val removedWidth = widths.removeAt(widths.lastIndex)
+                byWidth[removedWidth].removeAt(byWidth[removedWidth].lastIndex)
+                starts.removeAt(starts.lastIndex)
+            }
         }
     }
-    return -1
+    var index = 0
+    while (index < text.length) {
+        when {
+            text[index] == '`' -> {
+                var end = index
+                while (end < text.length && text[end] == '`') end++
+                index = codeRuns[index]?.plus(end - index) ?: end
+            }
+            text.startsWith("](", index) && nextParen[index + 2] >= 0 -> {
+                index = nextParen[index + 2] + 1
+            }
+            text[index] == '*' -> {
+                var end = index
+                while (end < text.length && text[end] == '*') end++
+                val width = end - index
+                if (width in 1..3) {
+                    if (width == 3 && widths.size >= 2 &&
+                        widths.last() + widths[widths.lastIndex - 1] == 3
+                    ) {
+                        val inner = widths.last()
+                        consume(index, inner)
+                        consume(index + inner, 3 - inner)
+                    } else {
+                        consume(index, width)
+                    }
+                }
+                index = end
+            }
+            else -> index++
+        }
+    }
+    return pairs
 }
 
 private fun parseInlineSource(
@@ -1437,11 +1467,15 @@ private fun parseInlineSource(
     linkColor: Color,
     highlights: SearchHighlightColors,
     isRtl: Boolean = BidiUtils.isRtlText(text),
+    depth: Int = 0,
 ): AnnotatedString {
+    // Bound recursive rendering and repeated indexing of nested substrings.
+    if (depth >= 32) return AnnotatedString(text)
     return buildAnnotatedString {
         var i = 0
         val src = text
         val codeRuns = nextCodeRuns(src)
+        val emphasis = emphasisPairs(src, codeRuns)
 
         while (i < src.length) {
             // Cheap prefix gate: URL_PATTERN only matches at "http(s)://", so skip the regex elsewhere.
@@ -1475,10 +1509,13 @@ private fun parseInlineSource(
 
                 // Combined / nested emphasis delimiters.
                 src.startsWith("***", i) -> {
-                    val end = src.indexOf("***", i + 3)
+                    val end = emphasis[i] ?: -1
                     if (end >= 0) {
                         val raw = src.substring(i + 3, end)
-                        val content = if (isRtl) BidiUtils.wrapLtrIsolate(raw) else raw
+                        val content = parseInlineSource(
+                            raw, textColor, searchQuery, isCurrentMatch, linkColor, highlights,
+                            isRtl && !BidiUtils.isLtrSnippet(raw), depth + 1,
+                        ).isolateLtrSnippet(isRtl)
                         withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic)) {
                             append(content)
                         }
@@ -1490,7 +1527,7 @@ private fun parseInlineSource(
                 }
 
                 src.startsWith("**", i) -> {
-                    val end = emphasisEnd(src, i, 2, codeRuns)
+                    val end = emphasis[i] ?: -1
                     if (end != -1) {
                         val raw = src.substring(i + 2, end)
                         val nested =
@@ -1502,6 +1539,7 @@ private fun parseInlineSource(
                                 linkColor,
                                 highlights,
                                 isRtl && !BidiUtils.isLtrSnippet(raw),
+                                depth + 1,
                             ).isolateLtrSnippet(isRtl)
                         withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(nested) }
                         i = end + 2
@@ -1529,7 +1567,7 @@ private fun parseInlineSource(
 
                 // *italic*; bold spans keep their styles while nested text is appended.
                 src.startsWith("*", i) -> {
-                    val close = emphasisEnd(src, i, 1, codeRuns)
+                    val close = emphasis[i] ?: -1
                     if (close > i + 1) {
                         val raw = src.substring(i + 1, close)
                         val italic = SpanStyle(fontStyle = FontStyle.Italic)
@@ -1542,6 +1580,7 @@ private fun parseInlineSource(
                                 linkColor,
                                 highlights,
                                 isRtl && !BidiUtils.isLtrSnippet(raw),
+                                depth + 1,
                             ).isolateLtrSnippet(isRtl)
                         withStyle(italic) { append(nested) }
                         i = close + 1
@@ -1655,6 +1694,7 @@ private fun parseInlineSource(
                                     linkColor,
                                     highlights,
                                     isRtl && !BidiUtils.isLtrSnippet(label),
+                                    depth + 1,
                                 ).isolateLtrSnippet(isRtl)
                             withStyle(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline)) {
                                 append(labelText)
