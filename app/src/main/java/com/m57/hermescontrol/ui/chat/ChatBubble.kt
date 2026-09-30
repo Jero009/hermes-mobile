@@ -418,6 +418,8 @@ private fun AssistantBubble(
                         ReasoningCard(
                             reasoningText = message.reasoningText,
                             isStreaming = message.isStreaming,
+                            searchQuery = searchQuery,
+                            isCurrentMatch = isCurrentMatch,
                         )
                         Spacer(modifier = Modifier.height(6.dp))
                     }

@@ -45,6 +45,104 @@ private val DEFAULT_HIGHLIGHTS =
  * structurally instead.
  */
 class MarkdownTextFeatureTest {
+    @Test
+    fun styledSearchHitsKeepTheirFormatting() {
+        listOf(
+            "***Needle***",
+            "~~Needle~~",
+            "==Needle==",
+            "^Needle^",
+            "~Needle~",
+            "<kbd>Needle</kbd>",
+            "[**Needle**](https://example.com)",
+            "`Needle`",
+        ).forEach { source ->
+            val parsed = parseInline(source, Color.Black, "needle", true, Color.Blue, DEFAULT_HIGHLIGHTS)
+            assertEquals("Needle", parsed.text)
+            assertTrue(
+                parsed.spanStyles.any {
+                    it.start == 0 && it.end == 6 && it.item.background == DEFAULT_HIGHLIGHTS.currentSearchBackground
+                },
+            )
+        }
+    }
+
+    @Test
+    fun codeSearchOverlayPreservesSyntaxAndHighlightsEveryHit() {
+        val original =
+            androidx.compose.ui.text.buildAnnotatedString {
+                append("Needle needle")
+                addStyle(
+                    androidx.compose.ui.text.SpanStyle(fontWeight = androidx.compose.ui.text.font.FontWeight.Bold),
+                    0,
+                    6,
+                )
+            }
+        val result = original.withSearchHighlights("needle", false, DEFAULT_HIGHLIGHTS)
+        assertEquals(original.text, result.text)
+        assertTrue(result.spanStyles.containsAll(original.spanStyles))
+        assertEquals(2, result.spanStyles.count { it.item.background == DEFAULT_HIGHLIGHTS.searchBackground })
+        assertEquals(original, original.withSearchHighlights("", false, DEFAULT_HIGHLIGHTS))
+    }
+
+    @Test
+    fun testNestedInlineStyles_preserveCodeAndEmphasisFormatting() {
+        val parsed = parseInline("**bold `code` and *italic***", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+
+        assertEquals("bold code and italic", parsed.toString())
+        assertTrue(parsed.spanStyles.any { it.item.fontWeight == androidx.compose.ui.text.font.FontWeight.Bold })
+        assertTrue(parsed.spanStyles.any { it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace })
+        assertTrue(parsed.spanStyles.any { it.item.fontStyle == androidx.compose.ui.text.font.FontStyle.Italic })
+        val codeStart = parsed.indexOf("code")
+        assertTrue(
+            parsed.spanStyles.any {
+                it.item.fontWeight == androidx.compose.ui.text.font.FontWeight.Bold &&
+                    it.start <= codeStart &&
+                    it.end >= codeStart + 4
+            },
+        )
+        assertTrue(
+            parsed.spanStyles.any {
+                it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace &&
+                    it.start <= codeStart &&
+                    it.end >= codeStart + 4
+            },
+        )
+    }
+
+    @Test
+    fun testLinkLabel_nestedEmphasisAndCode() {
+        val parsed =
+            parseInline(
+                "[**bold `code`**](https://example.com)",
+                Color.Black,
+                "",
+                false,
+                Color.Blue,
+                DEFAULT_HIGHLIGHTS,
+            )
+
+        assertEquals("bold code", parsed.toString())
+        assertTrue(parsed.getLinkAnnotations(0, parsed.length).isNotEmpty())
+        assertTrue(parsed.spanStyles.any { it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace })
+    }
+
+    @Test
+    fun testCodeSpan_doesNotParseInnerEmphasis() {
+        val parsed = parseInline("`**literal**`", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+
+        assertEquals("**literal**", parsed.toString())
+        assertFalse(parsed.spanStyles.any { it.item.fontWeight == androidx.compose.ui.text.font.FontWeight.Bold })
+    }
+
+    @Test
+    fun testInlineCode_matchesSameLengthBacktickRunAndPreservesUnmatchedRun() {
+        val parsed = parseInline("``a ` tick`` and `unfinished", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+
+        assertEquals("a ` tick and `unfinished", parsed.toString())
+        assertTrue(parsed.spanStyles.any { it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace })
+    }
+
     // 1. TABLES
     @Test
     fun testTable_parsesHeaderAndRows() {
