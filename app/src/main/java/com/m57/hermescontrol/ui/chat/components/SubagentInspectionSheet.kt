@@ -30,6 +30,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -57,6 +58,7 @@ fun SubagentInspectionSheet(
     modifier: Modifier = Modifier,
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val todoRows = remember(todos) { buildTodoHierarchy(todos) }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -135,10 +137,10 @@ fun SubagentInspectionSheet(
                             }
                         }
                         itemsIndexed(
-                            items = todos,
-                            key = { index, todo -> "todo-${todo.id}_$index" },
-                        ) { _, todo ->
-                            TodoInspectionCard(todo = todo)
+                            items = todoRows,
+                            key = { _, row -> row.key },
+                        ) { _, row ->
+                            TodoInspectionCard(todo = row.todo, depth = row.depth)
                         }
                     }
 
@@ -181,9 +183,12 @@ fun SubagentInspectionSheet(
 }
 
 @Composable
-internal fun TodoInspectionCard(todo: TodoItem) {
+internal fun TodoInspectionCard(
+    todo: TodoItem,
+    depth: Int = 0,
+) {
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().padding(start = (depth.coerceIn(0, MAX_TODO_DEPTH) * 12).dp),
         shape = RoundedCornerShape(12.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
     ) {
