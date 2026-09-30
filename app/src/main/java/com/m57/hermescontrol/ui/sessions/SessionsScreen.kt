@@ -292,6 +292,22 @@ private fun displayedSessions(state: SessionsUiState): List<SessionTreeItem> =
         flattenSessionTree(state.sessions)
     }
 
+/** Every input read by the cached projection must participate in its remember key. */
+@Composable
+internal fun rememberSessionsToDisplay(
+    state: SessionsUiState,
+    sessionSections: SessionSections,
+): List<SessionTreeItem> =
+    remember(
+        state.isSearchMode,
+        state.searchQuery,
+        state.searchResults,
+        state.searchTitles,
+        sessionSections,
+    ) {
+        if (state.isSearchMode) displayedSessions(state) else sessionSections.pinned + sessionSections.recent
+    }
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun SessionsScreen(
@@ -324,19 +340,7 @@ fun SessionsScreen(
                 pinnedSessionIds = state.pinnedSessionIds,
             )
         }
-    val sessionsToDisplay =
-        remember(
-            state.isSearchMode,
-            state.searchQuery,
-            state.searchResults,
-            sessionSections,
-        ) {
-            if (state.isSearchMode) {
-                displayedSessions(state)
-            } else {
-                sessionSections.pinned + sessionSections.recent
-            }
-        }
+    val sessionsToDisplay = rememberSessionsToDisplay(state, sessionSections)
 
     val hasSelection = state.selectedIds.isNotEmpty()
     val automationRunGroups =

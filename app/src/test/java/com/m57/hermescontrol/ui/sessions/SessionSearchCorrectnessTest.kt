@@ -2,6 +2,9 @@ package com.m57.hermescontrol.ui.sessions
 
 import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.model.BulkDeleteResponse
+import com.m57.hermescontrol.data.model.SessionInfo
+import com.m57.hermescontrol.data.model.SessionLatestDescendantResponse
+import com.m57.hermescontrol.data.model.SessionListResponse
 import com.m57.hermescontrol.data.model.SessionSearchResponse
 import com.m57.hermescontrol.data.model.SessionSearchResult
 import com.m57.hermescontrol.data.remote.ApiClient
@@ -40,6 +43,12 @@ class SessionSearchCorrectnessTest {
         mockkObject(AuthManager, ApiClient)
         every { AuthManager.getSelectedProfileId() } returns "profile-a"
         every { ApiClient.hermesApi } returns api
+        coEvery { api.getSessions(any(), any(), any(), any(), any()) } returns
+            Response.success(SessionListResponse(emptyList()))
+        coEvery { api.getSessionStats() } returns
+            Response.success(com.m57.hermescontrol.data.model.SessionStatsResponse())
+        coEvery { api.getSessionLatestDescendant(any()) } returns Response.error(404, "missing".toResponseBody())
+        coEvery { api.getSession(any()) } returns Response.error(404, "missing".toResponseBody())
     }
 
     @After
@@ -48,19 +57,191 @@ class SessionSearchCorrectnessTest {
         unmockkAll()
     }
 
-    private class FakeSessionPinStore(
-        private var pins: List<String>,
-    ) : SessionPinStore {
-        override fun load(): List<String> = pins
+    private fun viewModel() = SessionsViewModel(pinStore = SearchReviewPinStore(), ioDispatcher = dispatcher)
+
+    private class SearchReviewPinStore(private var pins: List<String> = emptyList()) : SessionPinStore {
+        override fun load() = pins
 
         override fun save(pinIds: List<String>) {
             pins = pinIds
         }
     }
 
-    private fun viewModel() = SessionsViewModel(pinStore = FakeSessionPinStore(emptyList()), ioDispatcher = dispatcher)
-
     private fun hits(vararg ids: String) = Response.success(SessionSearchResponse(ids.map { SessionSearchResult(it) }))
+
+    @Test
+    fun `partial zero and unconfirmed bulk responses do not tombstone surviving hits or pins`() {
+        for (response in listOf(
+            BulkDeleteResponse(ok = true, deleted = 1),
+            BulkDeleteResponse(ok = true, deleted = 0),
+            BulkDeleteResponse(ok = false, deleted = 2),
+        )) {
+            coEvery { api.searchSessions(any(), any(), any(), any()) } returns hits("a", "b")
+            coEvery { api.bulkDeleteSessions(any()) } returns Response.success(response)
+            val pins = SearchReviewPinStore(listOf("a", "b"))
+            val vm = SessionsViewModel(pinStore = pins, ioDispatcher = dispatcher)
+            vm.setSearchQuery("a")
+            dispatcher.scheduler.advanceUntilIdle()
+            vm.selectAll(setOf("a", "b"))
+            vm.confirmBulkDelete()
+            dispatcher.scheduler.advanceUntilIdle()
+            assertEquals(listOf("a", "b"), vm.uiState.value.searchResults.map { it.session_id })
+            assertEquals(listOf("a", "b"), pins.load())
+            assertFalse(vm.uiState.value.isDeletingBulk)
+            vm.setSearchQuery("again")
+            dispatcher.scheduler.advanceUntilIdle()
+            assertEquals(listOf("a", "b"), vm.uiState.value.searchResults.map { it.session_id })
+        }
+    }
+
+    @Test
+    fun `stale single cleanup releases its own busy state but never a successor`() {
+        lateinit var first: Continuation<Response<Unit>>
+        lateinit var second: Continuation<Response<Unit>>
+        var calls = 0
+        coEvery { api.deleteSession("a") } coAnswers {
+            suspendCoroutine { if (calls++ == 0) first = it else second = it }
+        }
+        val vm = viewModel()
+        vm.requestDeleteSession("a")
+        vm.confirmDeleteSession()
+        dispatcher.scheduler.advanceUntilIdle()
+        every { AuthManager.getSelectedProfileId() } returns "profile-b"
+        vm.requestDeleteSession("a")
+        vm.confirmDeleteSession()
+        dispatcher.scheduler.advanceUntilIdle()
+        first.resume(Response.success(Unit))
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(setOf("a"), vm.uiState.value.deletingSessionIds)
+        every { AuthManager.getSelectedProfileId() } returns "profile-c"
+        second.resume(Response.success(Unit))
+        dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(vm.uiState.value.deletingSessionIds.isEmpty())
+        assertNull(vm.uiState.value.toastMessage)
+    }
+
+    @Test
+    fun `stale bulk cleanup releases its own busy state but never a successor`() {
+        lateinit var first: Continuation<Response<BulkDeleteResponse>>
+        lateinit var second: Continuation<Response<BulkDeleteResponse>>
+        var calls = 0
+        coEvery { api.bulkDeleteSessions(any()) } coAnswers {
+            suspendCoroutine { if (calls++ == 0) first = it else second = it }
+        }
+        val vm = viewModel()
+        vm.selectAll(setOf("a"))
+        vm.confirmBulkDelete()
+        dispatcher.scheduler.advanceUntilIdle()
+        every { ApiClient.hermesApi } returns mockk(relaxed = true)
+        every { AuthManager.getSelectedProfileId() } returns "profile-b"
+        every { ApiClient.hermesApi } returns api
+        vm.confirmBulkDelete()
+        dispatcher.scheduler.advanceUntilIdle()
+        first.resume(Response.success(BulkDeleteResponse(ok = true, deleted = 1)))
+        dispatcher.scheduler.advanceUntilIdle()
+        assertTrue(vm.uiState.value.isDeletingBulk)
+        every { ApiClient.hermesApi } returns mockk(relaxed = true)
+        second.resume(Response.success(BulkDeleteResponse(ok = true, deleted = 1)))
+        dispatcher.scheduler.advanceUntilIdle()
+        assertFalse(vm.uiState.value.isDeletingBulk)
+        assertEquals(setOf("a"), vm.uiState.value.selectedIds)
+        assertNull(vm.uiState.value.toastMessage)
+        every { ApiClient.hermesApi } returns api
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+    }
+
+    @Test
+    fun `cancel resistant history page cannot undo a rename or resurrect a deletion`() {
+        for (delete in listOf(false, true)) {
+            lateinit var pending: Continuation<Response<SessionListResponse>>
+            coEvery { api.getSessions(any(), any(), any(), any(), any()) } coAnswers {
+                suspendCoroutine { pending = it }
+            }
+            coEvery { api.renameSession(any(), any()) } returns Response.success(Unit)
+            coEvery { api.deleteSession(any()) } returns Response.success(Unit)
+            val vm = viewModel()
+            vm.loadSessions()
+            dispatcher.scheduler.advanceUntilIdle()
+            if (delete) {
+                vm.requestDeleteSession("a")
+                vm.confirmDeleteSession()
+            } else {
+                vm.renameSession("a", "New")
+            }
+            dispatcher.scheduler.advanceUntilIdle()
+            pending.resume(
+                Response.success(
+                    SessionListResponse(
+                        sessions = listOf(SessionInfo(id = "a", title = "Old")),
+                        total = 1,
+                    ),
+                ),
+            )
+            dispatcher.scheduler.advanceUntilIdle()
+            assertTrue(vm.uiState.value.sessions.isEmpty())
+            assertFalse(vm.uiState.value.isLoading)
+            if (!delete) assertEquals("New", vm.uiState.value.searchTitles["a"])
+        }
+    }
+
+    @Test
+    fun `partial bulk reconciliation fences an older search response`() {
+        lateinit var stale: Continuation<Response<SessionSearchResponse>>
+        var calls = 0
+        coEvery { api.searchSessions(any(), any(), any(), any()) } coAnswers {
+            if (calls++ == 0) suspendCoroutine { stale = it } else hits("survivor")
+        }
+        coEvery { api.bulkDeleteSessions(any()) } returns Response.success(BulkDeleteResponse(ok = true, deleted = 1))
+        val vm = viewModel()
+        vm.setSearchQuery("a")
+        dispatcher.scheduler.advanceUntilIdle()
+        vm.selectAll(setOf("gone", "survivor"))
+        vm.confirmBulkDelete()
+        dispatcher.scheduler.advanceUntilIdle()
+        stale.resume(hits("gone", "survivor"))
+        dispatcher.scheduler.advanceUntilIdle()
+        assertEquals(listOf("survivor"), vm.uiState.value.searchResults.map { it.session_id })
+        assertFalse(vm.uiState.value.isSearching)
+    }
+
+    @Test
+    fun `mutation fences pending next page and pinned hydration`() {
+        for (hydrate in listOf(false, true)) {
+            coEvery { api.getSessions(any(), 0, any(), any(), any()) } returns
+                Response.success(SessionListResponse(listOf(SessionInfo("base")), total = 2))
+            lateinit var page: Continuation<Response<SessionListResponse>>
+            lateinit var pin: Continuation<Response<SessionInfo>>
+            coEvery { api.getSessions(any(), 1, any(), any(), any()) } coAnswers {
+                suspendCoroutine { page = it }
+            }
+            coEvery { api.getSessionLatestDescendant("a") } returns
+                Response.success(SessionLatestDescendantResponse("a"))
+            coEvery { api.getSession("a") } coAnswers { suspendCoroutine { pin = it } }
+            coEvery { api.deleteSession("a") } returns Response.success(Unit)
+            val vm =
+                SessionsViewModel(
+                    pinStore = SearchReviewPinStore(if (hydrate) listOf("a") else emptyList()),
+                    ioDispatcher = dispatcher,
+                )
+            vm.loadSessions()
+            dispatcher.scheduler.advanceUntilIdle()
+            if (!hydrate) {
+                vm.loadMore()
+                dispatcher.scheduler.advanceUntilIdle()
+            }
+            vm.requestDeleteSession("a")
+            vm.confirmDeleteSession()
+            dispatcher.scheduler.advanceUntilIdle()
+            if (hydrate) {
+                pin.resume(Response.success(SessionInfo("a")))
+            } else {
+                page.resume(Response.success(SessionListResponse(listOf(SessionInfo("a")), total = 2)))
+            }
+            dispatcher.scheduler.advanceUntilIdle()
+            assertEquals(listOf("base"), vm.uiState.value.sessions.map { it.id })
+            assertFalse(vm.uiState.value.isLoadingMore)
+        }
+    }
 
     @Test
     fun `dedupe keeps the first surfaced ID in server order`() {

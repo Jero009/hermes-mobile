@@ -102,6 +102,19 @@ class SessionsViewModel(
     private var loadJob: Job? = null
     private var loadMoreJob: Job? = null
     private var loadGeneration = 0
+    private var mutationOperation = 0L
+    private val deleteOperations = mutableMapOf<String, Long>()
+    private var bulkDeleteOperation = 0L
+
+    /** Fence pre-mutation pages and pin hydration, including cancellation-resistant calls. */
+    private fun fencePendingSessionLoads() {
+        loadGeneration += 1
+        loadJob?.cancel()
+        loadMoreJob?.cancel()
+        hydratePinsJob?.cancel()
+        _uiState.update { it.copy(isLoading = false, isLoadingMore = false) }
+    }
+
     private var statsJob: Job? = null
     private var hydratePinsJob: Job? = null
     private var liveTrackingJob: Job? = null
@@ -510,6 +523,7 @@ class SessionsViewModel(
             if (api !== ApiClient.hermesApi || profileId != AuthManager.getSelectedProfileId()) return@launch
             when (result) {
                 is NetworkResult.Success -> {
+                    fencePendingSessionLoads()
                     _uiState.update {
                         it.copy(
                             renamingSessionId = null,
@@ -547,6 +561,8 @@ class SessionsViewModel(
 
     fun confirmDeleteSession() {
         val sessionId = _uiState.value.sessionToDeleteConfirm ?: return
+        val operation = ++mutationOperation
+        deleteOperations[sessionId] = operation
         _uiState.update {
             it.copy(
                 sessionToDeleteConfirm = null,
@@ -560,9 +576,15 @@ class SessionsViewModel(
                 safeApiCall {
                     api.deleteSession(sessionId)
                 }
-            if (api !== ApiClient.hermesApi || profileId != AuthManager.getSelectedProfileId()) return@launch
+            if (deleteOperations[sessionId] != operation) return@launch
+            deleteOperations.remove(sessionId)
+            if (api !== ApiClient.hermesApi || profileId != AuthManager.getSelectedProfileId()) {
+                _uiState.update { it.copy(deletingSessionIds = it.deletingSessionIds - sessionId) }
+                return@launch
+            }
             when (result) {
                 is NetworkResult.Success -> {
+                    fencePendingSessionLoads()
                     deletedSearchIds += sessionId
                     val state = _uiState.value
                     val updatedPins =
@@ -612,6 +634,8 @@ class SessionsViewModel(
     fun confirmBulkDelete() {
         val ids = _uiState.value.selectedIds.toList()
         if (ids.isEmpty()) return
+        val operation = ++mutationOperation
+        bulkDeleteOperation = operation
 
         _uiState.update { it.copy(showBulkDeleteConfirm = false, isDeletingBulk = true) }
         val api = ApiClient.hermesApi
@@ -623,12 +647,19 @@ class SessionsViewModel(
                         body = BulkDeleteRequest(ids = ids),
                     )
                 }
-            if (api !== ApiClient.hermesApi || profileId != AuthManager.getSelectedProfileId()) return@launch
+            if (bulkDeleteOperation != operation) return@launch
+            if (api !== ApiClient.hermesApi || profileId != AuthManager.getSelectedProfileId()) {
+                _uiState.update { it.copy(isDeletingBulk = false) }
+                return@launch
+            }
             when (result) {
                 is NetworkResult.Success -> {
                     val deletedCount = result.data.deleted
                     val state = _uiState.value
-                    val deletedIds = ids.toSet()
+                    fencePendingSessionLoads()
+                    // A count alone cannot identify which rows survived a partial response.
+                    val complete = result.data.ok && deletedCount == ids.size
+                    val deletedIds = if (complete) ids.toSet() else emptySet()
                     deletedSearchIds += deletedIds
                     val updatedPins =
                         remainingPinsAfterDeleting(
@@ -640,10 +671,11 @@ class SessionsViewModel(
                         pinStore.save(updatedPins)
                     }
                     val toastMsg =
-                        if (deletedCount > 0) {
-                            "$deletedCount session(s) deleted"
-                        } else {
-                            "No sessions were deleted"
+                        when {
+                            !result.data.ok -> "Deletion was not confirmed; refreshing sessions"
+                            complete -> "$deletedCount session(s) deleted"
+                            deletedCount == 0 -> "No sessions were deleted"
+                            else -> "Partial deletion reported; refreshing sessions"
                         }
                     _uiState.update {
                         it.copy(
@@ -660,6 +692,7 @@ class SessionsViewModel(
                             toastMessage = toastMsg,
                         )
                     }
+                    if (!complete && _uiState.value.isSearchMode) setSearchQuery(_uiState.value.searchQuery)
                     loadSessions()
                     loadStats()
                 }
