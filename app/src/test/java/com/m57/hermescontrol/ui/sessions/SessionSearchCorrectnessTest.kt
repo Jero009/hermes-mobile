@@ -48,6 +48,16 @@ class SessionSearchCorrectnessTest {
         unmockkAll()
     }
 
+    private class FakeSessionPinStore(
+        private var pins: List<String>,
+    ) : SessionPinStore {
+        override fun load(): List<String> = pins
+
+        override fun save(pinIds: List<String>) {
+            pins = pinIds
+        }
+    }
+
     private fun viewModel() = SessionsViewModel(pinStore = FakeSessionPinStore(emptyList()), ioDispatcher = dispatcher)
 
     private fun hits(vararg ids: String) = Response.success(SessionSearchResponse(ids.map { SessionSearchResult(it) }))
