@@ -1401,7 +1401,10 @@ private fun nextCodeRuns(text: String): Map<Int, Int> {
 
 // Pair runs once, discarding unmatched inner openers instead of hiding an outer close.
 // Each opener is pushed/popped at most once; code and link destinations are opaque.
-internal fun emphasisPairs(text: String, codeRuns: Map<Int, Int>): Map<Int, Int> {
+internal fun emphasisPairs(
+    text: String,
+    codeRuns: Map<Int, Int>,
+): Map<Int, Int> {
     val pairs = mutableMapOf<Int, Int>()
     val starts = mutableListOf<Int>()
     val widths = mutableListOf<Int>()
@@ -1410,7 +1413,11 @@ internal fun emphasisPairs(text: String, codeRuns: Map<Int, Int>): Map<Int, Int>
     for (index in text.indices.reversed()) {
         nextParen[index] = if (text[index] == ')') index else nextParen[index + 1]
     }
-    fun consume(start: Int, width: Int) {
+
+    fun consume(
+        start: Int,
+        width: Int,
+    ) {
         val match = byWidth[width].lastOrNull()
         if (match == null) {
             byWidth[width].add(starts.size)
@@ -1512,10 +1519,17 @@ private fun parseInlineSource(
                     val end = emphasis[i] ?: -1
                     if (end >= 0) {
                         val raw = src.substring(i + 3, end)
-                        val content = parseInlineSource(
-                            raw, textColor, searchQuery, isCurrentMatch, linkColor, highlights,
-                            isRtl && !BidiUtils.isLtrSnippet(raw), depth + 1,
-                        ).isolateLtrSnippet(isRtl)
+                        val content =
+                            parseInlineSource(
+                                raw,
+                                textColor,
+                                searchQuery,
+                                isCurrentMatch,
+                                linkColor,
+                                highlights,
+                                isRtl && !BidiUtils.isLtrSnippet(raw),
+                                depth + 1,
+                            ).isolateLtrSnippet(isRtl)
                         withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic)) {
                             append(content)
                         }

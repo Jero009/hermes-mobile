@@ -70,13 +70,17 @@ class MarkdownTextFeatureTest {
     fun tripleEmphasisRecursivelyRendersOpaqueCode() {
         val parsed = parseInline("***outer `***` tail***", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
         assertEquals("outer *** tail", parsed.text)
-        assertTrue(parsed.spanStyles.any {
-            it.start == 0 && it.end == parsed.length &&
-                it.item.fontWeight == FontWeight.Bold && it.item.fontStyle == FontStyle.Italic
-        })
-        assertTrue(parsed.spanStyles.any {
-            it.start == 6 && it.end == 9 && it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace
-        })
+        assertTrue(
+            parsed.spanStyles.any {
+                it.start == 0 && it.end == parsed.length &&
+                    it.item.fontWeight == FontWeight.Bold && it.item.fontStyle == FontStyle.Italic
+            },
+        )
+        assertTrue(
+            parsed.spanStyles.any {
+                it.start == 6 && it.end == 9 && it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace
+            },
+        )
     }
 
     @Test(timeout = 5000)
