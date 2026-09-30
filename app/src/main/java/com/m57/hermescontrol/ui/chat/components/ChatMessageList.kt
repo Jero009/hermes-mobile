@@ -27,6 +27,14 @@ import com.m57.hermescontrol.ui.common.EmptyState
 
 internal val CHAT_LIST_VERTICAL_CONTENT_PADDING = 8.dp
 
+internal fun chatMessageContentType(message: ChatMessage): String =
+    when {
+        message.approvalInfo != null -> "approval"
+        message.clarifyInfo != null -> "clarify"
+        message.displayKind != null -> "system_event"
+        else -> message.role.name
+    }
+
 internal fun chatListItemCount(
     messageCount: Int,
     hasStreamingMessage: Boolean,
@@ -84,7 +92,7 @@ fun ChatMessageList(
             contentPadding = PaddingValues(vertical = CHAT_LIST_VERTICAL_CONTENT_PADDING),
         ) {
             if (isLoadingOlder) {
-                item(key = "loading-older") {
+                item(key = "loading-older", contentType = "loading-older") {
                     Box(
                         modifier = Modifier.fillMaxWidth().padding(12.dp),
                         contentAlignment = Alignment.Center,
@@ -96,6 +104,7 @@ fun ChatMessageList(
             itemsIndexed(
                 items = messages,
                 key = { _, message -> message.id },
+                contentType = { _, message -> chatMessageContentType(message) },
             ) { index, message ->
                 val isCurrentMatch =
                     isSearchActive &&
@@ -134,7 +143,7 @@ fun ChatMessageList(
 
             // Streaming message
             streamingMessage?.let { streaming ->
-                item(key = "streaming-${streaming.id}") {
+                item(key = "streaming-${streaming.id}", contentType = chatMessageContentType(streaming)) {
                     if (typingEffectEnabled && streaming.isStreaming) {
                         StreamingBubbleWithTypingEffect(
                             streaming = streaming,
@@ -157,14 +166,14 @@ fun ChatMessageList(
 
             // Typing indicator — bouncing dots
             if (isThinking) {
-                item(key = "typing_indicator") {
+                item(key = "typing_indicator", contentType = "typing_indicator") {
                     TypingIndicator()
                 }
             }
 
             // Clarify bubble — rendered at the very bottom
             if (clarifyRequest != null) {
-                item(key = "clarify_bubble") {
+                item(key = "clarify_bubble", contentType = "clarify") {
                     ClarifyBubble(
                         clarifyRequest = clarifyRequest,
                         onSubmit = { expected, answers -> onRespondClarify?.invoke(expected, answers) },
