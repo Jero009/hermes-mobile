@@ -2,6 +2,7 @@ package com.m57.hermescontrol.ui.sessions
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.model.BulkDeleteRequest
 import com.m57.hermescontrol.data.model.PruneRequest
 import com.m57.hermescontrol.data.model.SessionInfo
@@ -9,6 +10,7 @@ import com.m57.hermescontrol.data.model.SessionLiveStatus
 import com.m57.hermescontrol.data.model.SessionRenameRequest
 import com.m57.hermescontrol.data.model.SessionSearchResult
 import com.m57.hermescontrol.data.remote.ApiClient
+import com.m57.hermescontrol.data.remote.HermesApiService
 import com.m57.hermescontrol.data.remote.NetworkResult
 import com.m57.hermescontrol.data.remote.safeApiCall
 import com.m57.hermescontrol.data.ws.ConnectionStatus
@@ -75,6 +77,7 @@ data class SessionsUiState(
     val isSearching: Boolean = false,
     val searchResults: List<SessionSearchResult> = emptyList(),
     val searchError: String? = null,
+    val searchTitles: Map<String, String> = emptyMap(),
     val liveStatuses: Map<String, SessionLiveStatus> = emptyMap(),
     val liveStatusesAuthoritative: Boolean = false,
 ) {
@@ -99,6 +102,19 @@ class SessionsViewModel(
     private var loadJob: Job? = null
     private var loadMoreJob: Job? = null
     private var loadGeneration = 0
+    private var mutationOperation = 0L
+    private val deleteOperations = mutableMapOf<String, Long>()
+    private var bulkDeleteOperation = 0L
+
+    /** Fence pre-mutation pages and pin hydration, including cancellation-resistant calls. */
+    private fun fencePendingSessionLoads() {
+        loadGeneration += 1
+        loadJob?.cancel()
+        loadMoreJob?.cancel()
+        hydratePinsJob?.cancel()
+        _uiState.update { it.copy(isLoading = false, isLoadingMore = false) }
+    }
+
     private var statsJob: Job? = null
     private var hydratePinsJob: Job? = null
     private var liveTrackingJob: Job? = null
@@ -320,6 +336,10 @@ class SessionsViewModel(
     // ── Search (server-backed FTS5) ──────────────────────────────────
 
     private var searchJob: Job? = null
+    private var searchGeneration = 0L
+    private var searchApi: HermesApiService? = null
+    private var searchProfileId: String? = null
+    private val deletedSearchIds = mutableSetOf<String>()
 
     /**
      * Debounced server-side session search. A non-blank query schedules a search
@@ -327,10 +347,26 @@ class SessionsViewModel(
      * paginated list mode.
      */
     fun setSearchQuery(query: String) {
-        val generation = loadGeneration
+        val generation = ++searchGeneration
         val section = _uiState.value.section
-        _uiState.update { it.copy(searchQuery = query, searchResults = emptyList()) }
+        val api = ApiClient.hermesApi
+        val profileId = AuthManager.getSelectedProfileId()
+        val connectionChanged = searchApi !== api || searchProfileId != profileId
+        searchApi = api
+        searchProfileId = profileId
+        if (connectionChanged) deletedSearchIds.clear()
         searchJob?.cancel()
+        _uiState.update {
+            it.copy(
+                searchQuery = query,
+                searchResults = emptyList(),
+                searchError = null,
+                isSearching = query.isNotBlank(),
+                searchTitles = if (connectionChanged) emptyMap() else it.searchTitles,
+                isSelecting = false,
+                selectedIds = emptySet(),
+            )
+        }
         if (query.isBlank()) {
             _uiState.update {
                 it.copy(searchResults = emptyList(), searchError = null, isSearching = false)
@@ -342,23 +378,50 @@ class SessionsViewModel(
         searchJob =
             viewModelScope.launch {
                 delay(SEARCH_DEBOUNCE_MS)
-                _uiState.update { it.copy(isSearching = true, searchError = null) }
+                if (api !== ApiClient.hermesApi || profileId != AuthManager.getSelectedProfileId()) {
+                    if (generation == searchGeneration) {
+                        _uiState.update {
+                            it.copy(
+                                isSearching = false,
+                                searchResults = emptyList(),
+                                searchError = null,
+                                searchTitles = emptyMap(),
+                            )
+                        }
+                    }
+                    return@launch
+                }
                 val result =
                     safeApiCall {
-                        ApiClient.hermesApi.searchSessions(
+                        api.searchSessions(
                             q = query,
                             profile = null,
                             source = section.source,
                             excludeSources = section.excludeSources,
                         )
                     }
-                if (generation != loadGeneration || _uiState.value.searchQuery != query) return@launch
+                // #1186: query text alone cannot fence an A -> B -> A race.
+                if (generation != searchGeneration || _uiState.value.section != section) return@launch
+                if (api !== ApiClient.hermesApi || profileId != AuthManager.getSelectedProfileId()) {
+                    _uiState.update {
+                        it.copy(
+                            isSearching = false,
+                            searchResults = emptyList(),
+                            searchError = null,
+                            searchTitles = emptyMap(),
+                        )
+                    }
+                    return@launch
+                }
                 when (result) {
                     is NetworkResult.Success -> {
                         _uiState.update {
                             it.copy(
                                 isSearching = false,
-                                searchResults = result.data.results.orEmpty(),
+                                // #1186: LazyList uses surfaced session IDs, not lineage roots.
+                                searchResults =
+                                    result.data.results.distinctBy { hit -> hit.session_id }
+                                        .filterNot { hit -> hit.session_id in deletedSearchIds },
                                 searchError = null,
                             )
                         }
@@ -447,16 +510,20 @@ class SessionsViewModel(
             _uiState.update { it.copy(renamingSessionId = null, toastMessage = "Title cannot be empty") }
             return
         }
+        val api = ApiClient.hermesApi
+        val profileId = AuthManager.getSelectedProfileId()
         viewModelScope.launch {
             val result =
                 safeApiCall {
-                    ApiClient.hermesApi.renameSession(
+                    api.renameSession(
                         sessionId = sessionId,
                         body = SessionRenameRequest(title = newTitle),
                     )
                 }
+            if (api !== ApiClient.hermesApi || profileId != AuthManager.getSelectedProfileId()) return@launch
             when (result) {
                 is NetworkResult.Success -> {
+                    fencePendingSessionLoads()
                     _uiState.update {
                         it.copy(
                             renamingSessionId = null,
@@ -464,6 +531,7 @@ class SessionsViewModel(
                                 it.sessions.map { s ->
                                     if (s.id == sessionId) s.copy(title = newTitle) else s
                                 },
+                            searchTitles = it.searchTitles + (sessionId to newTitle),
                             toastMessage = "Session renamed",
                         )
                     }
@@ -493,19 +561,31 @@ class SessionsViewModel(
 
     fun confirmDeleteSession() {
         val sessionId = _uiState.value.sessionToDeleteConfirm ?: return
+        val operation = ++mutationOperation
+        deleteOperations[sessionId] = operation
         _uiState.update {
             it.copy(
                 sessionToDeleteConfirm = null,
                 deletingSessionIds = it.deletingSessionIds + sessionId,
             )
         }
+        val api = ApiClient.hermesApi
+        val profileId = AuthManager.getSelectedProfileId()
         viewModelScope.launch {
             val result =
                 safeApiCall {
-                    ApiClient.hermesApi.deleteSession(sessionId)
+                    api.deleteSession(sessionId)
                 }
+            if (deleteOperations[sessionId] != operation) return@launch
+            deleteOperations.remove(sessionId)
+            if (api !== ApiClient.hermesApi || profileId != AuthManager.getSelectedProfileId()) {
+                _uiState.update { it.copy(deletingSessionIds = it.deletingSessionIds - sessionId) }
+                return@launch
+            }
             when (result) {
                 is NetworkResult.Success -> {
+                    fencePendingSessionLoads()
+                    deletedSearchIds += sessionId
                     val state = _uiState.value
                     val updatedPins =
                         remainingPinsAfterDeleting(
@@ -554,20 +634,33 @@ class SessionsViewModel(
     fun confirmBulkDelete() {
         val ids = _uiState.value.selectedIds.toList()
         if (ids.isEmpty()) return
+        val operation = ++mutationOperation
+        bulkDeleteOperation = operation
 
         _uiState.update { it.copy(showBulkDeleteConfirm = false, isDeletingBulk = true) }
+        val api = ApiClient.hermesApi
+        val profileId = AuthManager.getSelectedProfileId()
         viewModelScope.launch {
             val result =
                 safeApiCall {
-                    ApiClient.hermesApi.bulkDeleteSessions(
+                    api.bulkDeleteSessions(
                         body = BulkDeleteRequest(ids = ids),
                     )
                 }
+            if (bulkDeleteOperation != operation) return@launch
+            if (api !== ApiClient.hermesApi || profileId != AuthManager.getSelectedProfileId()) {
+                _uiState.update { it.copy(isDeletingBulk = false) }
+                return@launch
+            }
             when (result) {
                 is NetworkResult.Success -> {
                     val deletedCount = result.data.deleted
                     val state = _uiState.value
-                    val deletedIds = ids.toSet()
+                    fencePendingSessionLoads()
+                    // A count alone cannot identify which rows survived a partial response.
+                    val complete = result.data.ok && deletedCount == ids.size
+                    val deletedIds = if (complete) ids.toSet() else emptySet()
+                    deletedSearchIds += deletedIds
                     val updatedPins =
                         remainingPinsAfterDeleting(
                             pinnedSessionIds = state.pinnedSessionIds,
@@ -578,10 +671,11 @@ class SessionsViewModel(
                         pinStore.save(updatedPins)
                     }
                     val toastMsg =
-                        if (deletedCount > 0) {
-                            "$deletedCount session(s) deleted"
-                        } else {
-                            "No sessions were deleted"
+                        when {
+                            !result.data.ok -> "Deletion was not confirmed; refreshing sessions"
+                            complete -> "$deletedCount session(s) deleted"
+                            deletedCount == 0 -> "No sessions were deleted"
+                            else -> "Partial deletion reported; refreshing sessions"
                         }
                     _uiState.update {
                         it.copy(
@@ -598,6 +692,7 @@ class SessionsViewModel(
                             toastMessage = toastMsg,
                         )
                     }
+                    if (!complete && _uiState.value.isSearchMode) setSearchQuery(_uiState.value.searchQuery)
                     loadSessions()
                     loadStats()
                 }

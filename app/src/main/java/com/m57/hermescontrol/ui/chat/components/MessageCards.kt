@@ -78,8 +78,12 @@ import com.m57.hermescontrol.theme.CodeTerminalBg
 import com.m57.hermescontrol.theme.CodeTerminalBorder
 import com.m57.hermescontrol.theme.CodeTerminalMuted
 import com.m57.hermescontrol.theme.CodeTerminalText
+import com.m57.hermescontrol.theme.LocalHermesStatusColors
+import com.m57.hermescontrol.theme.searchHighlightColors
 import com.m57.hermescontrol.ui.chat.ClarifyUi
+import com.m57.hermescontrol.ui.chat.MarkdownText
 import com.m57.hermescontrol.ui.chat.SubagentIndicator
+import com.m57.hermescontrol.ui.chat.withSearchHighlights
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -90,7 +94,7 @@ import kotlinx.coroutines.withContext
  * (reasoning-model thinking steps) before the final answer.
  *
  * Collapsed: "🧠 Reasoning · {N} steps" with chevron.
- * Expanded: full reasoning text in monospace bodySmall.
+ * Expanded: completed reasoning is Markdown; streaming reasoning remains raw text.
  * Streaming: pulsing indicator at bottom while [isStreaming].
  */
 @Composable
@@ -98,7 +102,10 @@ fun ReasoningCard(
     reasoningText: String,
     isStreaming: Boolean = false,
     modifier: Modifier = Modifier,
+    searchQuery: String = "",
+    isCurrentMatch: Boolean = false,
 ) {
+    val highlights = searchHighlightColors(LocalHermesStatusColors.current)
     var expanded by remember { mutableStateOf(false) }
     val stepCount = remember(reasoningText) { reasoningText.count { it == '\n' } + 1 }
 
@@ -137,12 +144,27 @@ fun ReasoningCard(
             }
             AnimatedVisibility(visible = expanded) {
                 Column {
-                    Text(
-                        text = reasoningText,
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 4.dp),
-                    )
+                    if (isStreaming) {
+                        Text(
+                            text =
+                                AnnotatedString(reasoningText).withSearchHighlights(
+                                    searchQuery,
+                                    isCurrentMatch,
+                                    highlights,
+                                ),
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    } else {
+                        MarkdownText(
+                            text = reasoningText,
+                            textColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            searchQuery = searchQuery,
+                            isCurrentMatch = isCurrentMatch,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
                     if (isStreaming) {
                         ReasoningPulsingDot(modifier = Modifier.padding(top = 6.dp))
                     }
@@ -199,7 +221,10 @@ fun CodeBlockCard(
     language: String?,
     onCopy: (String) -> Unit,
     modifier: Modifier = Modifier,
+    searchQuery: String = "",
+    isCurrentMatch: Boolean = false,
 ) {
+    val highlights = searchHighlightColors(LocalHermesStatusColors.current)
     val context = LocalContext.current
 
     Surface(
@@ -262,7 +287,10 @@ fun CodeBlockCard(
                     }
             }
             Text(
-                text = highlighted,
+                text =
+                    remember(highlighted, searchQuery, isCurrentMatch, highlights) {
+                        highlighted.withSearchHighlights(searchQuery, isCurrentMatch, highlights)
+                    },
                 fontFamily = FontFamily.Monospace,
                 fontSize = 13.sp,
                 color = CodeTerminalText,

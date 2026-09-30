@@ -99,7 +99,55 @@ substitute for the full release validation matrix.
 These commits are beyond the contiguous `UPSTREAM.json` reviewed range;
 `reviewed_through` and its entries are intentionally unchanged.
 
-## Validation and release boundary
+## Rendering, language, and plan ports (2026-09-30)
+
+Based on fork `2b8e0647154e393ff4584d3b8f701b8e480134d9`; inspected against
+upstream main `ed915d08169469f9ea6c63357fa584ccbd40a919` and dev
+`ee1d7a0b7527f6e2ac88bee6df96c24e5e4883bd`. Sara requested upstream
+integration with as much autonomous implementation as possible. Existing
+owner holds remain in force. These are selective adaptations, not an ancestry
+merge or a claim that all intervening commits were reviewed.
+
+- `1ba1a62f319df0ecbaf1aa14623f61548e638912`: nested inline emphasis, code
+  delimiters, and styled link labels in the downstream Markdown parser.
+- `e80b00a6a73eb112d420ed280c99e1830342df3c`: inline Markdown and formula
+  rendering in table cells; preserve ambient table structure direction.
+- `83ac8a3418ffc660f41ab4cf760ec8ee05cc53a7`: completed reasoning renders
+  Markdown; streaming reasoning remains plain text.
+- `4f14ecac4b19448e1176cedc71f5b26ce1df1927`: additive search highlights on
+  styled text and syntax-highlighted code. No full upstream search-controller,
+  occurrence navigation, or reasoning/tool match-discovery port.
+- `18953e368b3fa73ae6f82070bf727b2d614d4ca1`: single prefix-gated URL match
+  and memoized inline formulas with complete search/style inputs.
+- `4fc4d097ccb196570fe57206f9a1a6b060912b7f` and
+  `6a00696e68d09f1c1114c5e0ca6c813dc680e611`: memoized typing display and
+  transcript content types, retaining stable keys and downstream bubble layout.
+- `7c00f4407dfe722567ea5b6b6417a999df0ed415`: Arabic language selection and
+  translations matching downstream resources. Untranslated downstream keys use
+  English fallback; sparse locale overrides retain window geometry/font scale.
+- `9690ce8dc63dd5fa278c45c882802edf3ace2e1d`: deduplicate History search
+  results and fence obsolete query/connection responses. Confirmed renames are
+  displayed as titles; confirmed deletions cannot be resurrected by an older
+  search response. No new search pagination or backend contract.
+- `ceb48132181348a9f752db5ce9d26b54fb305bb7`: parent-aware todo parsing and
+  bounded, cycle-safe hierarchy rendering. No revisioned `todo.updated` live
+  snapshot protocol. Duplicate IDs, orphan references, and rootless cycles
+  retain every source occurrence.
+
+Existing non-Google speech support (`dbd7008ee39818f96b16ab4a9c79d94508c98c9d`)
+was verified against downstream `1d358d96daa9fba85956a2c99287ee8c8a43a81e` and
+its earlier implementation commits. No second source port is needed. The
+ledger's post-base resolution requirement prevents recording historical
+source equivalence as a new resolution; that policy is not waived here.
+
+Nested block/content-sized table work, full reasoning/tool search, dependency
+migrations, the management-profile experiment, auth/header changes, updater
+work, signing changes, and broad refactors are not included.
+
+## Previous reliability-batch validation and release boundary
+
+The following evidence covers the preceding 2026-09-27 reliability batch,
+not the 2026-09-30 candidate.
 
 Independent specification and code-quality reviews were completed, including
 corrections and targeted regression tests. Both-flavor unit tests, Android lint,

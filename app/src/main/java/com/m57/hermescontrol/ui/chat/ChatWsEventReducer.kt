@@ -875,7 +875,8 @@ fun extractTodosFromMap(data: Map<String, Any?>?): List<TodoItem>? {
         val id = (map["id"] as? String) ?: continue
         val content = (map["content"] as? String) ?: (map["text"] as? String) ?: ""
         val status = (map["status"] as? String) ?: "pending"
-        items.add(TodoItem(id = id, content = content, status = status))
+        val parent = (map["parent"] as? String)?.takeIf { it.isNotBlank() }
+        items.add(TodoItem(id = id, content = content, status = status, parent = parent))
     }
     return items.takeIf { it.isNotEmpty() }
 }
@@ -899,7 +900,12 @@ fun extractTodosFromJson(content: String): List<TodoItem>? {
                 (itemObj["content"] as? JsonPrimitive)?.content
                     ?: (itemObj["text"] as? JsonPrimitive)?.content ?: ""
             val status = (itemObj["status"] as? JsonPrimitive)?.content ?: "pending"
-            TodoItem(id = id, content = contentStr, status = status)
+            val parent =
+                (itemObj["parent"] as? JsonPrimitive)
+                    ?.takeIf { it.isString }
+                    ?.content
+                    ?.takeIf { it.isNotBlank() }
+            TodoItem(id = id, content = contentStr, status = status, parent = parent)
         }.takeIf { it.isNotEmpty() }
     } catch (_: Exception) {
         null

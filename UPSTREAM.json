@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "fork_base": "58edff30806ed460342e6e469bbbc6706125829d",
+  "fork_base": "2b8e0647154e393ff4584d3b8f701b8e480134d9",
   "review_start_exclusive": "daf33dcb4c8f7fdafc890acfffc2fbb04569f004",
   "reviewed_through": "74cabbe681e47067d63f716eaf33c190b7dc46ba",
   "entries": [
@@ -1069,6 +1069,26 @@
       "disposition": "accepted",
       "reason": "downstream-adaptation",
       "downstream_commit": "0a5c50c898349e72eda454276318921a2d5bd3e7"
+    },
+    {
+      "upstream_commit": "7c00f4407dfe722567ea5b6b6417a999df0ed415",
+      "disposition": "accepted",
+      "reason": "downstream-adaptation",
+      "downstream_commit": "522c5b1666fd12f54a6434e94d51bb979a508aec"
+    },
+    {
+      "upstream_commit": "ceb48132181348a9f752db5ce9d26b54fb305bb7",
+      "disposition": "partial",
+      "reason": "downstream-adaptation",
+      "downstream_commit": "267510643fa2bcfe3c8c1e73799309f75bb3b1c0",
+      "scope": [
+        "app/src/main/java/com/m57/hermescontrol/ui/chat/ChatMessage.kt",
+        "app/src/main/java/com/m57/hermescontrol/ui/chat/ChatWsEventReducer.kt",
+        "app/src/main/java/com/m57/hermescontrol/ui/chat/components/SubagentInspectionSheet.kt",
+        "app/src/main/java/com/m57/hermescontrol/ui/chat/components/TodoHierarchy.kt",
+        "app/src/test/java/com/m57/hermescontrol/ui/chat/TodoParentPreservationTest.kt",
+        "app/src/test/java/com/m57/hermescontrol/ui/chat/components/TodoHierarchyTest.kt"
+      ]
     }
   ]
 }

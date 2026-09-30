@@ -276,7 +276,7 @@ private fun JsonElement.searchText(): String? =
 private fun displayedSessions(state: SessionsUiState): List<SessionTreeItem> =
     if (state.isSearchMode) {
         state.searchResults.map { searchResult ->
-            val session = searchResult.toSessionInfo()
+            val session = searchResult.toSessionInfo().copy(title = state.searchTitles[searchResult.session_id])
             SessionTreeItem(
                 session = session,
                 depth = 0,
@@ -290,6 +290,22 @@ private fun displayedSessions(state: SessionsUiState): List<SessionTreeItem> =
         }
     } else {
         flattenSessionTree(state.sessions)
+    }
+
+/** Every input read by the cached projection must participate in its remember key. */
+@Composable
+internal fun rememberSessionsToDisplay(
+    state: SessionsUiState,
+    sessionSections: SessionSections,
+): List<SessionTreeItem> =
+    remember(
+        state.isSearchMode,
+        state.searchQuery,
+        state.searchResults,
+        state.searchTitles,
+        sessionSections,
+    ) {
+        if (state.isSearchMode) displayedSessions(state) else sessionSections.pinned + sessionSections.recent
     }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -324,19 +340,7 @@ fun SessionsScreen(
                 pinnedSessionIds = state.pinnedSessionIds,
             )
         }
-    val sessionsToDisplay =
-        remember(
-            state.isSearchMode,
-            state.searchQuery,
-            state.searchResults,
-            sessionSections,
-        ) {
-            if (state.isSearchMode) {
-                displayedSessions(state)
-            } else {
-                sessionSections.pinned + sessionSections.recent
-            }
-        }
+    val sessionsToDisplay = rememberSessionsToDisplay(state, sessionSections)
 
     val hasSelection = state.selectedIds.isNotEmpty()
     val automationRunGroups =
@@ -432,6 +436,7 @@ fun SessionsScreen(
                 .find { it.id == sessionToDelete }
                 ?.title
                 ?.takeIf { it.isNotBlank() }
+                ?: state.searchTitles[sessionToDelete]?.takeIf(String::isNotBlank)
                 ?: state.searchResults
                     .find { it.session_id == sessionToDelete }
                     ?.snippet
@@ -1460,6 +1465,17 @@ private fun SearchResultCard(
                 }
 
                 Spacer(modifier = Modifier.height(spacing.xs))
+
+                // Locally confirmed renames are titles; legacy snippets remain excerpts.
+                session.title?.takeIf(String::isNotBlank)?.let { title ->
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(modifier = Modifier.height(spacing.xs))
+                }
 
                 // The matched snippet, highlighted — shown as the body, NOT as a title.
                 Text(
