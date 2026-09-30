@@ -247,6 +247,7 @@
     <string name="settings_item_language">언어</string>
     <string name="language_system">시스템</string>
     <string name="language_english">영어</string>
+    <string name="language_arabic">العربية</string>
     <string name="language_chinese">중국어</string>
     <string name="language_japanese">일본어</string>
     <string name="language_korean">한국어</string>
