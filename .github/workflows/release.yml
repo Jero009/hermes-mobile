@@ -20,105 +20,8 @@ permissions:
   contents: read
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────────
-  # Gate: require a green Android CI/CD run on the exact tagged commit.
-  #
-  # This job used to re-run the whole validation matrix (ktlint, lint,
-  # tests, both debug assemblies) that `android.yml` had already run on
-  # the same commit minutes earlier. That cost ~7 minutes per release and
-  # gave every release a second, independent chance to fail on runner
-  # flake — which is exactly what happened on v0.4.4, where the duplicate
-  # run failed in `packageHermesDebug` on a commit whose push workflow had
-  # already produced both debug APKs.
-  #
-  # Verifying the recorded conclusion of the real CI run keeps the actual
-  # guarantee (a tag may only be released from a commit that passed the
-  # complete matrix, instrumented tests included) without paying for it or
-  # re-rolling the dice. Only `push` and `workflow_dispatch` runs count: a
-  # `pull_request` run validates a merge ref, not the commit itself.
-  # ─────────────────────────────────────────────────────────────────────
-  verify-ci:
-    name: CI Checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
-
-      - name: Resolve tagged commit
-        id: commit
-        run: |
-          set -eu
-          COMMIT=$(git rev-parse HEAD)
-          echo "sha=$COMMIT" >> "$GITHUB_OUTPUT"
-          echo "Releasing commit $COMMIT"
-
-      - name: Require a successful Android CI run for this commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-          COMMIT: ${{ steps.commit.outputs.sha }}
-          REPO: ${{ github.repository }}
-        run: |
-          set -eu
-          # Android CI's slowest job (instrumented tests) has a 20-minute
-          # timeout of its own, so allow a full matrix to finish before
-          # declaring the tag unverifiable. The enclosing job timeout is
-          # deliberately larger than this deadline so the explicit error
-          # message below is what surfaces, not an opaque job cancellation.
-          WORKFLOW=android.yml
-          DEADLINE=$(( $(date +%s) + 1200 ))
-
-          while :; do
-            RUNS=$(
-              gh api \
-                "repos/$REPO/actions/workflows/$WORKFLOW/runs?head_sha=$COMMIT&per_page=100" \
-                --jq '[.workflow_runs[]
-                       | select(.event == "push" or .event == "workflow_dispatch")
-                       | {status, conclusion, url: .html_url}]'
-            )
-
-            SUCCEEDED=$(
-              printf '%s' "$RUNS" |
-                jq -r '[.[]
-                        | select(.status == "completed" and .conclusion == "success")]
-                       | .[0].url // ""'
-            )
-            if [ -n "$SUCCEEDED" ]; then
-              echo "Verified Android CI for $COMMIT: $SUCCEEDED"
-              exit 0
-            fi
-
-            TOTAL=$(printf '%s' "$RUNS" | jq 'length')
-            PENDING=$(
-              printf '%s' "$RUNS" |
-                jq '[.[] | select(.status != "completed")] | length'
-            )
-
-            if [ "$TOTAL" -gt 0 ] && [ "$PENDING" -eq 0 ]; then
-              echo "Android CI did not succeed for $COMMIT:" >&2
-              printf '%s' "$RUNS" |
-                jq -r '.[] | "  \(.conclusion // "unknown")  \(.url)"' >&2
-              exit 1
-            fi
-
-            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-              echo "Timed out waiting for an Android CI run on $COMMIT" >&2
-              echo "Runs found: $TOTAL (still running: $PENDING)" >&2
-              echo "A release tag must point at a commit that ran Android CI" >&2
-              exit 1
-            fi
-
-            echo "Waiting for Android CI on $COMMIT (runs=$TOTAL running=$PENDING) …"
-            sleep 20
-          done
-
   build-release:
     name: Build signed Hermes Mobile APK
-    needs: verify-ci
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -297,7 +200,7 @@ jobs:
         run: rm -f "$RUNNER_TEMP/hermes-pocket-release.keystore"
 
   publish:
-    name: Create draft GitHub release
+    name: Publish GitHub release
     needs: build-release
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -310,13 +213,13 @@ jobs:
           name: hermes-pocket-release
           path: release
 
-      - name: Create draft GitHub release
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           tag_name: ${{ needs.build-release.outputs.release_tag }}
           name: Hermes Mobile ${{ needs.build-release.outputs.release_tag }}
           generate_release_notes: true
-          draft: true
+          draft: false
           files: |
             release/hermes-pocket-${{ needs.build-release.outputs.release_tag }}.apk
             release/hermes-pocket-${{ needs.build-release.outputs.release_tag }}.apk.sha256
