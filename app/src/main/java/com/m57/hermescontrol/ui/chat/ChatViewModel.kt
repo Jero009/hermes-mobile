@@ -458,6 +458,9 @@ class ChatViewModel(
     /** One gateway.ready may arrive after the already-connected init path. */
     private var gatewayReadyHandled = false
 
+    /** The first session.list after opening Chat decides whether to resume or create. */
+    private var openLatestSessionOnNextList = false
+
     init {
         refreshSettings()
 
@@ -566,11 +569,13 @@ class ChatViewModel(
         gatewayReadyHandled = true
         _uiState.update { it.copy(isLoading = false) }
         addSystemMessage("Connected to Hermes")
+        val currentId = _uiState.value.currentSessionId
+        val initial = initialSessionId
+        openLatestSessionOnNextList = currentId == null && initial.isNullOrBlank()
         loadSessions()
         fetchCommandCatalog()
         fetchModelContextLength()
         preloadModelOptions()
-        val currentId = _uiState.value.currentSessionId
         if (currentId != null) {
             val resumeFence = captureResumeFence(currentId)
             viewModelScope.launch(Dispatchers.IO) {
@@ -584,12 +589,11 @@ class ChatViewModel(
             }
             loadSessionMessages(currentId)
         } else {
-            val initial = initialSessionId
             if (!initial.isNullOrBlank()) {
                 initialSessionId = null
                 switchSession(initial)
             } else {
-                createNewSession(setLoading = false)
+                _uiState.update { it.copy(isLoading = true) }
             }
         }
     }
@@ -1002,6 +1006,13 @@ class ChatViewModel(
                         chatTitle = newTitle ?: state.chatTitle,
                     )
                 }
+                if (openLatestSessionOnNextList) {
+                    openLatestSessionOnNextList = false
+                    if (_uiState.value.currentSessionId == null && initialSessionId.isNullOrBlank()) {
+                        sessions.firstOrNull()?.let { switchSession(it.id) }
+                            ?: createNewSession(setLoading = false)
+                    }
+                }
             }
 
             WsMethods.SESSION_RESUME -> {
@@ -1201,6 +1212,14 @@ class ChatViewModel(
                 }
                 return
             }
+        }
+
+        if (method == WsMethods.SESSION_LIST && openLatestSessionOnNextList) {
+            openLatestSessionOnNextList = false
+            if (_uiState.value.currentSessionId == null && initialSessionId.isNullOrBlank()) {
+                createNewSession(setLoading = false)
+            }
+            return
         }
 
         // Surface error in UI (these are server-pushed RpcError for

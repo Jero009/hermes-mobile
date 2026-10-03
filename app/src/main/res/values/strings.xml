@@ -124,7 +124,7 @@
     <string name="screen_logs">Logs</string>
     <string name="screen_kanban">Kanban</string>
     <string name="screen_achievements">Achievements</string>
-    <string name="screen_history">History</string>
+    <string name="screen_history">Previous sessions</string>
     <string name="screen_processes">Processes</string>
     <string name="screen_providers">Providers</string>
     <string name="screen_analytics">Analytics</string>

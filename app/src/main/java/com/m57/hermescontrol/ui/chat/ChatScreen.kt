@@ -38,6 +38,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -538,6 +539,13 @@ fun ChatScreen(
                         } else {
                             stringResource(R.string.chat_action_search)
                         },
+                )
+            }
+
+            IconButton(onClick = { NavigationController.navigateTo(HistoryScreen) }) {
+                Icon(
+                    imageVector = Icons.Filled.History,
+                    contentDescription = stringResource(R.string.screen_history),
                 )
             }
 

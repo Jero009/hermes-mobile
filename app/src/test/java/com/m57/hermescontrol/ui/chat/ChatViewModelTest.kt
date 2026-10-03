@@ -246,6 +246,13 @@ class ChatViewModelTest {
     private fun createViewModel(startCleanup: Boolean = false): ChatViewModel =
         ChatViewModel(app, startCleanup, fakeRepo, fakeSlashUsageStore, testDispatcher)
 
+    private suspend fun TestScope.respondToSessionList(sessions: List<Map<String, Any?>> = emptyList()) {
+        val requestId = sentRequestIds[WsMethods.SESSION_LIST]?.lastOrNull()
+        checkNotNull(requestId) { "session.list was not sent" }
+        mockEventsFlow.emit(WsEvent.RpcResult(requestId, mapOf("sessions" to sessions)))
+        advanceUntilIdle()
+    }
+
     /**
      * Create ViewModel, simulate GatewayReady, feed SESSION_CREATE result,
      * and return a Pair(viewModel, sessionId).
@@ -262,6 +269,7 @@ class ChatViewModelTest {
         mockConnectionStatus.value = ConnectionStatus.CONNECTED
         mockEventsFlow.emit(WsEvent.GatewayReady(null))
         advanceUntilIdle()
+        respondToSessionList()
 
         val createRequestId = sentRequestIds[WsMethods.SESSION_CREATE]?.lastOrNull()
         checkNotNull(createRequestId) { "session.create was not sent" }
@@ -1575,12 +1583,13 @@ class ChatViewModelTest {
         }
 
     @Test
-    fun testAlreadyConnectedOnLaunch_createsSession() =
+    fun testAlreadyConnectedOnLaunch_createsSessionWhenHistoryIsEmpty() =
         runTest {
             mockConnectionStatus.value = ConnectionStatus.CONNECTED
 
             createViewModel()
             advanceUntilIdle()
+            respondToSessionList()
 
             verify { HermesWsClient.send(WsMethods.SESSION_LIST, any(), any()) }
             verify { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
@@ -1595,6 +1604,7 @@ class ChatViewModelTest {
             mockConnectionStatus.value = ConnectionStatus.CONNECTED
             mockEventsFlow.emit(WsEvent.GatewayReady(null))
             advanceUntilIdle()
+            respondToSessionList()
 
             verify { HermesWsClient.send(WsMethods.SESSION_LIST, any(), any()) }
             verify { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
@@ -1611,6 +1621,7 @@ class ChatViewModelTest {
             mockEventsFlow.emit(WsEvent.GatewayReady(null))
             mockEventsFlow.emit(WsEvent.GatewayReady(null))
             advanceUntilIdle()
+            respondToSessionList()
 
             assertEquals(1, sentRequestIds[WsMethods.SESSION_CREATE]?.size)
         }
@@ -1652,10 +1663,11 @@ class ChatViewModelTest {
             mockConnectionStatus.value = ConnectionStatus.CONNECTED
             mockEventsFlow.emit(WsEvent.GatewayReady(null))
             advanceUntilIdle()
+            respondToSessionList()
 
-            // GatewayReady sends SESSION_LIST (req-id-1), COMMANDS_CATALOG (req-id-2),
-            // then SESSION_CREATE (req-id-3)
-            mockEventsFlow.emit(WsEvent.RpcResult("req-id-3", mapOf("session_id" to "session-123")))
+            val createRequestId = sentRequestIds[WsMethods.SESSION_CREATE]?.single()
+            checkNotNull(createRequestId)
+            mockEventsFlow.emit(WsEvent.RpcResult(createRequestId, mapOf("session_id" to "session-123")))
             advanceUntilIdle()
 
             assertEquals("session-123", viewModel.uiState.value.currentSessionId)
@@ -1669,7 +1681,7 @@ class ChatViewModelTest {
         }
 
     @Test
-    fun testSessionListRpcResult() =
+    fun testSessionListRpcResult_opensLatestSession() =
         runTest {
             val viewModel = createViewModel()
             advanceUntilIdle()
@@ -1678,26 +1690,23 @@ class ChatViewModelTest {
             mockEventsFlow.emit(WsEvent.GatewayReady(null))
             advanceUntilIdle()
 
-            // GatewayReady sends SESSION_LIST (req-id-1), COMMANDS_CATALOG (req-id-2),
-            // then SESSION_CREATE (req-id-3). Emit the SESSION_LIST result.
-            mockEventsFlow.emit(
-                WsEvent.RpcResult(
-                    "req-id-1",
+            respondToSessionList(
+                listOf(
                     mapOf(
-                        "sessions" to
-                            listOf(
-                                mapOf(
-                                    "id" to "session-123",
-                                    "title" to "My Session Title",
-                                    "message_count" to 12.0,
-                                ),
-                            ),
+                        "id" to "session-123",
+                        "title" to "My Session Title",
+                        "message_count" to 12.0,
+                    ),
+                    mapOf(
+                        "id" to "session-older",
+                        "title" to "Older Session",
+                        "message_count" to 3.0,
                     ),
                 ),
             )
-            advanceUntilIdle()
 
-            assertEquals(1, viewModel.uiState.value.sessions.size)
+            assertEquals(2, viewModel.uiState.value.sessions.size)
+            assertEquals("session-123", viewModel.uiState.value.currentSessionId)
             assertEquals(
                 "session-123",
                 viewModel.uiState.value.sessions[0]
@@ -1713,6 +1722,7 @@ class ChatViewModelTest {
                 viewModel.uiState.value.sessions[0]
                     .messageCount,
             )
+            verify(inverse = true) { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
         }
 
     // ── Streaming tests ──────────────────────────────────────────────────────
@@ -5425,6 +5435,11 @@ class ChatViewModelTest {
             mockEventsFlow.emit(WsEvent.GatewayReady(null))
             runCurrent()
 
+            val listRequestId = sentRequestIds[WsMethods.SESSION_LIST]?.single()
+            checkNotNull(listRequestId)
+            mockEventsFlow.emit(WsEvent.RpcResult(listRequestId, mapOf("sessions" to emptyList<Any>())))
+            runCurrent()
+
             // The first attempt went out and nothing acknowledged it.
             verify(exactly = 1) { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
             assertFalse(viewModel.uiState.value.isSessionReady)
@@ -5447,6 +5462,10 @@ class ChatViewModelTest {
 
             mockConnectionStatus.value = ConnectionStatus.CONNECTED
             mockEventsFlow.emit(WsEvent.GatewayReady(null))
+            runCurrent()
+            val listRequestId = sentRequestIds[WsMethods.SESSION_LIST]?.single()
+            checkNotNull(listRequestId)
+            mockEventsFlow.emit(WsEvent.RpcResult(listRequestId, mapOf("sessions" to emptyList<Any>())))
             advanceUntilIdle()
 
             verify(exactly = createMaxAttempts) {
@@ -5466,9 +5485,15 @@ class ChatViewModelTest {
             mockEventsFlow.emit(WsEvent.GatewayReady(null))
             runCurrent()
 
-            // req-id-3: loadSessions and fetchCommandCatalog precede the create.
+            val listRequestId = sentRequestIds[WsMethods.SESSION_LIST]?.single()
+            checkNotNull(listRequestId)
+            mockEventsFlow.emit(WsEvent.RpcResult(listRequestId, mapOf("sessions" to emptyList<Any>())))
+            runCurrent()
+
+            val createRequestId = sentRequestIds[WsMethods.SESSION_CREATE]?.single()
+            checkNotNull(createRequestId)
             mockEventsFlow.emit(
-                WsEvent.RpcResult("req-id-3", mapOf("session_id" to "session-123")),
+                WsEvent.RpcResult(createRequestId, mapOf("session_id" to "session-123")),
             )
             advanceUntilIdle()
 

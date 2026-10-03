@@ -55,12 +55,14 @@ class SlashCommandDispatchRpcTest {
     private lateinit var fakeRepo: FakeChatPersistenceRepository
     private lateinit var fakeSlashUsageStore: FakeSlashUsageStore
     private var reqCount = 0
+    private val sentRequestIds = mutableMapOf<String, MutableList<String>>()
 
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
         val testMainDispatcher = Dispatchers.Main
         reqCount = 0
+        sentRequestIds.clear()
 
         mockkStatic(android.util.Log::class)
         every { android.util.Log.d(any(), any()) } returns 0
@@ -101,6 +103,7 @@ class SlashCommandDispatchRpcTest {
         every { HermesWsClient.send(any(), any(), any()) } answers {
             reqCount++
             val id = "req-id-$reqCount"
+            sentRequestIds.getOrPut(arg(0)) { mutableListOf() } += id
             arg<((String) -> Unit)?>(2)?.invoke(id)
             id
         }
@@ -131,8 +134,13 @@ class SlashCommandDispatchRpcTest {
         mockConnectionStatus.value = ConnectionStatus.CONNECTED
         mockEventsFlow.emit(WsEvent.GatewayReady(null))
         advanceUntilIdle()
-        // req-id-3 = session.create (after loadSessions + fetchCommandCatalog)
-        mockEventsFlow.emit(WsEvent.RpcResult("req-id-3", mapOf("session_id" to "session-xyz")))
+        val listRequestId = sentRequestIds[WsMethods.SESSION_LIST]?.single()
+        checkNotNull(listRequestId)
+        mockEventsFlow.emit(WsEvent.RpcResult(listRequestId, mapOf("sessions" to emptyList<Any>())))
+        advanceUntilIdle()
+        val createRequestId = sentRequestIds[WsMethods.SESSION_CREATE]?.single()
+        checkNotNull(createRequestId)
+        mockEventsFlow.emit(WsEvent.RpcResult(createRequestId, mapOf("session_id" to "session-xyz")))
         advanceUntilIdle()
         return Pair(vm, "session-xyz")
     }
