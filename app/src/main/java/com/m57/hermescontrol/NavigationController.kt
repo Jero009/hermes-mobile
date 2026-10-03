@@ -44,8 +44,12 @@ object NavigationController {
     fun openBot(
         bot: ProfileInfo,
         selectedConnectionProfileId: String?,
+        resolvedSessionId: String? = null,
     ) {
-        val sessionId = bot.canonicalSessionId ?: return
+        val sessionId =
+            bot.canonicalSessionId
+                ?: resolvedSessionId?.takeIf { it.isNotBlank() }
+                ?: return
         val profileId = selectedConnectionProfileId?.takeIf { it.isNotBlank() } ?: return
         queuePendingSession(sessionId, profileId)
         navigateTo(ChatScreen)

@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.m57.hermescontrol.R
+import com.m57.hermescontrol.data.bots.BotGroupSessionIndex
 import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.WsEvent
@@ -83,12 +84,20 @@ class ChatNotificationService : Service() {
                     if (!isAppInForeground.get()) {
                         val event = sourcedEvent.event
                         val notificationProfileId = sourcedEvent.profileId
+                        // Group member sessions never reach the shade; the
+                        // index is profile-scoped and mirrors actual membership.
+                        val excludedGroupSessions =
+                            BotGroupSessionIndex.sessionsForProfile(notificationProfileId)
                         launch {
                             delay(500)
                             if (!isAppInForeground.get()) {
                                 when (
                                     val decision =
-                                        notificationDecisionFor(event, sourcedEvent.storedSessionId)
+                                        notificationDecisionFor(
+                                            event,
+                                            sourcedEvent.storedSessionId,
+                                            excludedGroupSessions,
+                                        )
                                 ) {
                                     is ChatNotificationDecision.Reply -> {
                                         showReplyNotification(
@@ -244,12 +253,25 @@ private const val NOTIFICATION_PREVIEW_CHARS = 100
  * would become an out-of-app secret-entry surface that persists the typed value
  * in system UI. Their expiry frames are equally silent — a notification about a
  * privileged request is itself a disclosure that one was made.
+ *
+ * [excludedSessionIds] carries the session ids owned by local bot group
+ * memberships for the originating connection profile; events for those
+ * sessions are silently ignored so group chatter never reaches the shade.
  */
 fun notificationDecisionFor(
     event: WsEvent,
     storedSessionId: String?,
-): ChatNotificationDecision =
-    when (event) {
+    excludedSessionIds: Set<String> = emptySet(),
+): ChatNotificationDecision {
+    val routedSessionId =
+        when (event) {
+            is WsEvent.MessageComplete -> storedSessionId ?: event.sessionId
+            else -> storedSessionId
+        }
+    if (routedSessionId != null && routedSessionId in excludedSessionIds) {
+        return ChatNotificationDecision.Ignore
+    }
+    return when (event) {
         is WsEvent.MessageComplete ->
             ChatNotificationDecision.Reply(
                 preview =
@@ -265,6 +287,7 @@ fun notificationDecisionFor(
 
         else -> ChatNotificationDecision.Ignore
     }
+}
 
 /**
  * Helper to start/stop the notification service from the UI layer.

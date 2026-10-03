@@ -98,6 +98,14 @@ private fun appEntryProvider(
         }
     }
 
+    // ── Bot group chat drill-down ────────────────────────────────────────
+    entry<BotGroupScreen> { key ->
+        com.m57.hermescontrol.ui.bots.BotGroupChatScreen(
+            roomId = key.roomId,
+            onBack = { NavigationController.goBack() },
+        )
+    }
+
     // ── Settings drill-down sub-pages ───────────────────────────────────
     // Each passes drawerGesturesEnabled = false to HermesScaffold — this is the
     // single source of truth that prevents the drawer-scrim stuck-open bug

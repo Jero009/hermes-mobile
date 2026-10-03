@@ -10,12 +10,19 @@ import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
 import java.io.File
 
 @Database(
-    entities = [ChatMessageEntity::class],
-    version = 6,
+    entities = [
+        ChatMessageEntity::class,
+        BotGroupRoomEntity::class,
+        BotGroupMemberEntity::class,
+        BotGroupMessageEntity::class,
+    ],
+    version = 7,
     exportSchema = true,
 )
 abstract class HermesDatabase : RoomDatabase() {
     abstract fun chatMessageDao(): ChatMessageDao
+
+    abstract fun botGroupDao(): BotGroupDao
 
     companion object {
         @Volatile
@@ -96,6 +103,63 @@ abstract class HermesDatabase : RoomDatabase() {
                 }
             }
 
+        // Local phone group chat v1: profile-scoped rooms, membership with
+        // resolved member sessions, and merged transcripts. Membership and
+        // messages cascade on room deletion.
+        internal val MIGRATION_6_7 =
+            object : Migration(6, 7) {
+                override fun migrate(db: SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `bot_group_rooms` (
+                            `id` TEXT NOT NULL,
+                            `connection_profile_id` TEXT NOT NULL,
+                            `title` TEXT NOT NULL,
+                            `created_at` INTEGER NOT NULL,
+                            `updated_at` INTEGER NOT NULL,
+                            PRIMARY KEY(`id`)
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `bot_group_members` (
+                            `room_id` TEXT NOT NULL,
+                            `bot_name` TEXT NOT NULL,
+                            `resolved_session_id` TEXT,
+                            PRIMARY KEY(`room_id`, `bot_name`),
+                            FOREIGN KEY(`room_id`) REFERENCES `bot_group_rooms`(`id`)
+                                ON UPDATE NO ACTION ON DELETE CASCADE
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_bot_group_members_room_id` " +
+                            "ON `bot_group_members` (`room_id`)",
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS `bot_group_messages` (
+                            `id` TEXT NOT NULL,
+                            `room_id` TEXT NOT NULL,
+                            `sender` TEXT NOT NULL,
+                            `from_user` INTEGER NOT NULL,
+                            `content` TEXT NOT NULL,
+                            `source_session_id` TEXT,
+                            `timestamp` INTEGER NOT NULL,
+                            PRIMARY KEY(`id`),
+                            FOREIGN KEY(`room_id`) REFERENCES `bot_group_rooms`(`id`)
+                                ON UPDATE NO ACTION ON DELETE CASCADE
+                        )
+                        """.trimIndent(),
+                    )
+                    db.execSQL(
+                        "CREATE INDEX IF NOT EXISTS `index_bot_group_messages_room_id_timestamp` " +
+                            "ON `bot_group_messages` (`room_id`, `timestamp`)",
+                    )
+                }
+            }
+
         fun get(context: Context): HermesDatabase =
             instance ?: synchronized(this) {
                 // SQLCipher can't open plaintext SQLite databases — if an old
@@ -116,7 +180,7 @@ abstract class HermesDatabase : RoomDatabase() {
                         HermesDatabase::class.java,
                         "hermes_control.db",
                     ).openHelperFactory(factory)
-                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                    .addMigrations(MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
                     .fallbackToDestructiveMigration(false)
                     .build()
                     .also { instance = it }
