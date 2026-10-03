@@ -1,169 +1,106 @@
-<!-- Modified from Hy4ri/hermes-mobile for this fork; see NOTICE. -->
+<!-- Modified from Hy4ri/hermes-mobile. See NOTICE. -->
 
-<div align="center">
-  <br>
-  <img src="https://img.shields.io/badge/Android-34DDDD?style=for-the-badge&logo=android&logoColor=black" alt="Android"/>
-  <img src="https://img.shields.io/badge/Jetpack%20Compose-4285F4?style=for-the-badge&logo=jetpackcompose&logoColor=white" alt="Jetpack Compose"/>
-  <img src="https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white" alt="Kotlin"/>
-  <img src="https://img.shields.io/badge/Material%20You-6750A4?style=for-the-badge&logo=materialdesign&logoColor=white" alt="Material You"/>
-  <br><br>
-</div>
+# Hermes Pocket
 
-<h1 align="center">Hermes Mobile</h1>
-<p align="center"><strong>Native Android companion app for your Hermes AI agent.</strong></p>
+Native Android client for [Hermes Agent](https://hermes-agent.nousresearch.com).
 
-<p align="center">
-  <a href="https://github.com/saralilyb/hermes-mobile/releases/latest"><img src="https://img.shields.io/github/v/release/saralilyb/hermes-mobile?color=6750A4&label=Latest%20Release&logo=github" alt="Latest Release"></a>
-  <img src="https://img.shields.io/github/actions/workflow/status/saralilyb/hermes-mobile/android.yml?branch=main&label=CI&logo=githubactions" alt="CI">
-  <img src="https://img.shields.io/badge/minSdk-26-brightgreen" alt="minSdk 26">
-  <img src="https://img.shields.io/badge/targetSdk-36-brightgreen" alt="targetSdk 36">
-</p>
+[![Release](https://img.shields.io/github/v/release/Jero009/hermes-mobile?label=release)](https://github.com/Jero009/hermes-mobile/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/Jero009/hermes-mobile/android.yml?branch=main&label=CI)](https://github.com/Jero009/hermes-mobile/actions/workflows/android.yml)
+[![minSdk 26](https://img.shields.io/badge/minSdk-26-brightgreen)](https://developer.android.com)
 
----
+Hermes Pocket connects to a self-hosted Hermes dashboard over HTTPS and WSS. It is not an agent runtime: your Hermes gateway remains the source of truth for sessions, profiles, tools, and credentials.
 
-## Overview
+## What it does
 
-**Hermes Mobile** is an unofficial native Android client for
-[Hermes Agent](https://hermes-agent.nousresearch.com). This security-focused
-fork is based on [Hy4ri/hermes-mobile](https://github.com/Hy4ri/hermes-mobile),
-with a selectively reconciled `v1.19.2` baseline and compatible later fixes,
-most recently clarification cleanup from upstream commit `0db741e`. It retains
-downstream security,
-complete-history pagination, signing, and distribution changes. The public
-release uses generic Hermes branding; the optional `iris` flavor exists only to
-distinguish a side-by-side personal installation.
+- Chat with Hermes in real time, including streamed responses, tool activity, approvals, clarifications, attachments, model selection, and persisted session history.
+- Manage sessions, profiles, skills, plugins, cron jobs, environment keys, webhooks, logs, Kanban boards, and gateway status.
+- Use **Bots** as a profile roster. Each bot gets a hidden managed `Bot Chat` session in its own Hermes profile.
+- Create local bot group chats with 2–6 members. Messages fan out through the existing profile sessions; Hermes Pocket does not invent a backend group-chat API.
+- Keep connection profiles, cookies, tokens, notifications, and local data scoped to the selected server connection.
 
----
+## Install
 
-## Features
+Download the APK from [GitHub Releases](https://github.com/Jero009/hermes-mobile/releases/latest), then install it on Android.
 
-- **Real-Time Chat:** Room-backed history, profile-scoped pinned sessions, rich
-  tool, approval, and clarification cards, explicit `/queue` prompt handling,
-  live context-window updates, bottom-follow with unread counts, persisted
-  reasoning cards and controls, and a two-row composer.
-- **System Config:** Manage and clone profiles, installed skills, plugins, and
-  LLM model selections.
-- **Operations:** Stream and filter live logs by server file, level, component,
-  and line count; manage cron jobs and categorized environment keys with warned
-  sensitive copying; and test webhooks.
-- **Gateway Status:** Monitor WebSocket connection, MCP servers, and messaging channel status.
-- **Productivity:** View and manage tasks via integrated Kanban boards and track agent milestones.
-- **Modern UX:** Drawer-first Navigation3, dynamic Material You colors, theme
-  presets, scroll-aware controls, and pull-to-refresh.
-- **Responsive Data Loading:** Two-phase model loading and compacted-history
-  requests only where complete session history requires them.
-
----
-
-## Quick Start
-
-### Install with Obtainium
-
-Add this repository URL to
-[Obtainium](https://github.com/ImranR98/Obtainium):
+For automatic release tracking, add this repository to [Obtainium](https://github.com/ImranR98/Obtainium):
 
 ```text
-https://github.com/saralilyb/hermes-mobile
+https://github.com/Jero009/hermes-mobile
 ```
 
-Obtainium installs the signed generic `Hermes Mobile` APK published with each
-GitHub Release. The `Iris Mobile` flavor is a separate personal build, not the
-public update channel. Obtainium is the sole supported binary update channel:
-the app deliberately has no in-app release checker, APK downloader, package
-installer permission, or self-update feature, and this fork is not distributed
-through F-Droid. Manual source builds remain supported below.
+Releases are signed under the Hermes Pocket Android identity, `si.jero.hermespocket`. The app deliberately has no in-app updater; Obtainium or manual downloads are the supported update paths.
 
-### Build from source
+## Connect to Hermes
 
-Prerequisites:
+1. Open Hermes Pocket and select **Connect**.
+2. Enter the complete dashboard URL, including `https://`, any explicit port, and any reverse-proxy path prefix.
+3. Sign in with the dashboard credentials configured on your Hermes server.
 
-- **JDK 21+**
-- **Android Studio** or an Android SDK with platform 37
-
-```sh
-git clone https://github.com/saralilyb/hermes-mobile.git
-cd hermes-mobile
-./gradlew assembleHermesDebug
-adb install app/build/outputs/apk/hermes/debug/app-hermes-debug.apk
-```
-
-Release builds require `KEYSTORE_PATH`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, and
-`KEY_PASSWORD`. The tag-triggered workflow creates a draft release only after
-the signed APK passes `apksigner` verification. Verify published artifacts
-against the certificate fingerprint in [SIGNING.md](SIGNING.md).
-
----
-
-## Authentication
-
-Enter the complete Hermes dashboard base URL, including `https://`, any
-explicit port, and any reverse-proxy path prefix. For example:
+Examples:
 
 ```text
 https://hermes.example.com/
 https://hermes.example.com:9119/dashboard/
 ```
 
-The app probes the dashboard and follows the server's authentication challenge.
-Basic authentication uses the username and password configured on the
-dashboard; the app exchanges them for an endpoint-scoped session cookie.
-WebSocket connections request a fresh, single-use ticket for every handshake
-and reconnect. Do not use example or default passwords.
+Release builds require HTTPS and derive their WSS endpoint from the same URL. The app follows the dashboard's authentication flow and obtains fresh WebSocket credentials for connections and reconnects.
 
-Release builds require HTTPS and derive `wss://` WebSocket URLs from the same
-base URL. Debug builds can use explicit HTTP URLs for local development and
-show a cleartext warning.
+## Bots and groups
 
-### Connection profiles
+Create a bot from **Bots → +**. This opens the Hermes profile builder. After creating a profile, return to **Bots** and select it; Hermes Pocket creates or resolves that profile's hidden `Bot Chat` session before opening it.
 
-Use **Settings → Connection profiles** to switch among complete server URLs.
-The active profile uses a high-contrast container and border. Credentials and
-session state remain scoped to their profile.
+To create a group, choose **New group chat** in Bots and select 2–6 profiles. Group rooms and membership are stored locally for the current connection profile. Hidden bot sessions do not appear in the normal Sessions screen or notification stream.
 
-### Pairing (admin)
+## Build from source
 
-The **Pairing** screen lets you approve or revoke agents and services that are
-trying to connect to your gateway, such as Telegram or Discord sessions.
+Requirements:
 
----
+- JDK 21+
+- Android SDK Platform 37
 
-## Project Structure
-
+```sh
+git clone https://github.com/Jero009/hermes-mobile.git
+cd hermes-mobile
+./gradlew testHermesDebugUnitTest assembleHermesDebug
+adb install app/build/outputs/apk/hermes/debug/app-hermes-debug.apk
 ```
+
+A signed release needs `KEYSTORE_PATH`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, and `KEY_PASSWORD`. The release workflow builds and verifies the APK with `apksigner`; see [SIGNING.md](SIGNING.md).
+
+## Development checks
+
+Run flavor-qualified tasks:
+
+```sh
+./gradlew testHermesDebugUnitTest testIrisDebugUnitTest
+./gradlew assembleHermesDebug assembleIrisDebug
+./gradlew lintHermesDebug lintIrisDebug
+./gradlew ktlintCheck checkColorLiterals
+```
+
+The repository CI also runs instrumented tests and release compilation checks.
+
+## Project layout
+
+```text
 app/src/main/java/com/m57/hermescontrol/
-├── data/          # Local (Room, Keystore-backed atomic blobs) & Remote (Retrofit, OkHttp WS)
-├── notification/  # Foreground service for message notifications
-├── theme/         # Material You design system, status colors, spacing, and typography
-└── ui/            # Compose screens (Chat, Settings, Profiles, Kanban, etc.) + Navigation
+├── data/          # Room persistence, Retrofit API client, WebSocket transport
+├── notification/  # Foreground service and notification routing
+├── theme/         # Material 3 theme and design tokens
+└── ui/            # Compose screens and view models
 ```
 
----
+## Security
 
-## Tech Stack
-
-- **Language:** Kotlin 2.4.10 with KSP compiler plugin
-- **UI & Layout:** Jetpack Compose (BOM 2026.03.01) & Material 3 / Material You
-- **Navigation:** Navigation3 (Compose-first Routing)
-- **Networking:** Retrofit 3.0.0, OkHttp 5.5.0, kotlinx-serialization
-- **Database:** Room 2.7.1 with SQLCipher encryption
-- **Security:** app-owned atomic AES-256-GCM blobs backed by Android Keystore;
-  `EncryptedSharedPreferences` retained only for one-release migration compatibility
-- **Formatting:** `ktlint` style rules (checked automatically in CI)
-
----
+- Release traffic is HTTPS/WSS only.
+- Credentials and connection state are scoped to the configured server profile.
+- Sensitive local values use Android Keystore-backed encryption.
+- APK release signing is verified against the pinned Hermes Pocket certificate.
 
 ## Contributing
 
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for our branch workflow, code style guidelines, and PR checklist.
-
-For developer-specific details, code conventions, and project architecture notes, refer to [AGENTS.md](AGENTS.md).
-
----
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for contribution workflow and [AGENTS.md](AGENTS.md) for project-specific development rules.
 
 ## License
 
-Copyright © 2026 M57 (Hy4ri). Security, transport, packaging, and distribution
-modifications Copyright © 2026 Sara Burke.
-
-This fork remains licensed under the Apache License, Version 2.0. See
-[LICENSE](LICENSE) and [NOTICE](NOTICE).
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
