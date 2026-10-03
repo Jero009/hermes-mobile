@@ -1602,6 +1602,20 @@ class ChatViewModelTest {
         }
 
     @Test
+    fun testDuplicateGatewayReady_createsOnlyOneSession() =
+        runTest {
+            createViewModel()
+            advanceUntilIdle()
+
+            mockConnectionStatus.value = ConnectionStatus.CONNECTED
+            mockEventsFlow.emit(WsEvent.GatewayReady(null))
+            mockEventsFlow.emit(WsEvent.GatewayReady(null))
+            advanceUntilIdle()
+
+            assertEquals(1, sentRequestIds[WsMethods.SESSION_CREATE]?.size)
+        }
+
+    @Test
     fun testGatewayReady_withInitialSessionId_switchesToIt() =
         runTest {
             val viewModel = createViewModel()

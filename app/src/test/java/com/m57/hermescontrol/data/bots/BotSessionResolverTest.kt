@@ -140,72 +140,59 @@ class BotSessionResolverTest {
         }
 
     @Test
-    fun `recency is never used - a recent unmanaged session does not resolve the bot`() =
+    fun `recency is never used - a recent unmanaged session creates a managed bot session`() =
         runTest {
             coEvery { api.getSessions(any(), any(), any(), any(), any()) } returns
                 sessionsPage(SessionInfo(id = "recent", title = "Random chat"))
-            coEvery { api.getActiveProfile() } returns activeProfile("other-profile")
 
             val resolution = resolver().resolve(ProfileInfo("researcher"))
 
-            assertTrue(resolution is BotSessionResolution.CreateUnsupported)
-            assertEquals("researcher", (resolution as BotSessionResolution.CreateUnsupported).botName)
+            assertEquals(BotSessionResolution.Resolved("new-1", BotResolutionSource.CREATED), resolution)
         }
 
     @Test
-    fun `creation requires the gateway active profile to be the bot itself`() =
+    fun `creation targets the bot profile without changing the active profile`() =
         runTest {
             coEvery { api.getSessions(any(), any(), any(), any(), any()) } returns sessionsPage()
-            coEvery { api.getActiveProfile() } returns activeProfile("someone-else")
+            val requests = mutableListOf<Map<String, Any>>()
+            val gateway: suspend (String, Map<String, Any>) -> Result<Any?> = { _, params ->
+                requests += params
+                Result.success(mapOf("session_id" to "new-1"))
+            }
 
-            val resolution = resolver().resolve(ProfileInfo("researcher"))
+            val resolution = resolver(gateway).resolve(ProfileInfo("researcher"))
 
-            assertTrue(resolution is BotSessionResolution.CreateUnsupported)
+            assertEquals(BotSessionResolution.Resolved("new-1", BotResolutionSource.CREATED), resolution)
+            assertEquals(
+                listOf(
+                    mapOf(
+                        "source" to "desktop",
+                        "profile" to "researcher",
+                        "title" to ManagedBotSession.managedTitle("researcher"),
+                        "hidden" to true,
+                    ),
+                ),
+                requests,
+            )
+            coVerify(exactly = 0) { api.getActiveProfile() }
             coVerify(exactly = 0) { api.renameSession(any(), any<SessionRenameRequest>()) }
         }
 
     @Test
-    fun `creation renames the new session to the managed title`() =
+    fun `creation assigns the managed title atomically`() =
         runTest {
             coEvery { api.getSessions(any(), any(), any(), any(), any()) } returns sessionsPage()
-            coEvery { api.getActiveProfile() } returns activeProfile("researcher")
-            coEvery {
-                api.renameSession(any(), any<SessionRenameRequest>())
-            } answers {
-                val renamedId: String = firstArg()
-                val body: SessionRenameRequest = secondArg()
-                capturedRenames.add(renamedId to body.title)
-                Response.success(Unit)
-            }
 
             val resolution = resolver(gatewayOk()).resolve(ProfileInfo("researcher"))
 
             assertEquals(BotSessionResolution.Resolved("new-1", BotResolutionSource.CREATED), resolution)
-            assertEquals(
-                listOf("new-1" to ManagedBotSession.managedTitle("researcher")),
-                capturedRenames,
-            )
-        }
-
-    @Test
-    fun `a created session whose rename fails is reported incomplete and not managed`() =
-        runTest {
-            coEvery { api.getSessions(any(), any(), any(), any(), any()) } returns sessionsPage()
-            coEvery { api.getActiveProfile() } returns activeProfile("researcher")
-            coEvery { api.renameSession(any(), any<SessionRenameRequest>()) } returns
-                Response.error(500, okhttp3.ResponseBody.create(null, ""))
-
-            val resolution = resolver(gatewayOk()).resolve(ProfileInfo("researcher"))
-
-            assertEquals(BotSessionResolution.ProvisionIncomplete("new-1"), resolution)
+            coVerify(exactly = 0) { api.renameSession(any(), any<SessionRenameRequest>()) }
         }
 
     @Test
     fun `a gateway create failure surfaces as Failed and never invents a session`() =
         runTest {
             coEvery { api.getSessions(any(), any(), any(), any(), any()) } returns sessionsPage()
-            coEvery { api.getActiveProfile() } returns activeProfile("researcher")
-
             val resolution = resolver(gatewayFailing()).resolve(ProfileInfo("researcher"))
 
             assertTrue(resolution is BotSessionResolution.Failed)
@@ -216,7 +203,7 @@ class BotSessionResolverTest {
     fun `create request targets the session create gateway method`() =
         runTest {
             coEvery { api.getSessions(any(), any(), any(), any(), any()) } returns sessionsPage()
-            coEvery { api.getActiveProfile() } returns activeProfile("researcher")
+
             val methods = mutableListOf<String>()
             val gateway: suspend (String, Map<String, Any>) -> Result<Any?> = { method, _ ->
                 methods.add(method)

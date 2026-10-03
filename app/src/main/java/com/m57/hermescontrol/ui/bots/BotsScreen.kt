@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Search
@@ -104,6 +105,9 @@ fun BotsScreen(
         title = { Text(stringResource(R.string.screen_bots)) },
         navigationIcon = onOpenDrawer?.let { NavIcon.Menu(it) },
         actions = {
+            IconButton(onClick = NavigationController::createBot) {
+                Icon(Icons.Filled.Add, contentDescription = "Create bot")
+            }
             if (state.hasHiddenBots) {
                 IconButton(onClick = viewModel::toggleShowHidden) {
                     Icon(
@@ -402,9 +406,7 @@ private fun BotCard(
 
 private fun BotSessionResolution.uiLabel(): Int =
     when (this) {
-        is BotSessionResolution.CreateUnsupported -> R.string.bots_session_unprovisioned
         is BotSessionResolution.Ambiguous -> R.string.bots_session_ambiguous
         is BotSessionResolution.Failed -> R.string.bots_session_resolve_failed
-        is BotSessionResolution.ProvisionIncomplete -> R.string.bots_session_partial
         is BotSessionResolution.Resolved -> R.string.bots_session_ready
     }

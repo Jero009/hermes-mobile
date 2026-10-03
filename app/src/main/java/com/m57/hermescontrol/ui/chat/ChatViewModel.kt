@@ -455,6 +455,9 @@ class ChatViewModel(
      */
     var initialSessionId: String? = null
 
+    /** One gateway.ready may arrive after the already-connected init path. */
+    private var gatewayReadyHandled = false
+
     init {
         refreshSettings()
 
@@ -483,6 +486,7 @@ class ChatViewModel(
                     status == ConnectionStatus.NO_NETWORK ||
                     status == ConnectionStatus.AUTH_EXPIRED
                 ) {
+                    gatewayReadyHandled = false
                     retireSync()
                     _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
                     conversationGeneration++
@@ -558,6 +562,8 @@ class ChatViewModel(
     // ── WS Event Handling ────────────────────────────────────────────────
 
     private fun handleGatewayReady() {
+        if (gatewayReadyHandled) return
+        gatewayReadyHandled = true
         _uiState.update { it.copy(isLoading = false) }
         addSystemMessage("Connected to Hermes")
         loadSessions()
