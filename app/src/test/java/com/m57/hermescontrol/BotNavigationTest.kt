@@ -44,4 +44,14 @@ class BotNavigationTest {
         assertNull(NavigationController.pendingSessionTarget)
         assertEquals(listOf(BotsScreen), stack.toList())
     }
+
+    @Test
+    fun `create bot opens the profile builder screen`() {
+        val stack = NavBackStack<NavKey>(BotsScreen)
+        NavigationController.backStack = stack
+
+        NavigationController.createBot()
+
+        assertEquals(ProfilesScreen, stack.lastOrNull())
+    }
 }

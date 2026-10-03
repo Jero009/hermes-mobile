@@ -2,7 +2,6 @@ package com.m57.hermescontrol.data.bots
 
 import com.m57.hermescontrol.data.model.ProfileInfo
 import com.m57.hermescontrol.data.model.SessionListResponse
-import com.m57.hermescontrol.data.model.SessionRenameRequest
 import com.m57.hermescontrol.data.remote.HermesApiService
 import com.m57.hermescontrol.data.ws.WsMethods
 import java.io.IOException
@@ -15,7 +14,7 @@ enum class BotResolutionSource {
     /** Exactly one session carries the bot's invisible managed title. */
     MANAGED_TITLE,
 
-    /** A session was created on the bot's own active profile and renamed. */
+    /** A hidden managed session was created in the bot's own profile. */
     CREATED,
 }
 
@@ -31,20 +30,6 @@ sealed interface BotSessionResolution {
         val count: Int,
     ) : BotSessionResolution
 
-    /** A new session is needed but this gateway cannot create one for the bot's profile. */
-    data class CreateUnsupported(
-        val botName: String,
-    ) : BotSessionResolution
-
-    /**
-     * A session was created but the managed rename failed. The session stays
-     * openable (the id is carried) but is never re-provisioned automatically —
-     * retrying would leak an unowned session per attempt.
-     */
-    data class ProvisionIncomplete(
-        val sessionId: String,
-    ) : BotSessionResolution
-
     /** Transport or protocol failure during resolution. */
     data class Failed(
         val reason: String,
@@ -58,11 +43,8 @@ sealed interface BotSessionResolution {
  * 2. A paged session-title search verified by exact unique invisible-title
  *    matching — one exact match resolves, several fail closed, and recency is
  *    never used to select anything.
- * 3. Create + rename, only where the existing gateway can create the correct
- *    profile session: `session.create` is issued against the gateway's active
- *    profile, so creation is allowed only when the bot's profile IS the
- *    gateway's active profile. Otherwise the outcome is a capability-gated
- *    [BotSessionResolution.CreateUnsupported] rather than an invented session.
+ * 3. Create a hidden managed session in the bot's profile using the gateway's
+ *    documented per-request `profile` scope.
  */
 class BotSessionResolver(
     private val api: HermesApiService,
@@ -155,21 +137,16 @@ class BotSessionResolver(
     }
 
     private suspend fun provisionNewSession(bot: ProfileInfo): BotSessionResolution {
-        val activeProfile =
-            try {
-                api.getActiveProfile().body()
-            } catch (e: IOException) {
-                null
-            }
-        // session.create runs on the gateway's active profile. Unless that
-        // profile IS the bot, a created session would belong to someone else —
-        // so creation is capability-gated, never attempted speculatively.
-        if (activeProfile?.active != bot.name) {
-            return BotSessionResolution.CreateUnsupported(bot.name)
-        }
-
         val created =
-            gatewayRequest(WsMethods.SESSION_CREATE, mapOf("source" to "desktop")).getOrElse {
+            gatewayRequest(
+                WsMethods.SESSION_CREATE,
+                mapOf(
+                    "source" to "desktop",
+                    "profile" to bot.name,
+                    "title" to ManagedBotSession.managedTitle(bot.name),
+                    "hidden" to true,
+                ),
+            ).getOrElse {
                 return BotSessionResolution.Failed(it.message ?: "session.create failed")
             }
         val sessionId =
@@ -178,20 +155,7 @@ class BotSessionResolver(
             return BotSessionResolution.Failed("session.create returned no session id")
         }
 
-        val renamed =
-            try {
-                api.renameSession(
-                    sessionId = sessionId,
-                    body = SessionRenameRequest(title = ManagedBotSession.managedTitle(bot.name)),
-                ).isSuccessful
-            } catch (e: IOException) {
-                false
-            }
-        return if (renamed) {
-            BotSessionResolution.Resolved(sessionId, BotResolutionSource.CREATED)
-        } else {
-            BotSessionResolution.ProvisionIncomplete(sessionId)
-        }
+        return BotSessionResolution.Resolved(sessionId, BotResolutionSource.CREATED)
     }
 
     private companion object {

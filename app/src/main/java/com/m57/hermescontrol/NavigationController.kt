@@ -55,6 +55,8 @@ object NavigationController {
         navigateTo(ChatScreen)
     }
 
+    fun createBot() = navigateTo(ProfilesScreen)
+
     // Top-level primary screens (Chat, Skills, Cron, System, Settings)
     private val primaryScreens: MutableSet<NavKey> =
         mutableSetOf(

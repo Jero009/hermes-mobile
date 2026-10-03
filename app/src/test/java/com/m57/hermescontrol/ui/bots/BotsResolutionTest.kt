@@ -65,7 +65,7 @@ class BotsResolutionTest {
 
     private fun viewModel(
         selectedProfile: () -> String? = { "connection-a" },
-        resolver: suspend (ProfileInfo) -> BotSessionResolution = { BotSessionResolution.CreateUnsupported(it.name) },
+        resolver: suspend (ProfileInfo) -> BotSessionResolution = { BotSessionResolution.Failed("offline") },
     ): BotsViewModel =
         BotsViewModel(
             ioDispatcher = dispatcher,
@@ -129,7 +129,7 @@ class BotsResolutionTest {
         }
 
     @Test
-    fun `capability gated bots surface the unresolved reason and stay unopenable`() =
+    fun `failed bots surface the unresolved reason and stay unopenable`() =
         runTest(dispatcher) {
             val viewModel = viewModel()
             viewModel.loadBots()
@@ -139,7 +139,7 @@ class BotsResolutionTest {
             val beta = state.profiles.first { it.name == "beta" }
             val resolution = state.resolutions.getValue("beta")
 
-            assertEquals(BotSessionResolution.CreateUnsupported("beta"), resolution.unresolved)
+            assertEquals(BotSessionResolution.Failed("offline"), resolution.unresolved)
             assertNull(resolution.sessionId)
             assertFalse(canOpenBot(beta, "connection-a", "connection-a", resolution.sessionId))
             assertTrue(state.hasUnresolvedBots)

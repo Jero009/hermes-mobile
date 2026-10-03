@@ -179,9 +179,7 @@ class BotsViewModel(
 private fun BotSessionResolution.toResolutionState(): BotResolutionState =
     when (this) {
         is BotSessionResolution.Resolved -> BotResolutionState(sessionId = sessionId)
-        is BotSessionResolution.ProvisionIncomplete -> BotResolutionState(sessionId = sessionId, unresolved = this)
         is BotSessionResolution.Ambiguous,
-        is BotSessionResolution.CreateUnsupported,
         is BotSessionResolution.Failed,
         -> BotResolutionState(sessionId = null, unresolved = this)
     }
