@@ -1,7 +1,5 @@
 package com.m57.hermescontrol.ui.logs
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import androidx.compose.foundation.background
@@ -369,10 +367,8 @@ private fun shareLogs(
     context: Context,
     text: String,
 ) {
-    // Also copy to clipboard
-    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-    clipboard?.setPrimaryClip(ClipData.newPlainText("Hermes Logs", text))
-
+    // No silent clipboard copy: log contents may contain sensitive request
+    // data, so they only leave the device through the explicit share sheet.
     val sendIntent =
         Intent().apply {
             action = Intent.ACTION_SEND

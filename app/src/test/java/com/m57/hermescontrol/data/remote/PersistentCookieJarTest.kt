@@ -382,6 +382,99 @@ class PersistentCookieJarTest {
         }
 
     @Test
+    fun clearLegacyWildcardCookiesRetiresWildcardButKeepsHostScopedCookies() =
+        runTest {
+            val store = FakeEncryptedCookieStore()
+            val jar =
+                PersistentCookieJar(
+                    store = store,
+                    storeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined),
+                )
+            jar.useStore(PersistentCookieJar.DEFAULT_SERVER_ID)
+            val legacy = requireNotNull(wrapSessionCookie("legacy-value"))
+            jar.saveFromResponse(
+                "https://old.example.com/".toHttpUrl(),
+                listOf(legacy, sessionCookie("old.example.com", "host-value")),
+            )
+
+            jar.clearLegacyWildcardCookies(PersistentCookieJar.DEFAULT_SERVER_ID)
+
+            assertTrue(
+                store.storedHolders(PersistentCookieJar.DEFAULT_SERVER_ID)
+                    .none { it.domain == LEGACY_WILDCARD_DOMAIN },
+            )
+            assertTrue(
+                store.storedHolders(PersistentCookieJar.DEFAULT_SERVER_ID)
+                    .any { it.value == "host-value" },
+            )
+            assertTrue(jar.loadForRequest("https://new.example.com/api".toHttpUrl()).isEmpty())
+            assertEquals(
+                listOf("host-value"),
+                jar.loadForRequest("https://old.example.com/".toHttpUrl()).map { it.value },
+            )
+        }
+
+    @Test
+    fun clearServerRemovesDeletedScopeButKeepsOtherScopes() =
+        runTest {
+            val store = FakeEncryptedCookieStore()
+            val jar =
+                PersistentCookieJar(
+                    store = store,
+                    storeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined),
+                )
+            jar.useStore("server-a")
+            jar.saveFromResponse(
+                "http://a.local/".toHttpUrl(),
+                listOf(sessionCookie("a.local", "cookie-a")),
+            )
+            jar.useStore("server-b")
+            jar.saveFromResponse(
+                "http://b.local/".toHttpUrl(),
+                listOf(sessionCookie("b.local", "cookie-b")),
+            )
+
+            jar.clearServer("server-a")
+
+            assertTrue(store.storedHolders("server-a").isEmpty())
+            jar.useStore("server-a")
+            assertTrue(jar.loadForRequest("http://a.local/x".toHttpUrl()).isEmpty())
+            assertTrue(store.storedHolders("server-b").any { it.value == "cookie-b" })
+            jar.useStore("server-b")
+            assertEquals(
+                "cookie-b",
+                jar.loadForRequest("http://b.local/x".toHttpUrl()).singleOrNull()?.value,
+            )
+        }
+
+    @Test
+    fun clearServerClearsPersistedCookiesForNeverLoadedScope() =
+        runTest {
+            val store = FakeEncryptedCookieStore()
+            val seeder =
+                PersistentCookieJar(
+                    store = store,
+                    storeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined),
+                )
+            seeder.useStore("server-a")
+            seeder.saveFromResponse(
+                "http://a.local/".toHttpUrl(),
+                listOf(sessionCookie("a.local", "stale-persisted")),
+            )
+
+            // A fresh jar in a new process never loaded the deleted scope.
+            val jar =
+                PersistentCookieJar(
+                    store = store,
+                    storeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined),
+                    initialServerId = "server-b",
+                )
+            jar.clearServer("server-a")
+
+            assertTrue(store.storedHolders("server-a").isEmpty())
+        }
+
+    @Test
     fun staleHttpResponseCannotRestoreCookieAfterClear() {
         val server = MockWebServer()
         val responseStarted = CompletableDeferred<Unit>()

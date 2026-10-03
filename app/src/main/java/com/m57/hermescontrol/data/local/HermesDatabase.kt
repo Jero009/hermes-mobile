@@ -165,10 +165,7 @@ abstract class HermesDatabase : RoomDatabase() {
                 // SQLCipher can't open plaintext SQLite databases — if an old
                 // unencrypted DB exists (v1), delete it so Room + SQLCipher can
                 // create an encrypted replacement from scratch.
-                val dbFile = context.getDatabasePath("hermes_control.db")
-                if (dbFile.exists() && !isSqlCipherDatabase(dbFile)) {
-                    dbFile.delete()
-                }
+                removeUnencryptedDatabase(context.getDatabasePath("hermes_control.db"))
 
                 // Load SQLCipher native library before creating the factory
                 System.loadLibrary("sqlcipher")
@@ -186,17 +183,45 @@ abstract class HermesDatabase : RoomDatabase() {
                     .also { instance = it }
             }
 
-        /** Returns true if the database file starts with the SQLCipher magic header. */
-        private fun isSqlCipherDatabase(file: File): Boolean =
+        /**
+         * Removes a legacy plaintext SQLite database (v1) so an encrypted
+         * replacement can be created. Returns true if the database was
+         * removed. Its WAL/SHM sidecars are removed with it — they hold
+         * plaintext pages that would otherwise outlive the main file.
+         *
+         * Fail closed (audit V6): deletion requires a positive plaintext
+         * SQLite header match. An unreadable or incomplete header means the
+         * file may be an encrypted database we failed to inspect, so it is
+         * kept untouched.
+         */
+        internal fun removeUnencryptedDatabase(dbFile: File): Boolean {
+            if (!dbFile.exists() || !isPlaintextSqliteDatabase(dbFile)) return false
+            dbFile.delete()
+            for (suffix in listOf("-wal", "-shm")) {
+                File(dbFile.parentFile, dbFile.name + suffix).delete()
+            }
+            return true
+        }
+
+        /**
+         * Returns true only when the file positively starts with the plaintext
+         * SQLite magic header "SQLite format 3\0". Read errors, partial
+         * headers, and anything else return false — the caller keeps the file.
+         */
+        private fun isPlaintextSqliteDatabase(file: File): Boolean =
             try {
                 val header = ByteArray(16)
-                file.inputStream().use { it.read(header) }
-                // SQLCipher 4.x databases start with bytes that differ from
-                // the plaintext SQLite header "SQLite format 3\0"
-                val plaintextHeader = "SQLite format 3\u0000"
-                !header.contentEquals(plaintextHeader.toByteArray())
+                file.inputStream().use { input ->
+                    var read = 0
+                    while (read < header.size) {
+                        val n = input.read(header, read, header.size - read)
+                        if (n < 0) return false // incomplete header: uncertain, keep
+                        read += n
+                    }
+                }
+                header.contentEquals("SQLite format 3\u0000".toByteArray())
             } catch (_: Exception) {
-                false // if we can't read it, treat as plaintext and delete
+                false // unreadable: uncertain, keep
             }
 
         /** For testing — inject a custom instance. */

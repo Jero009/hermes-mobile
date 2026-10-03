@@ -80,15 +80,18 @@ fun ProvidersScreen(
             onCancel = viewModel::cancelOAuthFlow,
             onDismissFlow = viewModel::dismissFlow,
             onOpenBrowser = { url ->
-                try {
-                    context.startActivity(
-                        android.content.Intent(
-                            android.content.Intent.ACTION_VIEW,
-                            android.net.Uri.parse(url),
-                        ),
-                    )
-                } catch (_: Exception) {
-                    // No browser available — ignore; user can copy the URL.
+                val safeUrl = com.m57.hermescontrol.util.SafeExternalUrl.sanitizeOrNull(url)
+                if (safeUrl != null) {
+                    try {
+                        context.startActivity(
+                            android.content.Intent(
+                                android.content.Intent.ACTION_VIEW,
+                                android.net.Uri.parse(safeUrl),
+                            ),
+                        )
+                    } catch (_: Exception) {
+                        // No browser available — ignore; user can copy the URL.
+                    }
                 }
             },
         )

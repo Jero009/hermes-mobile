@@ -260,6 +260,49 @@ class PersistentCookieJar(
         }
     }
 
+    /**
+     * Remove migration-era wildcard session cookies ([LEGACY_WILDCARD_DOMAIN])
+     * from [serverId]'s scope. Those cookies are host-less, so they would
+     * otherwise be replayed against any server the scope talks to after a
+     * base-URL change. Host-scoped cookies are unaffected.
+     */
+    fun clearLegacyWildcardCookies(serverId: String = credentialBoundary.serverId) {
+        if (!loadedScopes.contains(serverId)) {
+            kotlinx.coroutines.runBlocking { ensureLoaded(serverId) }
+        }
+        synchronized(credentialLock) {
+            val hosts = cache[serverId] ?: return
+            val bucket = hosts[LEGACY_WILDCARD_DOMAIN] ?: return
+            synchronized(bucket) {
+                bucket.removeAll { it.domain == LEGACY_WILDCARD_DOMAIN }
+            }
+            if (bucket.isEmpty()) hosts.remove(LEGACY_WILDCARD_DOMAIN)
+            persist(serverId)
+        }
+    }
+
+    /**
+     * Remove one server scope entirely — in-memory cache plus persisted
+     * cookies. Used when a connection profile is deleted: its endpoint-scoped
+     * cookies must not survive. Other scopes are untouched. If the deleted
+     * scope is active, the boundary is fenced like [clearActive] so in-flight
+     * writers cannot resurrect cookies after the persisted wipe.
+     */
+    fun clearServer(serverId: String) {
+        synchronized(credentialLock) {
+            if (credentialBoundary.serverId == serverId) {
+                credentialBoundary =
+                    credentialBoundary.copy(
+                        generation = credentialBoundary.generation + 1,
+                        acceptsCookies = false,
+                    )
+            }
+            cache.remove(serverId)
+            loadedScopes.add(serverId)
+            enqueuePersistence { store.clear(serverId) }
+        }
+    }
+
     /** Clear the active server scope's in-memory + persisted cookies. */
     fun clearActive() {
         synchronized(credentialLock) {
