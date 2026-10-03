@@ -188,11 +188,11 @@ jobs:
         run: |
           umask 077
           printf '%s' "$KEYSTORE_BASE64" |
-            base64 -d > "$RUNNER_TEMP/hermes-mobile-release.keystore"
+            base64 -d > "$RUNNER_TEMP/hermes-pocket-release.keystore"
 
       - name: Build signed Hermes release APK
         env:
-          KEYSTORE_PATH: ${{ runner.temp }}/hermes-mobile-release.keystore
+          KEYSTORE_PATH: ${{ runner.temp }}/hermes-pocket-release.keystore
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
@@ -208,7 +208,7 @@ jobs:
           set -eu
           mkdir -p release
           APK=app/build/outputs/apk/hermes/release/app-hermes-release.apk
-          OUT=release/hermes-mobile-$RELEASE_TAG.apk
+          OUT=release/hermes-pocket-$RELEASE_TAG.apk
           cp "$APK" "$OUT"
           APKSIGNER=$(
             find "$ANDROID_HOME/build-tools" \
@@ -226,7 +226,7 @@ jobs:
 
           EXPECTED_CERT=$(
             openssl x509 \
-              -in signing/hermes-mobile-release-certificate.pem \
+              -in signing/hermes-pocket-release-certificate.pem \
               -noout \
               -fingerprint \
               -sha256
@@ -273,11 +273,11 @@ jobs:
 
           (
             cd release
-            sha256sum "hermes-mobile-$RELEASE_TAG.apk" \
-              > "hermes-mobile-$RELEASE_TAG.apk.sha256"
+            sha256sum "hermes-pocket-$RELEASE_TAG.apk" \
+              > "hermes-pocket-$RELEASE_TAG.apk.sha256"
           )
           cp LICENSE NOTICE SIGNING.md release/
-          cp signing/hermes-mobile-release-certificate.pem release/
+          cp signing/hermes-pocket-release-certificate.pem release/
           {
             echo "versionName=${{ steps.version.outputs.version }}"
             echo "versionCode=${{ steps.version.outputs.code }}"
@@ -287,14 +287,14 @@ jobs:
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: hermes-mobile-release
+          name: hermes-pocket-release
           path: release/
           if-no-files-found: error
           retention-days: 90
 
       - name: Remove temporary keystore
         if: always()
-        run: rm -f "$RUNNER_TEMP/hermes-mobile-release.keystore"
+        run: rm -f "$RUNNER_TEMP/hermes-pocket-release.keystore"
 
   publish:
     name: Create draft GitHub release
@@ -307,7 +307,7 @@ jobs:
       - name: Download verified release artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: hermes-mobile-release
+          name: hermes-pocket-release
           path: release
 
       - name: Create draft GitHub release
@@ -318,11 +318,11 @@ jobs:
           generate_release_notes: true
           draft: true
           files: |
-            release/hermes-mobile-${{ needs.build-release.outputs.release_tag }}.apk
-            release/hermes-mobile-${{ needs.build-release.outputs.release_tag }}.apk.sha256
+            release/hermes-pocket-${{ needs.build-release.outputs.release_tag }}.apk
+            release/hermes-pocket-${{ needs.build-release.outputs.release_tag }}.apk.sha256
             release/apksigner-verification.txt
             release/provenance.txt
             release/LICENSE
             release/NOTICE
             release/SIGNING.md
-            release/hermes-mobile-release-certificate.pem
+            release/hermes-pocket-release-certificate.pem

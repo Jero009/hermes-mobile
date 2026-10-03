@@ -18,7 +18,7 @@ android {
     }
     compileSdk = 37
     defaultConfig {
-        applicationId = "sh.slb.hermesmobile"
+        applicationId = "si.jero.hermespocket"
         minSdk = 26
         // Android 17 target behavior requires a profile-aware local-network
         // permission flow. Compile against API 37 without opting into that
