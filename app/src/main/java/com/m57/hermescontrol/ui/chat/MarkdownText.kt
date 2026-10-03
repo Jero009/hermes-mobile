@@ -61,6 +61,7 @@ import com.m57.hermescontrol.theme.SearchHighlightColors
 import com.m57.hermescontrol.theme.WithoutChatFontScale
 import com.m57.hermescontrol.theme.searchHighlightColors
 import com.m57.hermescontrol.util.BidiUtils
+import com.m57.hermescontrol.util.SafeExternalUrl
 
 private val URL_PATTERN = Regex("""https?://[^\s)>\[\]"'‘’]+""")
 private val TABLE_COL_WIDTH = 160.dp
@@ -1690,7 +1691,8 @@ private fun parseInlineSource(
                     }
                 }
 
-                // [text](url)
+                // [text](url) — the destination comes from model output, so only
+                // bounded HTTPS URLs without embedded credentials get an open action.
                 src.startsWith("[", i) -> {
                     val close = src.indexOf(']', i)
                     if (close != -1 && close + 1 < src.length && src[close + 1] == '(') {
@@ -1698,7 +1700,8 @@ private fun parseInlineSource(
                         if (urlEnd != -1) {
                             val label = src.substring(i + 1, close)
                             val url = src.substring(close + 2, urlEnd)
-                            pushLink(LinkAnnotation.Url(url))
+                            val safeLink = SafeExternalUrl.sanitizeOrNull(url) != null
+                            if (safeLink) pushLink(LinkAnnotation.Url(url))
                             val labelText =
                                 parseInlineSource(
                                     label,
@@ -1713,7 +1716,7 @@ private fun parseInlineSource(
                             withStyle(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline)) {
                                 append(labelText)
                             }
-                            pop()
+                            if (safeLink) pop()
                             i = urlEnd + 1
                         } else {
                             append(src[i])
@@ -1725,11 +1728,12 @@ private fun parseInlineSource(
                     }
                 }
 
-                // bare URL
+                // bare URL — same shared external URL policy as Markdown links.
                 urlMatch != null -> {
                     val url = urlMatch.value
                     val urlToAppend = if (isRtl) BidiUtils.wrapLtrIsolate(url) else url
-                    pushLink(LinkAnnotation.Url(url))
+                    val safeLink = SafeExternalUrl.sanitizeOrNull(url) != null
+                    if (safeLink) pushLink(LinkAnnotation.Url(url))
                     withStyle(
                         SpanStyle(
                             color = linkColor,
@@ -1738,7 +1742,7 @@ private fun parseInlineSource(
                     ) {
                         append(urlToAppend)
                     }
-                    pop()
+                    if (safeLink) pop()
                     i = urlMatch.range.last + 1
                 }
 

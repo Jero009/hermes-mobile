@@ -61,10 +61,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -87,6 +86,7 @@ import com.m57.hermescontrol.ui.common.StatCard
 import com.m57.hermescontrol.ui.common.StatusBadge
 import com.m57.hermescontrol.ui.common.StatusBadgeType
 import com.m57.hermescontrol.ui.common.ToastEffect
+import com.m57.hermescontrol.ui.keys.copySensitiveText
 import com.m57.hermescontrol.ui.system.components.CredentialEntryRow
 import com.m57.hermescontrol.ui.system.components.HookCard
 
@@ -574,7 +574,11 @@ private fun LazyListScope.portalSection(
                     // Manage subscription link
                     portal.subscription_url?.let { url ->
                         TextButton(
-                            onClick = { uriHandler.openUri(url) },
+                            onClick = {
+                                com.m57.hermescontrol.util.SafeExternalUrl
+                                    .sanitizeOrNull(url)
+                                    ?.let { uriHandler.openUri(it) }
+                            },
                             modifier = Modifier.padding(top = spacing.xs),
                         ) {
                             Icon(Icons.Filled.Link, contentDescription = null, modifier = Modifier.size(16.dp))
@@ -1420,8 +1424,7 @@ private fun LazyListScope.operationsSection(
                 // Debug share results
                 state.debugShare?.let { share ->
                     Spacer(modifier = Modifier.height(spacing.sm))
-                    @Suppress("DEPRECATION")
-                    val clipboardManager = LocalClipboardManager.current
+                    val context = LocalContext.current
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1468,8 +1471,9 @@ private fun LazyListScope.operationsSection(
                                 modifier = Modifier.weight(1f),
                             )
                             IconButton(onClick = {
-                                @Suppress("DEPRECATION")
-                                clipboardManager.setText(AnnotatedString(url))
+                                // Debug-share URLs grant access to uploaded
+                                // diagnostics — copy with sensitive metadata.
+                                copySensitiveText(context, name, url)
                             }) {
                                 Icon(
                                     Icons.Filled.ContentCopy,

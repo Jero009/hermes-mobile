@@ -7,12 +7,14 @@ import android.content.SharedPreferences
 import com.m57.hermescontrol.data.config.ConnectionProfile
 import com.m57.hermescontrol.data.remote.CookieManager
 import com.m57.hermescontrol.data.remote.GatewayFileClient
+import com.m57.hermescontrol.data.remote.wrapSessionCookie
 import com.m57.hermescontrol.data.security.SecretStore
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkStatic
 import io.mockk.unmockkAll
 import io.mockk.verify
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -912,5 +914,102 @@ class AuthManagerTest {
         // token should now be persisted under the default profile key, and the legacy key removed
         verify { mockEditor.putString("token_${AuthManager.DEFAULT_PROFILE_ID}", "legacy-standalone-token") }
         verify { mockEditor.putString("legacy_default_migrated", "true") }
+    }
+
+    // ── Audit V1: legacy wildcard session cookies vs default-profile URL changes ──
+
+    private fun seedLegacyWildcardSessionCookie(value: String) {
+        kotlinx.coroutines.runBlocking {
+            CookieManager.cookieJar.useStore(AuthManager.DEFAULT_PROFILE_ID)
+        }
+        val legacy = requireNotNull(wrapSessionCookie(value))
+        CookieManager.cookieJar.saveFromResponse(
+            "https://old-hermes.example.com/".toHttpUrl(),
+            listOf(legacy),
+        )
+    }
+
+    @Test
+    fun setBaseUrlRetiresLegacyWildcardCookieWhenDefaultProfileUrlChanges() {
+        seedLegacyWildcardSessionCookie("legacy-session-value")
+        assertEquals("legacy-session-value", CookieManager.getSessionCookie())
+
+        AuthManager.ensureDefaultSelected()
+        AuthManager.setBaseUrl("https://new-hermes.example.com:9119/")
+
+        assertNull(CookieManager.getSessionCookie())
+        assertTrue(
+            CookieManager.cookieJar
+                .loadForRequest("https://new-hermes.example.com:9119/api/status".toHttpUrl())
+                .isEmpty(),
+        )
+    }
+
+    @Test
+    fun setBaseUrlToSameUrlKeepsLegacyWildcardCookie() {
+        seedLegacyWildcardSessionCookie("legacy-session-value")
+
+        AuthManager.ensureDefaultSelected()
+        AuthManager.setBaseUrl("https://127.0.0.1:9119/")
+
+        assertEquals("legacy-session-value", CookieManager.getSessionCookie())
+    }
+
+    // ── Audit V2: profile deletion clears the profile's scoped cookie store ──
+
+    private fun hostCookie(
+        host: String,
+        value: String,
+    ): okhttp3.Cookie =
+        okhttp3.Cookie
+            .Builder()
+            .name(com.m57.hermescontrol.data.remote.SESSION_COOKIE_NAME)
+            .value(value)
+            .expiresAt(System.currentTimeMillis() + 10L * 365 * 24 * 60 * 60 * 1000)
+            .hostOnlyDomain(host)
+            .path("/")
+            .build()
+
+    @Test
+    fun deletingProfileClearsItsScopedCookieStoreButKeepsOtherProfiles() {
+        val default =
+            ConnectionProfile(
+                id = AuthManager.DEFAULT_PROFILE_ID,
+                name = "Default",
+                baseUrl = "https://default.example.com:9119/",
+            )
+        val scoped =
+            ConnectionProfile(id = "prof-scoped", name = "Scoped", baseUrl = "https://scoped.example.com:9119/")
+        val other =
+            ConnectionProfile(id = "prof-other", name = "Other", baseUrl = "https://other.example.com:9119/")
+        AuthManager.saveConnectionProfiles(listOf(default, scoped, other))
+
+        kotlinx.coroutines.runBlocking { CookieManager.cookieJar.useStore("prof-scoped") }
+        CookieManager.cookieJar.saveFromResponse(
+            "https://scoped.example.com:9119/".toHttpUrl(),
+            listOf(hostCookie("scoped.example.com", "scoped-session")),
+        )
+        kotlinx.coroutines.runBlocking { CookieManager.cookieJar.useStore("prof-other") }
+        CookieManager.cookieJar.saveFromResponse(
+            "https://other.example.com:9119/".toHttpUrl(),
+            listOf(hostCookie("other.example.com", "other-session")),
+        )
+
+        // Delete "prof-scoped" while "prof-other" survives.
+        AuthManager.saveConnectionProfiles(listOf(default, other))
+
+        kotlinx.coroutines.runBlocking { CookieManager.cookieJar.useStore("prof-scoped") }
+        assertTrue(
+            CookieManager.cookieJar
+                .loadForRequest("https://scoped.example.com:9119/api/status".toHttpUrl())
+                .isEmpty(),
+        )
+        kotlinx.coroutines.runBlocking { CookieManager.cookieJar.useStore("prof-other") }
+        assertEquals(
+            listOf("other-session"),
+            CookieManager.cookieJar
+                .loadForRequest("https://other.example.com:9119/api/status".toHttpUrl())
+                .map { it.value },
+        )
     }
 }

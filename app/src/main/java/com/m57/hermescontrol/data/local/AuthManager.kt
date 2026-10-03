@@ -233,7 +233,12 @@ object AuthManager {
     fun getConnectionProfiles(): List<ConnectionProfile> = serverStore.getLatestState().connectionProfiles
 
     fun saveConnectionProfiles(profiles: List<ConnectionProfile>) {
-        synchronized(this) { serverStore.update { it.copy(connectionProfiles = profiles) } }
+        synchronized(this) {
+            val previous = serverStore.getLatestState()
+            serverStore.update { it.copy(connectionProfiles = profiles) }
+            retireDeletedProfileScopes(previous, serverStore.getLatestState())
+            retireLegacyWildcardCookiesIfDefaultUrlChanged(previous, serverStore.getLatestState())
+        }
     }
 
     fun saveConnectionProfilesAndToken(
@@ -242,6 +247,7 @@ object AuthManager {
         token: String?,
     ) {
         synchronized(this) {
+            val previous = serverStore.getLatestState()
             serverStore.update { it.copy(connectionProfiles = profiles) }
             requireSecureStorage().putString(SecureStorage.authKey("token_$profileId"), token)
             if (getSelectedProfileId() == profileId) {
@@ -249,6 +255,8 @@ object AuthManager {
                 tokenInitialized = true
                 publishTokenLocked(token)
             }
+            retireDeletedProfileScopes(previous, serverStore.getLatestState())
+            retireLegacyWildcardCookiesIfDefaultUrlChanged(previous, serverStore.getLatestState())
         }
     }
 
@@ -258,12 +266,15 @@ object AuthManager {
         token: String?,
     ) {
         synchronized(this) {
+            val previous = serverStore.getLatestState()
             serverStore.update { it.copy(connectionProfiles = profiles, selectedProfileId = profileId) }
             requireSecureStorage().putString(SecureStorage.authKey("token_$profileId"), token)
             cachedToken = token
             tokenInitialized = true
             syncCookieStoreForProfile(profileId)
             publishTokenLocked(token)
+            retireDeletedProfileScopes(previous, serverStore.getLatestState())
+            retireLegacyWildcardCookiesIfDefaultUrlChanged(previous, serverStore.getLatestState())
         }
     }
 
@@ -590,6 +601,7 @@ object AuthManager {
                     ensureDefaultSelected()
                     DEFAULT_PROFILE_ID
                 }
+            val previous = serverStore.getLatestState()
             serverStore.update { state ->
                 val profiles =
                     state.connectionProfiles.map { profile ->
@@ -608,8 +620,44 @@ object AuthManager {
                     connectionProfiles = profiles,
                 )
             }
+            retireLegacyWildcardCookiesIfDefaultUrlChanged(previous, serverStore.getLatestState())
         }
     }
+
+    /**
+     * Migration-era wildcard session cookies are host-less: they match every
+     * request made from the default scope. When the default profile's base
+     * URL changes, retire them so a legacy session credential is never
+     * replayed against a different server.
+     */
+    private fun retireLegacyWildcardCookiesIfDefaultUrlChanged(
+        previous: ServerStoreState,
+        current: ServerStoreState,
+    ) {
+        if (defaultScopeServerUrl(previous) != defaultScopeServerUrl(current)) {
+            CookieManager.clearLegacyWildcardCookies(DEFAULT_PROFILE_ID)
+        }
+    }
+
+    /**
+     * When saving the profile list removes connection profiles, retire each
+     * removed profile's endpoint-scoped cookie store. Deleted profiles must
+     * not leave session credentials in memory or in encrypted persistence.
+     */
+    private fun retireDeletedProfileScopes(
+        previous: ServerStoreState,
+        current: ServerStoreState,
+    ) {
+        val removedIds = previous.connectionProfiles.mapTo(HashSet()) { it.id }
+        removedIds.removeAll(current.connectionProfiles.mapTo(HashSet()) { it.id })
+        for (removedId in removedIds) CookieManager.clearForServer(removedId)
+    }
+
+    private fun defaultScopeServerUrl(state: ServerStoreState): String =
+        state.connectionProfiles
+            .firstOrNull { it.id == DEFAULT_PROFILE_ID }
+            ?.resolveBaseUrl(state.baseUrl)
+            ?: state.resolvedBaseUrl
 
     /** Compatibility accessors for legacy pairing payloads. */
     fun getHost(): String = serverStore.getLatestState().resolvedHost

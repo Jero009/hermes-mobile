@@ -57,6 +57,11 @@ import kotlinx.serialization.Serializable
 
 @Serializable data object FilesScreen : NavKey
 
+/** Drill-down: one local phone group chat room. */
+@Serializable data class BotGroupScreen(
+    val roomId: String,
+) : NavKey
+
 // ── Settings drill-down sub-pages ──────────────────────────────────────
 
 @Serializable data object SettingsConnection : NavKey

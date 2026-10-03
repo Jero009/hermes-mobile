@@ -108,6 +108,16 @@ object CookieManager {
         jar?.pruneServerCache(allScopes = false)
     }
 
+    /** Retire migration-era wildcard session cookies from one profile's scope. */
+    fun clearLegacyWildcardCookies(serverId: String) {
+        jar?.clearLegacyWildcardCookies(serverId)
+    }
+
+    /** Wipe one server scope's cookies entirely (profile deletion). */
+    fun clearForServer(serverId: String) {
+        jar?.clearServer(serverId)
+    }
+
     /** Wipe all cookies across all server scopes (logout / full reset). */
     fun clearAll() {
         jar?.clearAll()

@@ -920,4 +920,64 @@ class MarkdownTextFeatureTest {
         assertEquals(listOf("Name", "Status"), table.header)
         assertEquals(listOf("Alice", "جاهز"), table.rows.single())
     }
+
+    // ── Audit V3: model-generated chat links follow the shared external URL policy ──
+
+    @Test
+    fun unsafeMarkdownLinkDestinationsDoNotProduceLinkAnnotations() {
+        val unsafeSources =
+            listOf(
+                "[click](javascript:showAlert)",
+                "[click](intent://example.com/#Intent;end)",
+                "[click](https://user:secret@idp.example/authorize)",
+                "[click](http://idp.example/authorize)",
+            )
+        for (source in unsafeSources) {
+            val parsed = parseInline(source, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+            assertEquals("click", parsed.text)
+            assertTrue(
+                "unsafe destination must not open: $source",
+                parsed.getLinkAnnotations(0, parsed.length).isEmpty(),
+            )
+        }
+    }
+
+    @Test
+    fun validHttpsMarkdownLinkKeepsItsLinkAnnotation() {
+        val parsed =
+            parseInline(
+                "[click](https://idp.example/authorize)",
+                Color.Black,
+                "",
+                false,
+                Color.Blue,
+                DEFAULT_HIGHLIGHTS,
+            )
+
+        assertEquals(
+            "https://idp.example/authorize",
+            (
+                parsed.getLinkAnnotations(
+                    0,
+                    parsed.length,
+                ).single().item as androidx.compose.ui.text.LinkAnnotation.Url
+            ).url,
+        )
+    }
+
+    @Test
+    fun bareHttpUrlDoesNotProduceLinkAnnotation() {
+        val parsed =
+            parseInline("see http://example.com/page now", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+
+        assertTrue(parsed.getLinkAnnotations(0, parsed.length).isEmpty())
+    }
+
+    @Test
+    fun bareHttpsUrlProducesLinkAnnotation() {
+        val parsed =
+            parseInline("see https://example.com/page now", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+
+        assertEquals(1, parsed.getLinkAnnotations(0, parsed.length).size)
+    }
 }

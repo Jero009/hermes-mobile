@@ -2,6 +2,8 @@ package com.m57.hermescontrol.ui.sessions
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.m57.hermescontrol.data.bots.filterManagedBotSessions
+import com.m57.hermescontrol.data.bots.isManagedBotSession
 import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.model.BulkDeleteRequest
 import com.m57.hermescontrol.data.model.PruneRequest
@@ -80,6 +82,12 @@ data class SessionsUiState(
     val searchTitles: Map<String, String> = emptyMap(),
     val liveStatuses: Map<String, SessionLiveStatus> = emptyMap(),
     val liveStatusesAuthoritative: Boolean = false,
+    /**
+     * Session ids observed to be bot-owned (invisible managed titles) while
+     * paging. Search hits carry no titles server-side, so these known ids are
+     * what keeps owned sessions out of search results too.
+     */
+    val managedSessionIds: Set<String> = emptySet(),
 ) {
     val hasMore: Boolean get() = !paginationExhausted && total > serverOffset
     val isSearchMode: Boolean get() = searchQuery.isNotBlank()
@@ -87,6 +95,10 @@ data class SessionsUiState(
 
 private fun com.m57.hermescontrol.data.model.SessionListResponse.nextOffset(requestOffset: Int): Int =
     if (limit > 0) offset + limit else requestOffset + sessions.size
+
+/** Bot-owned session ids present in a page, remembered so search can drop them too. */
+private fun managedIdsIn(sessions: List<SessionInfo>): Set<String> =
+    sessions.filter { it.isManagedBotSession() }.map { it.id }.toSet()
 
 class SessionsViewModel(
     private val pinStore: SessionPinStore = AuthManagerSessionPinStore(),
@@ -198,6 +210,7 @@ class SessionsViewModel(
                 onSuccess = { data ->
                     if (generation != loadGeneration) return@safeLaunchLoad
                     val incoming = data.sessions.orEmpty()
+                    val visible = filterManagedBotSessions(incoming)
                     val nextOffset = data.nextOffset(0)
                     _uiState.update {
                         it.copy(
@@ -206,10 +219,11 @@ class SessionsViewModel(
                             sessions =
                                 mergeSessionPage(
                                     previous = it.sessions,
-                                    incoming = incoming,
+                                    incoming = visible,
                                     pinnedSessionIds = it.pinnedSessionIds,
                                 ),
-                            loadedSessionIds = incoming.mapTo(mutableSetOf()) { it.id },
+                            loadedSessionIds = visible.mapTo(mutableSetOf()) { it.id },
+                            managedSessionIds = it.managedSessionIds + managedIdsIn(incoming),
                             serverOffset = nextOffset,
                             paginationExhausted = incoming.isEmpty() || nextOffset <= 0,
                             total = data.total,
@@ -256,13 +270,15 @@ class SessionsViewModel(
                     is NetworkResult.Success -> {
                         val data = result.data
                         val nextOffset = data.nextOffset(state.serverOffset)
+                        val incomingVisible = filterManagedBotSessions(data.sessions)
                         _uiState.update {
                             if (generation != loadGeneration) return@update it
                             it.copy(
                                 isLoadingMore = false,
-                                sessions = mergeSessionRows(it.sessions, data.sessions),
+                                sessions = mergeSessionRows(it.sessions, incomingVisible),
                                 loadedSessionIds =
-                                    it.loadedSessionIds + data.sessions.map { session -> session.id },
+                                    it.loadedSessionIds + incomingVisible.map { session -> session.id },
+                                managedSessionIds = it.managedSessionIds + managedIdsIn(data.sessions),
                                 serverOffset = nextOffset,
                                 paginationExhausted = data.sessions.isEmpty() || nextOffset <= state.serverOffset,
                                 total = data.total,
@@ -327,7 +343,14 @@ class SessionsViewModel(
                     ).filter { it.inSection(section) }
                 if (hydrated.isNotEmpty() && generation == loadGeneration) {
                     _uiState.update {
-                        it.copy(sessions = mergeSessionRows(it.sessions, hydrated))
+                        it.copy(
+                            sessions =
+                                mergeSessionRows(
+                                    it.sessions,
+                                    filterManagedBotSessions(hydrated),
+                                ),
+                            managedSessionIds = it.managedSessionIds + managedIdsIn(hydrated),
+                        )
                     }
                 }
             }
@@ -421,7 +444,8 @@ class SessionsViewModel(
                                 // #1186: LazyList uses surfaced session IDs, not lineage roots.
                                 searchResults =
                                     result.data.results.distinctBy { hit -> hit.session_id }
-                                        .filterNot { hit -> hit.session_id in deletedSearchIds },
+                                        .filterNot { hit -> hit.session_id in deletedSearchIds }
+                                        .filterNot { hit -> hit.session_id in it.managedSessionIds },
                                 searchError = null,
                             )
                         }

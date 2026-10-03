@@ -1,7 +1,7 @@
 package com.m57.hermescontrol.ui.mcp
 
 import com.m57.hermescontrol.data.remote.NetworkError
-import java.net.URI
+import com.m57.hermescontrol.util.SafeExternalUrl
 
 internal enum class OAuthFlowState {
     PENDING,
@@ -35,14 +35,9 @@ internal object McpOAuthPolicy {
     /**
      * Accept only ordinary HTTPS authorization URLs. The URL comes from a
      * remote dashboard response and is handed to another app through an
-     * Android intent, so fail closed on malformed URLs, credentials in the
-     * authority, custom schemes, and unbounded input.
+     * Android intent, so the shared external URL policy fails closed on
+     * malformed URLs, credentials in the authority, custom schemes, and
+     * unbounded input.
      */
-    fun authorizationUrlOrNull(raw: String?): String? {
-        val value = raw?.trim()?.takeIf { it.length in 1..8_192 } ?: return null
-        val uri = runCatching { URI(value) }.getOrNull() ?: return null
-        if (!uri.scheme.equals("https", ignoreCase = true)) return null
-        if (uri.host.isNullOrBlank() || uri.userInfo != null) return null
-        return value
-    }
+    fun authorizationUrlOrNull(raw: String?): String? = SafeExternalUrl.sanitizeOrNull(raw)
 }
