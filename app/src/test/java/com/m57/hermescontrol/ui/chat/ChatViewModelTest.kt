@@ -159,6 +159,13 @@ class ChatViewModelTest {
             CompletableDeferred<Any?>(mapOf("ok" to true))
         every { HermesWsClient.connectionBinding("profile-a") } returns mockk()
         every { HermesWsClient.isConnectionBindingCurrent(any()) } returns true
+        every { HermesWsClient.sendForProfileConnection(any(), any(), any(), any()) } answers {
+            reqCount++
+            val id = "req-bound-$reqCount"
+            sentRequestIds.getOrPut(arg(1)) { mutableListOf() } += id
+            arg<((String) -> Unit)?>(3)?.invoke(id)
+            true
+        }
         every { HermesWsClient.requestForConnection(any(), any(), any(), any()) } returns
             CompletableDeferred<Any?>(mapOf("ok" to true))
 
@@ -668,7 +675,9 @@ class ChatViewModelTest {
             viewModel.sendMessage("/new")
             advanceUntilIdle()
 
-            verify(atLeast = 1) { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
+            verify(
+                atLeast = 1,
+            ) { HermesWsClient.sendForProfileConnection(any(), WsMethods.SESSION_CREATE, any(), any()) }
         }
 
     @Test
@@ -1591,8 +1600,15 @@ class ChatViewModelTest {
             advanceUntilIdle()
             respondToSessionList()
 
-            verify { HermesWsClient.send(WsMethods.SESSION_LIST, any(), any()) }
-            verify { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
+            verify {
+                HermesWsClient.sendForProfileConnection(
+                    any(),
+                    WsMethods.SESSION_LIST,
+                    any(),
+                    any(),
+                )
+            }
+            verify { HermesWsClient.sendForProfileConnection(any(), WsMethods.SESSION_CREATE, any(), any()) }
         }
 
     @Test
@@ -1606,8 +1622,15 @@ class ChatViewModelTest {
             advanceUntilIdle()
             respondToSessionList()
 
-            verify { HermesWsClient.send(WsMethods.SESSION_LIST, any(), any()) }
-            verify { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
+            verify {
+                HermesWsClient.sendForProfileConnection(
+                    any(),
+                    WsMethods.SESSION_LIST,
+                    any(),
+                    any(),
+                )
+            }
+            verify { HermesWsClient.sendForProfileConnection(any(), WsMethods.SESSION_CREATE, any(), any()) }
             assertTrue(viewModel.uiState.value.isConnected)
         }
 
@@ -1627,6 +1650,84 @@ class ChatViewModelTest {
         }
 
     @Test
+    fun testSessionListFromDroppedConnectionCannotWinAfterReconnect() =
+        runTest {
+            val viewModel = createViewModel()
+            advanceUntilIdle()
+
+            mockConnectionStatus.value = ConnectionStatus.CONNECTED
+            mockEventsFlow.emit(WsEvent.GatewayReady(null))
+            advanceUntilIdle()
+            val staleListId = sentRequestIds[WsMethods.SESSION_LIST]?.single()
+            checkNotNull(staleListId)
+
+            mockConnectionStatus.value = ConnectionStatus.RECONNECTING
+            advanceUntilIdle()
+            mockConnectionStatus.value = ConnectionStatus.CONNECTED
+            mockEventsFlow.emit(WsEvent.GatewayReady(null))
+            advanceUntilIdle()
+            val freshListId = sentRequestIds[WsMethods.SESSION_LIST]?.last()
+            checkNotNull(freshListId)
+            assertFalse(staleListId == freshListId)
+
+            mockEventsFlow.emit(
+                WsEvent.RpcResult(
+                    staleListId,
+                    mapOf(
+                        "sessions" to
+                            listOf(
+                                mapOf(
+                                    "id" to "stale-session",
+                                    "title" to "Stale",
+                                    "message_count" to 1.0,
+                                ),
+                            ),
+                    ),
+                ),
+            )
+            advanceUntilIdle()
+
+            assertNull(viewModel.uiState.value.currentSessionId)
+
+            mockEventsFlow.emit(WsEvent.RpcResult(freshListId, mapOf("sessions" to emptyList<Any>())))
+            advanceUntilIdle()
+
+            assertEquals(1, sentRequestIds[WsMethods.SESSION_CREATE]?.size)
+        }
+
+    @Test
+    fun testMissingSessionResumeFallsBackToAutomaticSessionCreation() =
+        runTest {
+            val (viewModel, _) = createViewModelWithSession()
+            val listCountBefore = sentRequestIds[WsMethods.SESSION_LIST].orEmpty().size
+            val createCountBefore = sentRequestIds[WsMethods.SESSION_CREATE].orEmpty().size
+            val resumeId = "missing-session-resume"
+            every {
+                HermesWsClient.sendForProfileConnection(
+                    any(),
+                    WsMethods.SESSION_RESUME,
+                    any(),
+                    any(),
+                )
+            } answers {
+                arg<((String) -> Unit)?>(3)?.invoke(resumeId)
+                true
+            }
+
+            viewModel.switchSession("deleted-session")
+            advanceUntilIdle()
+            mockEventsFlow.emit(WsEvent.RpcError(resumeId, JsonRpcError(4001, "Session not found")))
+            advanceUntilIdle()
+
+            assertNull(viewModel.uiState.value.currentSessionId)
+            assertEquals(listCountBefore + 2, sentRequestIds[WsMethods.SESSION_LIST].orEmpty().size)
+
+            respondToSessionList()
+
+            assertEquals(createCountBefore + 1, sentRequestIds[WsMethods.SESSION_CREATE].orEmpty().size)
+        }
+
+    @Test
     fun testGatewayReady_withInitialSessionId_switchesToIt() =
         runTest {
             val viewModel = createViewModel()
@@ -1639,7 +1740,8 @@ class ChatViewModelTest {
 
             assertEquals("session-from-notification", viewModel.uiState.value.currentSessionId)
             verify {
-                HermesWsClient.send(
+                HermesWsClient.sendForProfileConnection(
+                    any(),
                     WsMethods.SESSION_RESUME,
                     mapOf(
                         "session_id" to "session-from-notification",
@@ -1649,7 +1751,9 @@ class ChatViewModelTest {
                 )
             }
             // Should NOT create a new session
-            verify(inverse = true) { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
+            verify(
+                inverse = true,
+            ) { HermesWsClient.sendForProfileConnection(any(), WsMethods.SESSION_CREATE, any(), any()) }
         }
 
     // ── RPC result tests ─────────────────────────────────────────────────────
@@ -1722,7 +1826,9 @@ class ChatViewModelTest {
                 viewModel.uiState.value.sessions[0]
                     .messageCount,
             )
-            verify(inverse = true) { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
+            verify(
+                inverse = true,
+            ) { HermesWsClient.sendForProfileConnection(any(), WsMethods.SESSION_CREATE, any(), any()) }
         }
 
     // ── Streaming tests ──────────────────────────────────────────────────────
@@ -2869,7 +2975,8 @@ class ChatViewModelTest {
             )
 
             verify {
-                HermesWsClient.send(
+                HermesWsClient.sendForProfileConnection(
+                    any(),
                     WsMethods.SESSION_RESUME,
                     mapOf("session_id" to "session-456", "omit_messages" to true),
                     any(),
@@ -2897,14 +3004,15 @@ class ChatViewModelTest {
                     ),
                 )
             every {
-                HermesWsClient.send(
+                HermesWsClient.sendForProfileConnection(
+                    any(),
                     WsMethods.SESSION_RESUME,
                     mapOf("session_id" to "session-root", "omit_messages" to true),
                     any(),
                 )
             } answers {
-                arg<((String) -> Unit)?>(2)?.invoke(resumeRequestId)
-                resumeRequestId
+                arg<((String) -> Unit)?>(3)?.invoke(resumeRequestId)
+                true
             }
 
             viewModel.switchSession("session-root")
@@ -2979,16 +3087,17 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, _) = createViewModelWithSession()
             every {
-                HermesWsClient.send(
+                HermesWsClient.sendForProfileConnection(
+                    any(),
                     WsMethods.SESSION_RESUME,
                     any(),
                     any(),
                 )
             } answers {
-                val sessionId = arg<Map<String, Any>>(1)["session_id"] as String
+                val sessionId = arg<Map<String, Any>>(2)["session_id"] as String
                 val requestId = "resume-$sessionId"
-                arg<((String) -> Unit)?>(2)?.invoke(requestId)
-                requestId
+                arg<((String) -> Unit)?>(3)?.invoke(requestId)
+                true
             }
 
             viewModel.switchSession("session-a")
@@ -3022,9 +3131,16 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, sessionId) = createViewModelWithSession()
             val resumeId = "resume-before-undo"
-            every { HermesWsClient.send(WsMethods.SESSION_RESUME, any(), any()) } answers {
-                arg<((String) -> Unit)?>(2)?.invoke(resumeId)
-                resumeId
+            every {
+                HermesWsClient.sendForProfileConnection(
+                    any(),
+                    WsMethods.SESSION_RESUME,
+                    any(),
+                    any(),
+                )
+            } answers {
+                arg<((String) -> Unit)?>(3)?.invoke(resumeId)
+                true
             }
             val undoResult = CompletableDeferred<Any?>()
             every {
@@ -3063,9 +3179,16 @@ class ChatViewModelTest {
             val (viewModel, _) = createViewModelWithSession()
             val sessionId = "storage-root"
             val resumeId = "resume-before-reconnect"
-            every { HermesWsClient.send(WsMethods.SESSION_RESUME, any(), any()) } answers {
-                arg<((String) -> Unit)?>(2)?.invoke(resumeId)
-                resumeId
+            every {
+                HermesWsClient.sendForProfileConnection(
+                    any(),
+                    WsMethods.SESSION_RESUME,
+                    any(),
+                    any(),
+                )
+            } answers {
+                arg<((String) -> Unit)?>(3)?.invoke(resumeId)
+                true
             }
             viewModel.switchSession(sessionId)
             advanceUntilIdle()
@@ -3087,9 +3210,16 @@ class ChatViewModelTest {
         runTest {
             val (viewModel, _) = createViewModelWithSession()
             val resumeId = "valid-resume"
-            every { HermesWsClient.send(WsMethods.SESSION_RESUME, any(), any()) } answers {
-                arg<((String) -> Unit)?>(2)?.invoke(resumeId)
-                resumeId
+            every {
+                HermesWsClient.sendForProfileConnection(
+                    any(),
+                    WsMethods.SESSION_RESUME,
+                    any(),
+                    any(),
+                )
+            } answers {
+                arg<((String) -> Unit)?>(3)?.invoke(resumeId)
+                true
             }
             viewModel.switchSession("storage-root")
             advanceUntilIdle()
@@ -3162,14 +3292,15 @@ class ChatViewModelTest {
             }
             val resumeRequestId = "resume-pagination"
             every {
-                HermesWsClient.send(
+                HermesWsClient.sendForProfileConnection(
+                    any(),
                     WsMethods.SESSION_RESUME,
                     mapOf("session_id" to "session-root", "omit_messages" to true),
                     any(),
                 )
             } answers {
-                arg<((String) -> Unit)?>(2)?.invoke(resumeRequestId)
-                resumeRequestId
+                arg<((String) -> Unit)?>(3)?.invoke(resumeRequestId)
+                true
             }
 
             viewModel.switchSession("session-root")
@@ -5441,13 +5572,83 @@ class ChatViewModelTest {
             runCurrent()
 
             // The first attempt went out and nothing acknowledged it.
-            verify(exactly = 1) { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
+            verify(
+                exactly = 1,
+            ) { HermesWsClient.sendForProfileConnection(any(), WsMethods.SESSION_CREATE, any(), any()) }
             assertFalse(viewModel.uiState.value.isSessionReady)
 
             advanceTimeBy(createRetryDelayMs + 1)
             runCurrent()
 
-            verify(exactly = 2) { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
+            verify(
+                exactly = 2,
+            ) { HermesWsClient.sendForProfileConnection(any(), WsMethods.SESSION_CREATE, any(), any()) }
+        }
+
+    @Test
+    fun `session create is reconciled instead of retried after a connection drop`() =
+        runTest {
+            val viewModel = createViewModelWithCreateRetry()
+            advanceUntilIdle()
+
+            mockConnectionStatus.value = ConnectionStatus.CONNECTED
+            mockEventsFlow.emit(WsEvent.GatewayReady(null))
+            runCurrent()
+            val initialListId = sentRequestIds[WsMethods.SESSION_LIST]?.last()
+            checkNotNull(initialListId)
+            mockEventsFlow.emit(WsEvent.RpcResult(initialListId, mapOf("sessions" to emptyList<Any>())))
+            runCurrent()
+
+            verify(exactly = 1) {
+                HermesWsClient.sendForProfileConnection(
+                    any(),
+                    WsMethods.SESSION_CREATE,
+                    any(),
+                    any(),
+                )
+            }
+
+            mockConnectionStatus.value = ConnectionStatus.RECONNECTING
+            runCurrent()
+            advanceTimeBy(createRetryDelayMs + 1)
+            runCurrent()
+
+            verify(exactly = 1) {
+                HermesWsClient.sendForProfileConnection(
+                    any(),
+                    WsMethods.SESSION_CREATE,
+                    any(),
+                    any(),
+                )
+            }
+
+            mockConnectionStatus.value = ConnectionStatus.CONNECTED
+            mockEventsFlow.emit(WsEvent.GatewayReady(null))
+            runCurrent()
+
+            verify(exactly = 1) {
+                HermesWsClient.sendForProfileConnection(
+                    any(),
+                    WsMethods.SESSION_CREATE,
+                    any(),
+                    any(),
+                )
+            }
+
+            val reconciledListId = sentRequestIds[WsMethods.SESSION_LIST]?.last()
+            checkNotNull(reconciledListId)
+            mockEventsFlow.emit(WsEvent.RpcResult(reconciledListId, mapOf("sessions" to emptyList<Any>())))
+            runCurrent()
+
+            verify(exactly = 2) {
+                HermesWsClient.sendForProfileConnection(
+                    any(),
+                    WsMethods.SESSION_CREATE,
+                    any(),
+                    any(),
+                )
+            }
+            assertFalse(viewModel.uiState.value.isSessionReady)
         }
 
     @Test
@@ -5469,7 +5670,7 @@ class ChatViewModelTest {
             advanceUntilIdle()
 
             verify(exactly = createMaxAttempts) {
-                HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any())
+                HermesWsClient.sendForProfileConnection(any(), WsMethods.SESSION_CREATE, any(), any())
             }
             assertFalse(viewModel.uiState.value.isLoading)
             assertEquals("Couldn't start a new chat.", viewModel.uiState.value.errorMessage)
@@ -5499,7 +5700,9 @@ class ChatViewModelTest {
 
             assertTrue(viewModel.uiState.value.isSessionReady)
             assertEquals("session-123", viewModel.uiState.value.currentSessionId)
-            verify(exactly = 1) { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) }
+            verify(
+                exactly = 1,
+            ) { HermesWsClient.sendForProfileConnection(any(), WsMethods.SESSION_CREATE, any(), any()) }
             assertNull(viewModel.uiState.value.errorMessage)
         }
 
@@ -5515,12 +5718,19 @@ class ChatViewModelTest {
             // aimed at session.list is discarded by its own handler, passing
             // this test without ever reaching the generation fence.
             val createIds = mutableListOf<String>()
-            every { HermesWsClient.send(WsMethods.SESSION_CREATE, any(), any()) } answers {
+            every {
+                HermesWsClient.sendForProfileConnection(
+                    any(),
+                    WsMethods.SESSION_CREATE,
+                    any(),
+                    any(),
+                )
+            } answers {
                 reqCount++
                 val id = "req-id-$reqCount"
                 createIds += id
-                arg<((String) -> Unit)?>(2)?.invoke(id)
-                id
+                arg<((String) -> Unit)?>(3)?.invoke(id)
+                true
             }
 
             viewModel.createNewSession()

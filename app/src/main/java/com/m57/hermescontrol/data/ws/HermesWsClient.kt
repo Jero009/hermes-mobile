@@ -752,6 +752,39 @@ object HermesWsClient {
                 activeConnectionGeneration == binding.generation
         }
 
+    /** Send once on the exact live profile/socket without reconnect queueing. */
+    fun sendForProfileConnection(
+        binding: ConnectionBinding,
+        method: String,
+        params: Map<String, Any> = emptyMap(),
+        onSent: ((String) -> Unit)? = null,
+    ): Boolean =
+        synchronized(connectionLock) {
+            if (!appInForeground.get() ||
+                !connected.get() ||
+                webSocket !== binding.socket ||
+                activeConnectionProfileId != binding.profileId ||
+                activeConnectionGeneration != binding.generation ||
+                AuthManager.getSelectedProfileId() != binding.profileId
+            ) {
+                return@synchronized false
+            }
+
+            val id = requestId.incrementAndGet().toString()
+            val request =
+                JsonRpcRequest(
+                    id = id,
+                    method = method,
+                    params = params.mapValues { it.value.toJsonElement() },
+                )
+            if (!binding.socket.send(OkHttpProvider.json.encodeToString(request))) {
+                recoverRejectedSocket(binding.socket)
+                return@synchronized false
+            }
+            onSent?.invoke(id)
+            true
+        }
+
     /**
      * Atomically send an awaited request on an exact live foreground socket.
      *

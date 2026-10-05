@@ -107,6 +107,13 @@ class SlashCommandDispatchRpcTest {
             arg<((String) -> Unit)?>(2)?.invoke(id)
             id
         }
+        every { HermesWsClient.sendForProfileConnection(any(), any(), any(), any()) } answers {
+            reqCount++
+            val id = "req-bound-$reqCount"
+            sentRequestIds.getOrPut(arg(1)) { mutableListOf() } += id
+            arg<((String) -> Unit)?>(3)?.invoke(id)
+            true
+        }
         every { HermesWsClient.sendMessage(any(), any(), any(), any()) } answers {
             reqCount++
             val id = "req-msg-$reqCount"

@@ -75,10 +75,8 @@ private const val MESSAGE_PAGE_SIZE = 150
 /**
  * How long an unacknowledged `session.create` waits before it is retried.
  *
- * `session.create` is fire-and-forget: [HermesWsClient.send] can queue it for a
- * later socket, or drop it outright once credentials were cleared. Chat cannot
- * recover on its own from a dropped create — it has already discarded the old
- * session id — so the request needs its own liveness deadline.
+ * `session.create` is sent once on the captured live connection. If that
+ * connection stays open but never acknowledges it, this deadline retries it.
  */
 private const val SESSION_CREATE_TIMEOUT_MS = 10_000L
 
@@ -90,6 +88,7 @@ private const val SESSION_CREATE_MAX_ATTEMPTS = 3
  * (hermes-agent `tui_gateway/server.py`, `session.redirect` handler).
  */
 private const val REDIRECT_UNSUPPORTED_CODE = 4010
+private const val SESSION_NOT_FOUND_CODE = 4001
 private const val MAX_RETIRED_RESUME_REQUESTS = 64
 
 private data class PendingRpcRequest(
@@ -104,6 +103,8 @@ private data class PendingRpcRequest(
     val redirectConnectionBinding: ConnectionBinding? = null,
     /** Attempt generation for a session.create, used to fence retried answers. */
     val createGeneration: Long? = null,
+    /** Conversation generation that owns a session.list bootstrap response. */
+    val sessionListGeneration: Long? = null,
 )
 
 private data class ResumeFence(
@@ -490,6 +491,9 @@ class ChatViewModel(
                     status == ConnectionStatus.AUTH_EXPIRED
                 ) {
                     gatewayReadyHandled = false
+                    sessionCreateJob?.cancel()
+                    sessionCreateJob = null
+                    sessionCreateCounter++
                     retireSync()
                     _uiState.value.currentSessionId?.let(repo::invalidateReplacementWrites)
                     conversationGeneration++
@@ -580,9 +584,10 @@ class ChatViewModel(
             val resumeFence = captureResumeFence(currentId)
             viewModelScope.launch(Dispatchers.IO) {
                 if (resumeFence != null && isResumeFenceCurrent(resumeFence)) {
-                    wsClient.send(
-                        WsMethods.SESSION_RESUME,
-                        mapOf("session_id" to currentId, "omit_messages" to true),
+                    wsClient.sendForProfileConnection(
+                        binding = resumeFence.connectionBinding,
+                        method = WsMethods.SESSION_RESUME,
+                        params = mapOf("session_id" to currentId, "omit_messages" to true),
                         onSent = { id -> trackResumeRequest(id, resumeFence) },
                     )
                 }
@@ -904,6 +909,9 @@ class ChatViewModel(
     ) {
         val request = pendingRequests.remove(id) ?: return
         val method = request.method
+        if (method == WsMethods.SESSION_LIST && request.sessionListGeneration != conversationGeneration) {
+            return
+        }
         when (method) {
             WsMethods.SESSION_CREATE -> {
                 // A retried create can be answered twice, and a create issued
@@ -1182,6 +1190,15 @@ class ChatViewModel(
                 is Map<*, *> -> error["message"] as? String ?: error.toString()
                 else -> error.toString()
             }
+
+        if (method == WsMethods.SESSION_LIST && request.sessionListGeneration != conversationGeneration) {
+            return
+        }
+
+        if (method == WsMethods.SESSION_RESUME && errorCode == SESSION_NOT_FOUND_CODE) {
+            recoverFromMissingSession(request.resumeSessionId)
+            return
+        }
 
         // A gateway whose running agent cannot steer an in-flight turn answers
         // session.redirect with 4010. The user's text is already on screen but
@@ -1938,10 +1955,11 @@ class ChatViewModel(
     /**
      * Ask the gateway for a fresh conversation.
      *
-     * `session.create` is fire-and-forget over a socket that may be mid-drop.
-     * [HermesWsClient.send] queues the frame while the socket is down and drops
-     * it outright once credentials were cleared, and neither path reports back
-     * — so an unlucky tap could leave Chat with no session at all:
+     * `session.create` is fire-and-forget over the exact live profile/socket.
+     * A disconnect cancels its retry generation so the next gateway bootstrap
+     * reconciles `session.list` before deciding whether another create is safe.
+     * Without a liveness deadline, an open but unresponsive gateway could leave
+     * Chat with no session at all:
      * `currentSessionId` and `runtimeSessionId` already discarded,
      * `isSessionReady` false, Send disabled, and nothing in flight to recover
      * it. That is the "leave the chat screen and come back a few times" state;
@@ -2002,51 +2020,90 @@ class ChatViewModel(
         onDispatched: (() -> Unit)? = null,
     ) {
         viewModelScope.launch(Dispatchers.IO) {
-            wsClient.send(
-                WsMethods.SESSION_CREATE,
-                params = mapOf("source" to "desktop"),
-                onSent = { id ->
-                    trackCreateRequest(id, generation)
-                    onDispatched?.invoke()
-                },
-            )
-        }
+            val binding = wsClient.connectionBinding(selectedProfileId()) ?: return@launch
+            val sent =
+                wsClient.sendForProfileConnection(
+                    binding = binding,
+                    method = WsMethods.SESSION_CREATE,
+                    params = mapOf("source" to "desktop"),
+                    onSent = { id ->
+                        trackCreateRequest(id, generation)
+                        onDispatched?.invoke()
+                    },
+                )
+            if (!sent || generation != sessionCreateCounter) return@launch
 
-        // Historical behavior: unit tests never armed the safety timer. Keep
-        // that unless a test opts into the retry path by injecting a delay.
-        val injectedDelay = sessionCreateRetryDelayMs
-        if (injectedDelay == null && isTestEnvironment()) return
-        val delayMs = injectedDelay ?: SESSION_CREATE_TIMEOUT_MS
+            // Historical behavior: unit tests never armed the safety timer. Keep
+            // that unless a test opts into the retry path by injecting a delay.
+            val injectedDelay = sessionCreateRetryDelayMs
+            if (injectedDelay == null && isTestEnvironment()) return@launch
+            val delayMs = injectedDelay ?: SESSION_CREATE_TIMEOUT_MS
 
-        sessionCreateJob =
-            viewModelScope.launch {
-                delay(delayMs)
-                if (generation != sessionCreateCounter) return@launch
-                if (_uiState.value.isSessionReady) return@launch
-                if (attempt < SESSION_CREATE_MAX_ATTEMPTS) {
-                    Log.w(TAG, "session.create unacknowledged — retrying (attempt ${attempt + 1})")
-                    sendSessionCreate(generation = generation, attempt = attempt + 1)
-                } else {
-                    Log.w(TAG, "session.create gave up after $attempt attempts")
-                    _uiState.update {
-                        it.copy(
-                            isLoading = false,
-                            errorMessage =
-                                getApplication<Application>()
-                                    .getString(R.string.chat_new_session_failed),
-                        )
+            sessionCreateJob =
+                viewModelScope.launch {
+                    delay(delayMs)
+                    if (generation != sessionCreateCounter) return@launch
+                    if (_uiState.value.isSessionReady) return@launch
+                    if (attempt < SESSION_CREATE_MAX_ATTEMPTS) {
+                        Log.w(TAG, "session.create unacknowledged — retrying (attempt ${attempt + 1})")
+                        sendSessionCreate(generation = generation, attempt = attempt + 1)
+                    } else {
+                        Log.w(TAG, "session.create gave up after $attempt attempts")
+                        _uiState.update {
+                            it.copy(
+                                isLoading = false,
+                                errorMessage =
+                                    getApplication<Application>()
+                                        .getString(R.string.chat_new_session_failed),
+                            )
+                        }
                     }
                 }
-            }
+        }
     }
 
     fun loadSessions() {
+        val generation = conversationGeneration
         viewModelScope.launch(Dispatchers.IO) {
-            wsClient.send(
-                WsMethods.SESSION_LIST,
-                onSent = { id -> trackRequest(id, WsMethods.SESSION_LIST) },
+            val binding = wsClient.connectionBinding(selectedProfileId()) ?: return@launch
+            wsClient.sendForProfileConnection(
+                binding = binding,
+                method = WsMethods.SESSION_LIST,
+                onSent = { id -> trackSessionListRequest(id, generation) },
             )
         }
+    }
+
+    private fun recoverFromMissingSession(sessionId: String?) {
+        if (sessionId == null || sessionId != _uiState.value.currentSessionId) return
+        clearPrivilegedControls()
+        invalidateHistoryRefresh()
+        repo.invalidateReplacementWrites(sessionId)
+        conversationGeneration++
+        invalidateResumeRequests()
+        sessionCreateCounter++
+        sessionCreateJob?.cancel()
+        sessionCreateJob = null
+        runtimeSessionId = null
+        ActiveSessionHolder.set(null)
+        openLatestSessionOnNextList = true
+        _uiState.update {
+            it.copy(
+                currentSessionId = null,
+                isSessionReady = false,
+                isLoading = true,
+                messages = emptyList(),
+                subagentIndicators = emptyList(),
+                todos = emptyList(),
+                chatTitle = "Hermes",
+                currentSessionModel = null,
+                terminalBackend = null,
+                modelSwitchConfirmation = null,
+                contextUsage = null,
+                showContextDetail = false,
+            )
+        }
+        loadSessions()
     }
 
     private fun fetchCommandCatalog() {
@@ -2461,9 +2518,10 @@ class ChatViewModel(
             // Resume the selected desktop session, then load its complete transcript.
             launch(Dispatchers.IO) {
                 if (resumeFence != null && isResumeFenceCurrent(resumeFence)) {
-                    wsClient.send(
-                        WsMethods.SESSION_RESUME,
-                        mapOf("session_id" to sessionId, "omit_messages" to true),
+                    wsClient.sendForProfileConnection(
+                        binding = resumeFence.connectionBinding,
+                        method = WsMethods.SESSION_RESUME,
+                        params = mapOf("session_id" to sessionId, "omit_messages" to true),
                         onSent = { id -> trackResumeRequest(id, resumeFence) },
                     )
                 }
@@ -4360,6 +4418,17 @@ class ChatViewModel(
         method: String,
     ) {
         pendingRequests[id] = PendingRpcRequest(method)
+    }
+
+    private fun trackSessionListRequest(
+        id: String,
+        generation: Long,
+    ) {
+        pendingRequests[id] =
+            PendingRpcRequest(
+                method = WsMethods.SESSION_LIST,
+                sessionListGeneration = generation,
+            )
     }
 
     /**

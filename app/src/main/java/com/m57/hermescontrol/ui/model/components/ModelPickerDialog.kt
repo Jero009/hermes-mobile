@@ -19,6 +19,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material3.AlertDialog
@@ -36,6 +38,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
@@ -44,6 +48,41 @@ import com.m57.hermescontrol.data.model.ModelProvider
 import com.m57.hermescontrol.data.model.PinnedModel
 import com.m57.hermescontrol.ui.common.LoadingState
 import com.m57.hermescontrol.ui.common.SearchBar
+
+internal data class ModelPickerSection(
+    val provider: ModelProvider,
+    val visibleModels: List<String>,
+)
+
+internal fun modelPickerSections(
+    providers: List<ModelProvider>,
+    query: String,
+    expandedProvider: String?,
+): List<ModelPickerSection> {
+    val normalizedQuery = query.trim()
+    return providers.mapNotNull { provider ->
+        val models = provider.models.orEmpty()
+        if (normalizedQuery.isEmpty()) {
+            ModelPickerSection(
+                provider = provider,
+                visibleModels = if (provider.slug == expandedProvider) models else emptyList(),
+            )
+        } else {
+            val providerMatches =
+                provider.name.contains(normalizedQuery, ignoreCase = true) ||
+                    provider.slug.contains(normalizedQuery, ignoreCase = true)
+            val matchingModels =
+                if (providerMatches) {
+                    models
+                } else {
+                    models.filter { it.contains(normalizedQuery, ignoreCase = true) }
+                }
+            matchingModels.takeIf { it.isNotEmpty() }?.let {
+                ModelPickerSection(provider = provider, visibleModels = it)
+            }
+        }
+    }
+}
 
 /**
  * Reusable model picker used by both the global model screen and the
@@ -61,12 +100,14 @@ fun ModelPickerDialog(
     title: String,
     isLoading: Boolean = false,
     pinnedModels: List<PinnedModel> = emptyList(),
+    selectedModel: String? = null,
     onPinToggle: ((provider: String, model: String) -> Unit)? = null,
     onSelect: (provider: String, model: String) -> Unit,
     onDismiss: () -> Unit,
     imeInsets: WindowInsets = WindowInsets.ime,
 ) {
     var pickerQuery by remember { mutableStateOf("") }
+    var expandedProvider by remember { mutableStateOf<String?>(null) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -136,22 +177,9 @@ fun ModelPickerDialog(
                             pinnedModels.map { "${it.providerSlug}:${it.modelName}" }.toSet()
                         }
 
-                    val filteredProvidersWithModels =
-                        remember(pickerQuery, providers) {
-                            providers.mapNotNull { provider ->
-                                val matchingModels =
-                                    provider.models.orEmpty().filter { model ->
-                                        pickerQuery.isBlank() ||
-                                            provider.name.contains(pickerQuery, ignoreCase = true) ||
-                                            provider.slug.contains(pickerQuery, ignoreCase = true) ||
-                                            model.contains(pickerQuery, ignoreCase = true)
-                                    }
-                                if (matchingModels.isNotEmpty()) {
-                                    provider to matchingModels
-                                } else {
-                                    null
-                                }
-                            }
+                    val providerSections =
+                        remember(pickerQuery, providers, expandedProvider) {
+                            modelPickerSections(providers, pickerQuery, expandedProvider)
                         }
 
                     SearchBar(
@@ -204,6 +232,8 @@ fun ModelPickerDialog(
                                             }?.capabilities
                                             ?.get(pinned.modelName),
                                     isPinned = true,
+                                    isSelected =
+                                        selectedModel == "${pinned.providerSlug}/${pinned.modelName}",
                                     onPinToggle =
                                         if (onPinToggle != null) {
                                             { onPinToggle(pinned.providerSlug, pinned.modelName) }
@@ -215,30 +245,73 @@ fun ModelPickerDialog(
                             }
                         }
 
-                        // ── All providers / models (lazy item per model) ──
-                        filteredProvidersWithModels.forEach { (provider, models) ->
+                        // ── Provider-first inventory ──
+                        providerSections.forEach { section ->
+                            val provider = section.provider
+                            val expanded = pickerQuery.isNotBlank() || expandedProvider == provider.slug
                             item(key = "header:${provider.slug}") {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(top = 12.dp, bottom = 6.dp),
+                                Surface(
+                                    modifier =
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .padding(top = 6.dp, bottom = 2.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .clickable {
+                                                expandedProvider =
+                                                    if (expandedProvider == provider.slug) null else provider.slug
+                                            }.testTag("model_picker_provider_${provider.slug}"),
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                                    border =
+                                        BorderStroke(
+                                            width = 1.dp,
+                                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f),
+                                        ),
                                 ) {
-                                    Text(
-                                        text = provider.name,
-                                        style = MaterialTheme.typography.labelLarge,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onSurface,
-                                    )
-                                    Spacer(modifier = Modifier.weight(1f))
-                                    Text(
-                                        text = "${models.size} models",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
+                                    Row(
+                                        modifier =
+                                            Modifier.padding(
+                                                start = 12.dp,
+                                                end = 4.dp,
+                                                top = 8.dp,
+                                                bottom = 8.dp,
+                                            ),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            text = provider.name,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onSurface,
+                                        )
+                                        Spacer(modifier = Modifier.weight(1f))
+                                        Text(
+                                            text = "${provider.models.orEmpty().size} models",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                        Icon(
+                                            imageVector =
+                                                if (expanded) {
+                                                    Icons.Default.ExpandLess
+                                                } else {
+                                                    Icons.Default.ExpandMore
+                                                },
+                                            contentDescription =
+                                                if (expanded) {
+                                                    "Collapse ${provider.name} models"
+                                                } else {
+                                                    "Expand ${provider.name} models"
+                                                },
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(32.dp).padding(6.dp),
+                                        )
+                                    }
                                 }
                             }
 
                             items(
-                                items = models,
+                                items = section.visibleModels,
                                 key = { model -> "${provider.slug}:$model" },
                             ) { model ->
                                 val isPinned = "${provider.slug}:$model" in pinnedSet
@@ -246,6 +319,7 @@ fun ModelPickerDialog(
                                     modelName = model,
                                     capabilities = provider.capabilities?.get(model),
                                     isPinned = isPinned,
+                                    isSelected = selectedModel == "${provider.slug}/$model",
                                     onPinToggle =
                                         if (onPinToggle != null) {
                                             { onPinToggle(provider.slug, model) }
@@ -269,6 +343,7 @@ private fun ModelItemCard(
     modelName: String,
     capabilities: ModelCapabilities?,
     isPinned: Boolean,
+    isSelected: Boolean = false,
     onPinToggle: (() -> Unit)?,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -279,13 +354,24 @@ private fun ModelItemCard(
                 .fillMaxWidth()
                 .padding(vertical = 2.dp)
                 .clip(RoundedCornerShape(12.dp))
+                .semantics { selected = isSelected }
                 .clickable(onClick = onClick),
         shape = RoundedCornerShape(12.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        color =
+            if (isSelected) {
+                MaterialTheme.colorScheme.primaryContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceContainerLow
+            },
         border =
             BorderStroke(
                 width = 1.dp,
-                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f),
+                color =
+                    if (isSelected) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                    },
             ),
     ) {
         Row(
