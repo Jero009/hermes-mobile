@@ -162,6 +162,10 @@
     <string name="chat_relogin_error_empty">Username and password cannot be empty</string>
     <string name="chat_empty_title">Ready to chat</string>
     <string name="chat_empty_subtitle">Send a message to start a conversation</string>
+    <string name="chat_tools_steps">Tools · %1$d steps</string>
+    <string name="chat_tools_running">Tools · %1$d steps · Running</string>
+    <string name="chat_tools_expand">Expand tool activity</string>
+    <string name="chat_tools_collapse">Collapse tool activity</string>
     <string name="chat_new_session_failed">Couldn\'t start a new chat. Check the connection and try again.</string>
     <string name="chat_status_connecting">Connecting to Hermes\u2026</string>
     <string name="chat_status_reconnecting">Reconnecting\u2026</string>
@@ -239,6 +243,7 @@
     <string name="settings_about_debug">Debug</string>
     <string name="settings_about_release">Release</string>
     <string name="settings_about_commit">Commit</string>
+    <string name="settings_open_source_licenses">Open-source licenses</string>
 
     <!-- Settings list summaries (drill-down) -->
     <string name="settings_summary_profiles">%1$d saved</string>
@@ -272,6 +277,7 @@
     <string name="theme_preset_catppuccin">Catppuccin</string>
     <string name="theme_preset_amoled">AMOLED Black (Dark only)</string>
     <string name="theme_preset_neon_noir">Neon Noir</string>
+    <string name="theme_preset_nothing_os_5">Nothing OS 5</string>
 
     <!-- Language -->
     <string name="settings_item_language">Language</string>

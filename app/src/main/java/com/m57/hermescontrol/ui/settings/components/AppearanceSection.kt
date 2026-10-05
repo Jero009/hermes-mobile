@@ -1,3 +1,5 @@
+// Modified from Hy4ri/hermes-mobile for this fork; see NOTICE.
+
 package com.m57.hermescontrol.ui.settings.components
 
 import androidx.compose.animation.AnimatedVisibility
@@ -131,6 +133,7 @@ internal fun AppearanceSection(
                         ThemePreset.CATPPUCCIN -> stringResource(R.string.theme_preset_catppuccin)
                         ThemePreset.AMOLED -> stringResource(R.string.theme_preset_amoled)
                         ThemePreset.NEON_NOIR -> stringResource(R.string.theme_preset_neon_noir)
+                        ThemePreset.NOTHING_OS_5 -> stringResource(R.string.theme_preset_nothing_os_5)
                     },
                 )
             }
@@ -177,6 +180,12 @@ internal fun AppearanceSection(
                                     ThemePreset.NEON_NOIR -> {
                                         stringResource(
                                             R.string.theme_preset_neon_noir,
+                                        )
+                                    }
+
+                                    ThemePreset.NOTHING_OS_5 -> {
+                                        stringResource(
+                                            R.string.theme_preset_nothing_os_5,
                                         )
                                     }
                                 },
