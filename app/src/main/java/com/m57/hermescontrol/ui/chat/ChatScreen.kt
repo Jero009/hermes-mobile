@@ -794,6 +794,7 @@ fun ChatScreen(
                     } ?: stringResource(R.string.chat_model_picker_title),
                 isLoading = state.modelPickerLoading && state.modelPickerProviders.isEmpty(),
                 pinnedModels = state.modelPickerPinned,
+                selectedModel = state.currentSessionModel,
                 onPinToggle = { provider, model -> viewModel.togglePinModel(provider, model) },
                 onSelect = { provider, model ->
                     viewModel.sendSlashModel(provider, model)

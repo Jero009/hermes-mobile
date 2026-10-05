@@ -1268,6 +1268,9 @@ class HermesWsClientTest {
         val connectedField = HermesWsClient::class.java.getDeclaredField("connected")
         connectedField.isAccessible = true
         (connectedField.get(HermesWsClient) as java.util.concurrent.atomic.AtomicBoolean).set(true)
+        val intentionalCloseField = HermesWsClient::class.java.getDeclaredField("intentionalClose")
+        intentionalCloseField.isAccessible = true
+        (intentionalCloseField.get(HermesWsClient) as AtomicBoolean).set(false)
 
         val statusField = HermesWsClient::class.java.getDeclaredField("_connectionStatus")
         statusField.isAccessible = true
@@ -2094,6 +2097,55 @@ class HermesWsClientTest {
         assertTrue(HermesWsClient.isConnected)
         assertEquals(ConnectionStatus.CONNECTED, HermesWsClient.connectionStatus.value)
         assertTrue(socketField.get(HermesWsClient) === activeSocket)
+    }
+
+    @Test
+    fun profileBoundSendRefusesAStaleProfileWithoutQueueing() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val socket = mockk<WebSocket>(relaxed = true)
+        every { socket.send(any<String>()) } returns true
+        installActiveListener(socket)
+        val binding = HermesWsClient.connectionBinding("profile-a")
+        checkNotNull(binding)
+        every { AuthManager.getSelectedProfileId() } returns "profile-b"
+
+        val sent =
+            HermesWsClient.sendForProfileConnection(
+                binding = binding,
+                method = WsMethods.SESSION_CREATE,
+                params = mapOf("source" to "desktop"),
+            )
+
+        assertFalse(sent)
+        verify(exactly = 0) { socket.send(any<String>()) }
+        assertTrue(outboundQueue().isEmpty())
+    }
+
+    @Test
+    fun profileBoundSendFailureDisconnectsWithoutQueueing() {
+        every { AuthManager.getSelectedProfileId() } returns "profile-a"
+        val socket = mockk<WebSocket>(relaxed = true)
+        every { socket.send(any<String>()) } returns false
+        every { socket.queueSize() } returns 0L
+        installActiveListener(socket)
+        val binding = HermesWsClient.connectionBinding("profile-a")
+        checkNotNull(binding)
+
+        val sent =
+            HermesWsClient.sendForProfileConnection(
+                binding = binding,
+                method = WsMethods.SESSION_RESUME,
+                params = mapOf("session_id" to "session-a"),
+            )
+
+        assertFalse(sent)
+        runBlocking {
+            withTimeout(5000) {
+                HermesWsClient.connectionStatus.first { it == ConnectionStatus.DISCONNECTED }
+            }
+        }
+        assertTrue(outboundQueue().isEmpty())
+        verify(exactly = 1) { socket.cancel() }
     }
 
     // ── Issue #635: gated-mode WS ticket fetch must not be blocked by a

@@ -4,9 +4,11 @@ import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
-import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.unit.dp
 import com.m57.hermescontrol.data.model.ModelCapabilities
 import com.m57.hermescontrol.data.model.ModelProvider
@@ -18,6 +20,35 @@ import org.junit.Test
 class ModelPickerDialogTest {
     @get:Rule
     val composeTestRule = createAndroidComposeRule<ComponentActivity>()
+
+    @Test
+    fun providersStartCollapsedAndExpandInline() {
+        composeRuleWithProviders()
+
+        composeTestRule.onAllNodesWithText("OpenAI").assertCountEquals(1)
+        composeTestRule.onAllNodesWithText("gpt-4o").assertCountEquals(0)
+        composeTestRule.onAllNodesWithContentDescription("Expand OpenAI models").assertCountEquals(1)
+
+        composeTestRule.onNodeWithTag("model_picker_provider_openai").performClick()
+
+        composeTestRule.onAllNodesWithText("gpt-4o").assertCountEquals(1)
+        composeTestRule.onAllNodesWithContentDescription("Collapse OpenAI models").assertCountEquals(1)
+
+        composeTestRule.onNodeWithTag("model_picker_provider_openai").performClick()
+
+        composeTestRule.onAllNodesWithText("gpt-4o").assertCountEquals(0)
+    }
+
+    @Test
+    fun searchRevealsMatchingModelWithoutExpandingProvider() {
+        composeRuleWithProviders()
+
+        composeTestRule.onNodeWithTag("model_picker_search").performTextInput("sonnet")
+
+        composeTestRule.onAllNodesWithText("Anthropic").assertCountEquals(1)
+        composeTestRule.onAllNodesWithText("claude-sonnet").assertCountEquals(1)
+        composeTestRule.onAllNodesWithText("OpenAI").assertCountEquals(0)
+    }
 
     @Test
     fun capabilityHintsAppearForPinnedAndOrdinaryRows() {
@@ -54,10 +85,11 @@ class ModelPickerDialogTest {
             )
         }
 
+        composeTestRule.onNodeWithTag("model_picker_provider_openai-codex").performClick()
         composeTestRule
             .onAllNodesWithText("Reasoning always on")
             .assertCountEquals(2)
-        composeTestRule.onNodeWithText("No reasoning").assertExists()
+        composeTestRule.onAllNodesWithText("No reasoning").assertCountEquals(1)
     }
 
     @Test
@@ -97,5 +129,28 @@ class ModelPickerDialogTest {
             "Close button bottom ($closeButtonBottom) must stay above keyboard top ($keyboardTop)",
             closeButtonBottom <= keyboardTop,
         )
+    }
+
+    private fun composeRuleWithProviders() {
+        composeTestRule.setContent {
+            ModelPickerDialog(
+                providers =
+                    listOf(
+                        ModelProvider(
+                            slug = "openai",
+                            name = "OpenAI",
+                            models = listOf("gpt-4o", "o3"),
+                        ),
+                        ModelProvider(
+                            slug = "anthropic",
+                            name = "Anthropic",
+                            models = listOf("claude-sonnet"),
+                        ),
+                    ),
+                title = "Switch model",
+                onSelect = { _, _ -> },
+                onDismiss = {},
+            )
+        }
     }
 }
