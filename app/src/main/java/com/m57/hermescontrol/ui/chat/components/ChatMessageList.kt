@@ -1,3 +1,5 @@
+// Modified from Hy4ri/hermes-mobile for this fork; see NOTICE.
+
 package com.m57.hermescontrol.ui.chat.components
 
 import androidx.compose.foundation.layout.Box
@@ -11,6 +13,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
@@ -75,6 +78,7 @@ fun ChatMessageList(
     onDismissClarify: (() -> Unit)? = null,
     onImageClick: (ImageViewerModel) -> Unit = {},
 ) {
+    val toolGroups = remember(messages) { toolActivityGroups(messages) }
     if (messages.isEmpty() && !isLoading) {
         Box(
             modifier = Modifier.fillMaxSize(),
@@ -112,32 +116,49 @@ fun ChatMessageList(
                         currentSearchMatchIndex < searchMatchIndices.size &&
                         searchMatchIndices[currentSearchMatchIndex] == index
 
-                val isLastMessage = index == messages.lastIndex
-                val isAssistant = message.role == MessageRole.ASSISTANT
+                val toolGroup = toolGroups[index]
+                when {
+                    toolGroup != null -> {
+                        val selectedMessageIndex = searchMatchIndices.getOrNull(currentSearchMatchIndex)
+                        ToolActivityCard(
+                            messages = toolGroup,
+                            isDarkTheme = isDark,
+                            forceExpanded =
+                                selectedMessageIndex != null &&
+                                    selectedMessageIndex in index until index + toolGroup.size,
+                        )
+                    }
 
-                if (typingEffectEnabled && isLastMessage && isAssistant && message.isStreaming &&
-                    lastAnimatedMessageId != message.id
-                ) {
-                    StreamingBubbleWithTypingEffect(
-                        streaming = message,
-                        typingDelayMs = typingEffectDelayMs,
-                        isDark = isDark,
-                        onAnimationComplete = {
-                            onLastAnimatedMessageIdChange(message.id)
-                        },
-                    )
-                } else {
-                    ChatBubble(
-                        message = message,
-                        isDarkTheme = isDark,
-                        searchQuery = if (isSearchActive) searchQuery else "",
-                        isCurrentMatch = isCurrentMatch,
-                        onRespondApproval = onRespondApproval,
-                        onCancelApproval = onCancelApproval,
-                        onOpenAttachment = viewModel::openAttachment,
-                        openingAttachmentPath = openingAttachmentPath,
-                        onImageClick = onImageClick,
-                    )
+                    message.isAggregatableToolActivity() -> Unit
+
+                    else -> {
+                        val isLastMessage = index == messages.lastIndex
+                        val isAssistant = message.role == MessageRole.ASSISTANT
+                        if (typingEffectEnabled && isLastMessage && isAssistant && message.isStreaming &&
+                            lastAnimatedMessageId != message.id
+                        ) {
+                            StreamingBubbleWithTypingEffect(
+                                streaming = message,
+                                typingDelayMs = typingEffectDelayMs,
+                                isDark = isDark,
+                                onAnimationComplete = {
+                                    onLastAnimatedMessageIdChange(message.id)
+                                },
+                            )
+                        } else {
+                            ChatBubble(
+                                message = message,
+                                isDarkTheme = isDark,
+                                searchQuery = if (isSearchActive) searchQuery else "",
+                                isCurrentMatch = isCurrentMatch,
+                                onRespondApproval = onRespondApproval,
+                                onCancelApproval = onCancelApproval,
+                                onOpenAttachment = viewModel::openAttachment,
+                                openingAttachmentPath = openingAttachmentPath,
+                                onImageClick = onImageClick,
+                            )
+                        }
+                    }
                 }
             }
 

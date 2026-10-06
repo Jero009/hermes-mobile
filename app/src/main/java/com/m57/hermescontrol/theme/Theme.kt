@@ -1,3 +1,5 @@
+// Modified from Hy4ri/hermes-mobile for this fork; see NOTICE.
+
 package com.m57.hermescontrol.theme
 
 import android.os.Build
@@ -35,13 +37,17 @@ import com.m57.hermescontrol.theme.presets.NeonNoirDarkColorScheme
 import com.m57.hermescontrol.theme.presets.NeonNoirDarkStatusColors
 import com.m57.hermescontrol.theme.presets.NeonNoirLightColorScheme
 import com.m57.hermescontrol.theme.presets.NeonNoirLightStatusColors
+import com.m57.hermescontrol.theme.presets.NothingOs5DarkColorScheme
+import com.m57.hermescontrol.theme.presets.NothingOs5DarkStatusColors
+import com.m57.hermescontrol.theme.presets.NothingOs5LightColorScheme
+import com.m57.hermescontrol.theme.presets.NothingOs5LightStatusColors
 import kotlinx.serialization.Serializable
 
 @Serializable
 enum class ThemePreference { SYSTEM, LIGHT, DARK }
 
 @Serializable
-enum class ThemePreset { DEFAULT, MONOCHROME, GRUVBOX, CATPPUCCIN, AMOLED, NEON_NOIR }
+enum class ThemePreset { DEFAULT, MONOCHROME, GRUVBOX, CATPPUCCIN, AMOLED, NEON_NOIR, NOTHING_OS_5 }
 
 val LocalThemePreference = compositionLocalOf { ThemePreference.SYSTEM }
 val LocalThemePreset = compositionLocalOf { ThemePreset.DEFAULT }
@@ -95,6 +101,7 @@ private fun resolveColorScheme(
     ThemePreset.CATPPUCCIN -> if (darkTheme) CatppuccinDarkColorScheme else CatppuccinLightColorScheme
     ThemePreset.AMOLED -> if (darkTheme) AmoledDarkColorScheme else AmoledLightColorScheme
     ThemePreset.NEON_NOIR -> if (darkTheme) NeonNoirDarkColorScheme else NeonNoirLightColorScheme
+    ThemePreset.NOTHING_OS_5 -> if (darkTheme) NothingOs5DarkColorScheme else NothingOs5LightColorScheme
 }
 
 /**
@@ -113,6 +120,7 @@ private fun resolveStatusColors(
     ThemePreset.CATPPUCCIN -> if (darkTheme) CatppuccinDarkStatusColors else CatppuccinLightStatusColors
     ThemePreset.AMOLED -> if (darkTheme) AmoledDarkStatusColors else AmoledLightStatusColors
     ThemePreset.NEON_NOIR -> if (darkTheme) NeonNoirDarkStatusColors else NeonNoirLightStatusColors
+    ThemePreset.NOTHING_OS_5 -> if (darkTheme) NothingOs5DarkStatusColors else NothingOs5LightStatusColors
 }
 
 @Composable
@@ -157,7 +165,12 @@ fun HermesControlTheme(
         MaterialTheme(
             colorScheme = colorScheme,
             typography = Typography,
-            shapes = HermesShapes,
+            shapes =
+                if (!dynamicAvailable && themePreset == ThemePreset.NOTHING_OS_5) {
+                    NothingOs5Shapes
+                } else {
+                    HermesShapes
+                },
             content = content,
         )
     }
