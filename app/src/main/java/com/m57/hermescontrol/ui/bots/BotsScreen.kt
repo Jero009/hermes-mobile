@@ -400,6 +400,11 @@ private fun BotCard(
                     )
                 }
             }
+            if (onClick != null) {
+                TextButton(onClick = onClick) {
+                    Text("Chat")
+                }
+            }
         }
     }
 }

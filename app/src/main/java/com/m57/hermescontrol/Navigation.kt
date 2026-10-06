@@ -83,7 +83,7 @@ private fun appEntryProvider(
     entry<AuthLoginScreen> {
         AuthLoginScreenContent(
             onConnected = {
-                NavigationController.resetTo(ChatScreen)
+                NavigationController.resetTo(HomeScreen)
             },
             onBack = {
                 NavigationController.goBack()
@@ -307,7 +307,7 @@ internal fun authenticatedStartScreen(
     wsAuthParam: String,
 ): NavKey =
     if (!token.isNullOrBlank() || wsAuthParam == "ticket") {
-        ChatScreen
+        HomeScreen
     } else {
         LandingScreen
     }

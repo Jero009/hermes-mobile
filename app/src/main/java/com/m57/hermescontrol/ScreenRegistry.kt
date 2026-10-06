@@ -38,6 +38,7 @@ import com.m57.hermescontrol.ui.config.ConfigScreen as ConfigScreenContent
 import com.m57.hermescontrol.ui.cron.CronJobsScreen as CronJobsScreenContent
 import com.m57.hermescontrol.ui.files.FilesScreen as FilesScreenContent
 import com.m57.hermescontrol.ui.gateway.GatewayScreen as GatewayScreenContent
+import com.m57.hermescontrol.ui.home.HomeScreen as HomeScreenContent
 import com.m57.hermescontrol.ui.kanban.KanbanScreen as KanbanScreenContent
 import com.m57.hermescontrol.ui.keys.KeysScreen as KeysScreenContent
 import com.m57.hermescontrol.ui.logs.LogsScreen as LogsScreenContent
@@ -74,6 +75,12 @@ data class ScreenDefinition(
 object ScreenRegistry {
     val ALL_SCREENS =
         listOf(
+            ScreenDefinition(
+                HomeScreen,
+                R.string.screen_home,
+                Icons.Filled.Dashboard,
+                DrawerSection.CONVERSE,
+            ) { sessionId, openDrawer -> HomeScreenContent(onOpenDrawer = openDrawer, sessionId = sessionId) },
             ScreenDefinition(
                 ChatScreen,
                 R.string.screen_chat,

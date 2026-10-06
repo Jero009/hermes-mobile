@@ -106,6 +106,7 @@
     <string name="nav_drawer_section_inspect">Inspect</string>
 
     <!-- Screen Names -->
+    <string name="screen_home">Home</string>
     <string name="screen_chat">Chat</string>
     <string name="screen_skills">Skills</string>
     <string name="screen_cron">Cron</string>
@@ -161,6 +162,9 @@
     <string name="chat_relogin_cancel">Cancel</string>
     <string name="chat_relogin_error_empty">Username and password cannot be empty</string>
     <string name="chat_empty_title">Ready to chat</string>
+    <string name="home_context_empty">Open a chat to see its live context</string>
+    <string name="home_recent_chats">Recent chats</string>
+    <string name="home_profiles">Profiles</string>
     <string name="chat_empty_subtitle">Send a message to start a conversation</string>
     <string name="chat_tools_steps">Tools · %1$d steps</string>
     <string name="chat_tools_running">Tools · %1$d steps · Running</string>

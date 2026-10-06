@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -77,6 +78,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.m57.hermescontrol.BotsScreen
 import com.m57.hermescontrol.HistoryScreen
 import com.m57.hermescontrol.NavigationController
 import com.m57.hermescontrol.R
@@ -469,7 +471,7 @@ fun ChatScreen(
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 AutoScrollingTitleText(
-                    text = state.chatTitle,
+                    text = "Agent · ${state.chatTitle}",
                     modifier = Modifier.weight(1f),
                     style =
                         MaterialTheme.typography.titleMedium.copy(
@@ -526,6 +528,12 @@ fun ChatScreen(
             }
         },
         actions = {
+            IconButton(onClick = { NavigationController.navigateTo(BotsScreen) }) {
+                Icon(
+                    imageVector = Icons.Filled.SmartToy,
+                    contentDescription = "Switch bot",
+                )
+            }
             // Search toggle
             IconButton(onClick = { viewModel.toggleSearch() }) {
                 Icon(

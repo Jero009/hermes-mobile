@@ -60,6 +60,7 @@ object NavigationController {
     // Top-level primary screens (Chat, Skills, Cron, System, Settings)
     private val primaryScreens: MutableSet<NavKey> =
         mutableSetOf(
+            HomeScreen,
             ChatScreen,
             BotsScreen,
             SkillsScreen,
@@ -96,7 +97,7 @@ object NavigationController {
      * Navigate back one step, or fall back to [fallback] when the stack has only one item.
      * Never leaves the stack empty.
      */
-    fun goBack(fallback: NavKey = ChatScreen) {
+    fun goBack(fallback: NavKey = HomeScreen) {
         val stack = backStack ?: return
         val effectiveFallback =
             if (AuthSessionState.signInRequired.value && (fallback == ChatScreen || isPrimaryScreen(fallback))) {
