@@ -34,8 +34,8 @@ class AuthenticationRoutingTest {
     }
 
     @Test
-    fun testGatedCookieSessionStartsInChatWithoutBearerToken() {
-        assertEquals(ChatScreen, authenticatedStartScreen(null, "ticket"))
+    fun testGatedCookieSessionStartsOnHomeWithoutBearerToken() {
+        assertEquals(HomeScreen, authenticatedStartScreen(null, "ticket"))
     }
 
     @Test
