@@ -169,7 +169,7 @@ class NavigationControllerTest {
         NavigationController.goBack()
 
         assertEquals(1, backStack.size)
-        assertEquals("default fallback should be ChatScreen", ChatScreen, backStack.lastOrNull())
+        assertEquals("default fallback should be HomeScreen", HomeScreen, backStack.lastOrNull())
     }
 
     @Test

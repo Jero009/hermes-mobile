@@ -9,6 +9,8 @@ import kotlinx.serialization.Serializable
 
 @Serializable data object ChatScreen : NavKey
 
+@Serializable data object HomeScreen : NavKey
+
 @Serializable data object SettingsScreen : NavKey
 
 @Serializable data object SkillsScreen : NavKey
