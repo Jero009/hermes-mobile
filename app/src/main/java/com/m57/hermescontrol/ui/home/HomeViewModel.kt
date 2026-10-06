@@ -22,6 +22,7 @@ data class HomeUiState(
     val profiles: List<ProfileInfo> = emptyList(),
     val activeProfileName: String? = null,
     val activeProfileId: String? = null,
+    val nowSeconds: Long = 0L,
     val sessions: List<SessionInfo> = emptyList(),
     val errorMessage: String? = null,
 )
@@ -71,6 +72,7 @@ class HomeViewModel(
                         profiles = profiles,
                         activeProfileName = activeName,
                         activeProfileId = AuthManager.getSelectedProfileId(),
+                        nowSeconds = System.currentTimeMillis() / 1_000L,
                         sessions = recentSessions,
                     )
                 }
@@ -95,3 +97,17 @@ fun selectActiveProfile(
         ?: profiles.firstOrNull { it.is_default == true }?.name
         ?: profiles.firstOrNull()?.name
 }
+
+private const val ACTIVE_WINDOW_SECONDS = 90L
+
+fun activeProfiles(
+    profiles: List<ProfileInfo>,
+    nowSeconds: Long,
+): List<ProfileInfo> =
+    profiles.filter { profile ->
+        listOfNotNull(
+            profile.worker_session?.last_active,
+            profile.canonical_session?.last_active,
+            profile.last_session?.last_active,
+        ).maxOrNull()?.let { it >= nowSeconds - ACTIVE_WINDOW_SECONDS } == true
+    }
