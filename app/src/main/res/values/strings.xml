@@ -165,6 +165,9 @@
     <string name="home_context_empty">Open a chat to see its live context</string>
     <string name="home_recent_chats">Recent chats</string>
     <string name="home_profiles">Profiles</string>
+    <string name="home_active_conversations">Active conversations</string>
+    <string name="home_view_all_bots">View all</string>
+    <string name="home_browse_bots">Browse all bots</string>
     <string name="chat_empty_subtitle">Send a message to start a conversation</string>
     <string name="chat_tools_steps">Tools · %1$d steps</string>
     <string name="chat_tools_running">Tools · %1$d steps · Running</string>

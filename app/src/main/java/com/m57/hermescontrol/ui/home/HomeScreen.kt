@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Dashboard
+import androidx.compose.material.icons.filled.SmartToy
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
@@ -22,6 +23,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.m57.hermescontrol.BotsScreen
 import com.m57.hermescontrol.ChatScreen
 import com.m57.hermescontrol.NavigationController
 import com.m57.hermescontrol.R
@@ -89,6 +91,34 @@ fun HomeScreen(
                         )
                     }
 
+                    val activeBots = activeProfiles(state.profiles, state.nowSeconds)
+                    if (activeBots.isNotEmpty()) {
+                        SectionHeader(
+                            title = stringResource(R.string.home_active_conversations),
+                            action = stringResource(R.string.home_view_all_bots),
+                            onAction = { NavigationController.navigateTo(BotsScreen) },
+                        )
+                        activeBots.take(2).forEach { profile ->
+                            QuickProfileRow(
+                                profile = profile,
+                                onClick = {
+                                    val selectedConnectionProfileId = AuthManager.getSelectedProfileId()
+                                    if (!selectedConnectionProfileId.isNullOrBlank() &&
+                                        !profile.canonicalSessionId.isNullOrBlank()
+                                    ) {
+                                        NavigationController.openBot(
+                                            profile,
+                                            selectedConnectionProfileId,
+                                            profile.canonicalSessionId,
+                                        )
+                                    } else {
+                                        NavigationController.navigateTo(BotsScreen)
+                                    }
+                                },
+                            )
+                        }
+                    }
+
                     val sessionsToShow = state.sessions.take(2)
                     if (sessionsToShow.isNotEmpty()) {
                         SectionHeader(title = stringResource(R.string.home_recent_chats))
@@ -119,27 +149,12 @@ fun HomeScreen(
                         }
                     }
 
-                    val openableProfiles =
-                        state.profiles.filter { !it.canonicalSessionId.isNullOrBlank() && !it.isHidden }
-                    if (openableProfiles.isNotEmpty()) {
-                        SectionHeader(title = stringResource(R.string.home_profiles))
-                        openableProfiles.take(4).forEach { profile ->
-                            QuickProfileRow(
-                                profile = profile,
-                                onClick = {
-                                    val sid = profile.canonicalSessionId ?: return@QuickProfileRow
-                                    val selectedConnectionProfileId = AuthManager.getSelectedProfileId()
-                                    if (!selectedConnectionProfileId.isNullOrBlank()) {
-                                        NavigationController.openBot(
-                                            profile,
-                                            selectedConnectionProfileId,
-                                            sid,
-                                        )
-                                    }
-                                },
-                            )
-                        }
-                    }
+                    SectionHeader(
+                        title = stringResource(R.string.home_profiles),
+                        action = stringResource(R.string.home_view_all_bots),
+                        onAction = { NavigationController.navigateTo(BotsScreen) },
+                    )
+                    BrowseBotsRow(onClick = { NavigationController.navigateTo(BotsScreen) })
 
                     if (state.sessions.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(12.dp))
@@ -274,12 +289,50 @@ private fun QuickProfileRow(
 }
 
 @Composable
-private fun SectionHeader(title: String) {
-    Text(
-        text = title,
-        modifier = Modifier.padding(start = 12.dp, top = 8.dp, bottom = 4.dp),
-        style = MaterialTheme.typography.labelLarge,
-        color = MaterialTheme.colorScheme.primary,
-        fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
-    )
+private fun BrowseBotsRow(onClick: () -> Unit) {
+    Card(
+        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+        onClick = onClick,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+    ) {
+        androidx.compose.foundation.layout.Row(
+            modifier = Modifier.padding(12.dp).fillMaxWidth(),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        ) {
+            androidx.compose.material3.Icon(
+                imageVector = Icons.Default.SmartToy,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+            )
+            androidx.compose.foundation.layout.Spacer(modifier = Modifier.width(12.dp))
+            Text(
+                text = stringResource(R.string.home_browse_bots),
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun SectionHeader(
+    title: String,
+    action: String? = null,
+    onAction: (() -> Unit)? = null,
+) {
+    androidx.compose.foundation.layout.Row(
+        modifier = Modifier.fillMaxWidth().padding(start = 12.dp, top = 8.dp, end = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.primary,
+            fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+            modifier = Modifier.weight(1f),
+        )
+        if (action != null && onAction != null) {
+            androidx.compose.material3.TextButton(onClick = onAction) { Text(action) }
+        }
+    }
 }
